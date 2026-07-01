@@ -1,0 +1,15 @@
+﻿{
+    "component":  "HTCondor",
+    "product_name":  "condor-25.0.11",
+    "product_version":  "25.0.11",
+    "manufacturer":  "Condor Team - University of Wisconsin Madison",
+    "product_code":  "{7ECC7865-FD15-35C9-A808-ECE64D71F54A}",
+    "architecture":  "x64",
+    "installer":  "condor-Windows-x64.msi",
+    "installer_size_bytes":  250730218,
+    "sha256":  "1c66900a0ff8c6e584380897df21dd8bc1a3557fe772f1aaf01a40060cfcefa3",
+    "signature_status":  "NotSigned",
+    "signer_subject":  "",
+    "bundled_install_dir":  "C:\\Condor",
+    "prepared_at_utc":  "2026-06-25T06:26:59.9235638Z"
+}

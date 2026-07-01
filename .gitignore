@@ -1,0 +1,44 @@
+﻿# IDE
+.idea/
+.vscode/
+
+# Python cache
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# Backend virtual environments
+backend/.venv/
+backend/.venv_*/
+backend/.venv_backup_*/
+backend/module_envs/
+
+# Runtime and logs
+backend/runtime/
+backend/logs/
+*.log
+
+# Frontend generated files
+frontend/node_modules/
+frontend/dist/
+
+# Generated task/data records
+backend/data/tasks.json
+backend/data/data_files.json
+
+# Local wheels and offline caches
+backend/python_wheels/
+
+# Large local installers
+third_party/htcondor/*.msi
+
+# Temporary files
+*.tmp
+.DS_Store
+Thumbs.db
+
+# PyInstaller / runtime temp
+backend/.pyi_tmp/
+
+diff_with_github.txt
