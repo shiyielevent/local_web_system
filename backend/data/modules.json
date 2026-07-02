@@ -1,1 +1,85 @@
-[]
+[
+  {
+    "id": "H8_CM_CTH_2_EXE",
+    "name": "葵花8号云类型与云相态反演",
+    "description": "读取H8 NetCDF目录，生成云掩膜和云相态反演结果。",
+    "runtime": "cpp_native",
+    "entry": "CM_CTH_2.exe",
+    "executable": "backend/installed_modules/H8_CM_CTH_2_EXE/CM_CTH_2.exe",
+    "working_dir": "backend/installed_modules/H8_CM_CTH_2_EXE",
+    "config_mode": "json_file",
+    "command_template": [
+      "{executable}",
+      "{config_json}"
+    ],
+    "dependency_dirs": [],
+    "dependency_search_dirs": [],
+    "resource_dirs": [],
+    "parallel": {
+      "mode": "none",
+      "input_key": "",
+      "output_key": "",
+      "file_patterns": "*R21*.nc;*R21*.NC",
+      "output_suffix": ".tif",
+      "files_per_job": 1,
+      "chunk_multiplier": 1
+    },
+    "tags": [
+      "h8",
+      "cloud",
+      "cloud-mask",
+      "cloud-phase",
+      "executable"
+    ],
+    "tool_type": "cloud",
+    "enabled": true,
+    "inputs": [
+      {
+        "key": "file",
+        "label": "file",
+        "type": "dir_path",
+        "required": true,
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "input",
+        "default": "D:/H8/data/input",
+        "batch_role": "input",
+        "match_mode": "each_file",
+        "file_patterns": "*R21*.nc;*R21*.NC",
+        "batch_allow_all_files": true,
+        "batch_allow_no_extension": true
+      },
+      {
+        "key": "cm_files",
+        "label": "cm_files",
+        "type": "dir_path",
+        "required": true,
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "input",
+        "default": "D:/H8/data/CM",
+        "batch_role": "output",
+        "match_mode": "each_file",
+        "file_patterns": "*R21*.nc;*R21*.NC",
+        "batch_allow_all_files": true,
+        "batch_allow_no_extension": true
+      },
+      {
+        "key": "outpath",
+        "label": "outpath",
+        "type": "dir_path",
+        "required": true,
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "output",
+        "default": "D:/H8/data/output",
+        "batch_role": "output"
+      }
+    ],
+    "_manifest_format": "executable_module_json",
+    "_param_json_path": "D:\\NEPU\\H8\\CM_CTH_2\\CTH\\dist\\CM_CTH_2\\config.json"
+  }
+]

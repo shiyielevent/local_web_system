@@ -1358,7 +1358,8 @@ else {
                                 "$dst = Join-Path $jobDir 'localweb_runtime_config.json'",
                                 "$text = Get-Content -LiteralPath $src -Raw",
                                 "$text = $text.Replace('__LOCAL_WEB_JOB_DIR__', $jobDirForJson)",
-                                "Set-Content -LiteralPath $dst -Value $text -Encoding UTF8",
+                                "$utf8NoBom = New-Object System.Text.UTF8Encoding($false)",
+                                "[System.IO.File]::WriteAllText($dst, $text, $utf8NoBom)",
                             ]) + "\n",
                             encoding="utf-8-sig",
                         )

@@ -1513,7 +1513,7 @@ class TaskManager:
         if machines:
             self.append_log(parent_id, f"[HTCONDOR] 当前可用执行节点：{', '.join(machines)}")
         self.append_log(parent_id, "[HTCONDOR] 系统会为每个子任务写入 target_machine，尽量让不同节点同时运行。")
-        self.append_log(parent_id, "[HTCONDOR] 各节点需要能访问 config.json 中写入的大型输入/输出路径。")
+        self.append_log(parent_id, "[HTCONDOR] 系统会为拆分任务传输子任务 config.json 和对应输入子目录；输出目录按子任务隔离。")
 
         done_count = 0
         failures = 0
@@ -1635,9 +1635,11 @@ class TaskManager:
                     else:
                         self.append_log(parent_id, f"[HTCONDOR] 已提交 {index + 1}/{total}: {label}")
 
+                cancel_notice_written = False
                 while future_map:
-                    if parent_id in self.cancel_flags:
+                    if parent_id in self.cancel_flags and not cancel_notice_written:
                         self.append_log(parent_id, "[HTCONDOR] 收到取消请求，正在等待已提交的任务结束或取消。")
+                        cancel_notice_written = True
 
                     done, _ = wait(list(future_map.keys()), timeout=0.5, return_when=FIRST_COMPLETED)
                     if not done:
@@ -3496,6 +3498,61 @@ class TaskManager:
                     child.setdefault("logs", []).append("[SYSTEM] 子任务排队已取消")
             self._save_tasks()
             return True
+
+        # HTCondor 多节点父任务：父任务本身没有 ClusterId，真正的 ClusterId 在子任务上。
+        # 取消时必须逐个取消子任务，否则页面会提示“没有找到可取消的 HTCondor ClusterId”。
+        if task.get("kind") == "htcondor_parent":
+            self.cancel_flags.add(task_id)
+            any_stopped = False
+
+            with self.lock:
+                parent = self.tasks.get(task_id)
+                if parent:
+                    parent["status"] = "cancelled"
+                    parent["ended_at"] = now_iso()
+                    parent["return_code"] = -2
+                    parent.setdefault("logs", []).append("[SYSTEM] 已请求取消 HTCondor 多节点任务")
+
+            for child_id in task.get("children") or []:
+                self.cancel_flags.add(child_id)
+                child_snapshot = self.get_task(child_id) or {}
+                cluster_id = str(child_snapshot.get("htcondor_cluster_id") or "")
+                result = None
+
+                if self.htcondor_manager is not None:
+                    try:
+                        result = self.htcondor_manager.cancel_job(
+                            job_id=child_id,
+                            cluster_id=cluster_id,
+                        )
+                    except Exception as exc:
+                        result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+                if cluster_id:
+                    any_stopped = True
+
+                with self.lock:
+                    child = self.tasks.get(child_id)
+                    if child and child.get("status") not in TERMINAL_STATUSES:
+                        child["status"] = "cancelled"
+                        child["ended_at"] = now_iso()
+                        child["return_code"] = -2
+                        child.setdefault("logs", []).append("[SYSTEM] 父 HTCondor 任务已取消，子任务终止")
+                        if result:
+                            if result.get("cluster_id"):
+                                child["htcondor_cluster_id"] = str(result.get("cluster_id") or "")
+                            msg = result.get("message") or result.get("stdout") or result.get("stderr") or result.get("error") or ""
+                            if msg:
+                                child.setdefault("logs", []).append(f"[HTCONDOR] 停止结果：{msg}")
+
+                if result:
+                    msg = result.get("message") or result.get("stdout") or result.get("stderr") or result.get("error") or ""
+                    if msg:
+                        self.append_log(task_id, f"[HTCONDOR] 子任务 {child_id} 停止结果：{msg}")
+
+            self._save_tasks()
+            self._cleanup_runtime_roots_for_task(task_id, reason="HTCondor 多节点任务取消")
+            return True or any_stopped
 
         # 并行父任务：标记取消，并尽量停止已经启动的所有子进程。
         if task.get("kind") in {"parallel", "batch_parent"}:

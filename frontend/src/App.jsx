@@ -1991,7 +1991,19 @@ const TASK_TRAY_RESERVED_BOTTOM = 150;
 
 
 
-function HTCondorPage({ status, busy, message, clusterForm, setClusterForm, onRefresh, onSetMode, onSmokeTest, onCreateParent, onJoinParent, onLeavePool }) {
+function HTCondorPage({
+  status,
+  busy,
+  message,
+  clusterForm,
+  setClusterForm,
+  onRefresh,
+  onSetMode,
+  onSmokeTest,
+  onCreateParent,
+  onJoinParent,
+  onLeavePool,
+}) {
   const info = status || {};
   const install = info.install_result || {};
   const runtime = info.runtime || {};
@@ -2011,10 +2023,27 @@ function HTCondorPage({ status, busy, message, clusterForm, setClusterForm, onRe
   const clusterHealthy = clusterStarted && !!info.service_running && !!nodes.ok;
   const nodeCount = uniqueMachines.length || nodeItems.length || 0;
   const parentAddress = info.parent_ip || info.bind_ip || '-';
+
+  const versionOutput = String(installedRuntime.version_output || '');
+  const versionLine = versionOutput.split('\n').find((line) => line.includes('CondorVersion')) || '';
+  const platformLine = versionOutput.split('\n').find((line) => line.includes('CondorPlatform')) || '';
+  const shortVersion = [
+    versionLine
+      .replace(/^\$?CondorVersion:\s*/i, '')
+      .replace(/^SCondorVersion:\s*/i, '')
+      .replace(/\s+BuildID:.*$/i, '')
+      .replace(/\s+GitSHA:.*$/i, '')
+      .trim(),
+    platformLine
+      .replace(/^\$?CondorPlatform:\s*/i, '')
+      .replace(/^SCondorPlatform:\s*/i, '')
+      .trim(),
+  ].filter(Boolean).join(' ｜ ');
+
   const parentInfo = poolRole === 'parent'
-    ? `父节点机器：${info.machine || '-'}\n父节点 IP：${parentAddress}\nCollector 端口：${info.collector_port || 9618}`
+    ? `机器：${info.machine || '-'}\nIP：${parentAddress}\n端口：${info.collector_port || 9618}`
     : (poolRole === 'child'
-      ? `父节点 IP：${parentAddress}\nCollector 端口：${info.collector_port || 9618}`
+      ? `父节点 IP：${parentAddress}\n端口：${info.collector_port || 9618}`
       : '-');
 
   const childMachines = poolRole === 'parent'
@@ -2053,6 +2082,7 @@ function HTCondorPage({ status, busy, message, clusterForm, setClusterForm, onRe
       fontWeight: 800,
       background: ok ? '#dcfce7' : '#fee2e2',
       color: ok ? '#166534' : '#991b1b',
+      whiteSpace: 'nowrap',
     }}>
       <span style={{
         width: 8,
@@ -2064,51 +2094,65 @@ function HTCondorPage({ status, busy, message, clusterForm, setClusterForm, onRe
     </span>
   );
 
-  const infoGridStyle = {
-    display: 'grid',
-    gridTemplateColumns: 'repeat(auto-fit, minmax(230px, 1fr))',
-    gap: 10,
-    alignItems: 'stretch',
-  };
+  const cardTitle = (text, subText = '') => (
+    <div style={{ minHeight: 44, marginBottom: 12 }}>
+      <div style={{ fontSize: 20, fontWeight: 900, color: '#12385f', lineHeight: 1.2 }}>{text}</div>
+      {subText && <div style={{ marginTop: 5, color: '#64748b', fontSize: 13, lineHeight: 1.45 }}>{subText}</div>}
+    </div>
+  );
 
-  const row = (label, value, options = {}) => (
-    <div
-      style={{
-        padding: 12,
-        border: '1px solid #dce8f3',
-        borderRadius: 10,
-        background: '#fff',
-        minHeight: 74,
-        display: 'flex',
-        flexDirection: 'column',
-        justifyContent: 'center',
-        gridColumn: options.full ? '1 / -1' : undefined,
-      }}
-    >
+  const statCard = (label, value) => (
+    <div style={{
+      minHeight: 66,
+      padding: '10px 12px',
+      borderRadius: 14,
+      border: '1px solid #dce8f3',
+      background: '#fff',
+      boxSizing: 'border-box',
+      display: 'flex',
+      flexDirection: 'column',
+      justifyContent: 'center',
+    }}>
       <div style={{ fontSize: 12, color: '#6a7f96', fontWeight: 800 }}>{label}</div>
-      <div
-        style={{
-          marginTop: 6,
-          fontWeight: 900,
-          color: '#173b61',
-          overflowWrap: 'anywhere',
-          whiteSpace: 'pre-wrap',
-          lineHeight: 1.45,
-          fontSize: options.small ? 13 : 15,
-        }}
-      >
+      <div style={{
+        marginTop: 5,
+        fontWeight: 900,
+        color: '#173b61',
+        overflowWrap: 'anywhere',
+        whiteSpace: 'pre-wrap',
+        lineHeight: 1.35,
+        fontSize: 14,
+      }}>
         {value || '-'}
       </div>
     </div>
   );
 
-  const sectionTitle = (text) => (
-    <div style={{ fontSize: 17, fontWeight: 900, color: '#12385f', margin: '14px 0 10px' }}>
-      {text}
+  const infoCard = (label, value) => (
+    <div style={{
+      minHeight: 92,
+      padding: '10px 12px',
+      borderRadius: 14,
+      border: '1px solid #dce8f3',
+      background: '#fff',
+      boxSizing: 'border-box',
+    }}>
+      <div style={{ fontSize: 12, color: '#6a7f96', fontWeight: 800 }}>{label}</div>
+      <div style={{
+        marginTop: 5,
+        fontWeight: 900,
+        color: '#173b61',
+        overflowWrap: 'anywhere',
+        whiteSpace: 'pre-wrap',
+        lineHeight: 1.45,
+        fontSize: 13,
+      }}>
+        {value || '-'}
+      </div>
     </div>
   );
 
-  const logBlock = (title, value, maxHeight = 180) => (
+  const logBlock = (title, value, maxHeight = 160) => (
     <div>
       <div style={{ fontWeight: 900, color: '#17406b', marginBottom: 6 }}>{title}</div>
       <pre style={{
@@ -2118,14 +2162,29 @@ function HTCondorPage({ status, busy, message, clusterForm, setClusterForm, onRe
         background: '#0f172a',
         color: '#dbeafe',
         padding: 12,
-        borderRadius: 10,
+        borderRadius: 12,
         fontSize: 12,
-        lineHeight: 1.5,
+        lineHeight: 1.45,
+        margin: 0,
       }}>
         {value || '-'}
       </pre>
     </div>
   );
+
+  const commonColumnStyle = {
+    ...styles.card,
+    padding: 18,
+    height: '100%',
+    minHeight: 640,
+    boxSizing: 'border-box',
+    display: 'flex',
+    flexDirection: 'column',
+  };
+
+  const clusterStatusText = clusterHealthy
+    ? '已启动 / 可发现执行节点'
+    : (clusterStarted ? '已配置，等待确认' : '未启动');
 
   return (
     <section style={{ display: 'grid', gap: 16, minHeight: 'calc(100vh - 98px)' }}>
@@ -2134,13 +2193,13 @@ function HTCondorPage({ status, busy, message, clusterForm, setClusterForm, onRe
           <div>
             <div style={{ fontSize: 28, fontWeight: 900, color: '#12385f' }}>HTCondor 分布式</div>
             <div style={{ marginTop: 8, color: '#5c7189', lineHeight: 1.7 }}>
-              当前先接入 HTCondor 提交和执行模式。旧的“分布式”Dask 页面暂时保留，测试稳定后再删除。
+              当前接入 HTCondor 提交与执行模式，用于父节点调度、子节点执行和多节点任务分配。
             </div>
           </div>
           <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
             {okBadge(info.install_validated, '一键安装已验证', '安装未完全验证')}
             {okBadge(info.service_running, 'Condor 服务运行中', 'Condor 服务未运行')}
-            {okBadge(ping.ok, 'NTSSPI 检查通过', 'NTSSPI 检查失败')}
+            {okBadge(ping.ok, 'WRITE 权限通过', 'WRITE 权限失败')}
             {okBadge(info.enabled, 'HTCondor 执行已启用', '当前未启用 HTCondor')}
           </div>
         </div>
@@ -2158,29 +2217,56 @@ function HTCondorPage({ status, busy, message, clusterForm, setClusterForm, onRe
         </div>
       )}
 
-      <div style={{ display: 'grid', gridTemplateColumns: '1.05fr 1fr 1.05fr', gap: 16, alignItems: 'start' }}>
-        <div style={{ ...styles.card, padding: 18 }}>
-          <div style={{ fontSize: 20, fontWeight: 900, color: '#12385f', marginBottom: 12 }}>运行状态</div>
-          <div style={infoGridStyle}>
-            {row('当前运行模式', mode === 'htcondor' ? 'HTCondor 分布式执行' : '本机 local')}
-            {row('当前机器名', info.machine)}
-            {row('HTCondor 版本信息', installedRuntime.version_output, { full: true, small: true })}
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: 'minmax(340px, 0.92fr) minmax(330px, 0.88fr) minmax(430px, 1.2fr)',
+        gap: 16,
+        alignItems: 'stretch',
+      }}>
+        <div style={commonColumnStyle}>
+          {cardTitle('运行状态', '集中展示集群角色、节点数量和安装结果。')}
+
+          <div style={{
+            padding: '10px 12px',
+            borderRadius: 14,
+            border: '1px solid #dce8f3',
+            background: 'linear-gradient(135deg, #ffffff 0%, #f5f9ff 100%)',
+            marginBottom: 10,
+          }}>
+            <div style={{ fontSize: 12, color: '#6a7f96', fontWeight: 800 }}>HTCondor 版本</div>
+            <div style={{ marginTop: 5, fontSize: 14, fontWeight: 900, color: '#173b61', overflowWrap: 'anywhere' }}>
+              {shortVersion || '-'}
+            </div>
           </div>
 
-          {sectionTitle('集群信息')}
-          <div style={infoGridStyle}>
-            {row('集群运行状态', clusterHealthy ? '已启动 / 可发现执行节点' : (clusterStarted ? '已配置，但状态未完全正常' : '未启动'))}
-            {row('当前集群节点数', String(nodeCount))}
-            {row('当前集群角色', roleText)}
-            {row('服务状态', service.state || (info.service_running ? 'running' : 'stopped'))}
-            {row('父节点信息', parentInfo, { small: true })}
-            {row('子节点信息', childInfo, { small: true })}
-            {row('本机可用 IP', localIps.join('\n') || '-')}
-            {row('安装结果', install.message || install.status)}
-            {row('runtime 目录', info.runtime_dir, { full: true, small: true })}
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 10 }}>
+            {statCard('运行模式', mode === 'htcondor' ? 'HTCondor 分布式执行' : '本机 local')}
+            {statCard('集群状态', clusterStatusText)}
+            {statCard('节点数量', String(nodeCount))}
+            {statCard('当前角色', roleText)}
           </div>
 
-          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 14 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginTop: 10 }}>
+            {infoCard('父节点信息', parentInfo)}
+            {infoCard('子节点信息', childInfo)}
+          </div>
+
+          <div style={{
+            marginTop: 10,
+            padding: '10px 12px',
+            borderRadius: 12,
+            background: '#f8fbff',
+            border: '1px dashed #cfe0f2',
+            color: '#5b6f86',
+            fontSize: 13,
+            lineHeight: 1.55,
+          }}>
+            <div><strong style={{ color: '#17406b' }}>当前机器：</strong>{info.machine || '-'}</div>
+            <div><strong style={{ color: '#17406b' }}>服务状态：</strong>{service.state || (info.service_running ? 'running' : 'stopped')}</div>
+            <div><strong style={{ color: '#17406b' }}>安装结果：</strong>{install.message || install.status || '暂无安装结果'}</div>
+          </div>
+
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 'auto', paddingTop: 14 }}>
             <button style={styles.blueBtn} disabled={!!busy} onClick={onRefresh}>刷新状态</button>
             <button style={styles.whiteBtn} disabled={!!busy} onClick={() => onSetMode('htcondor')}>启用 HTCondor 执行</button>
             <button style={styles.whiteBtn} disabled={!!busy} onClick={() => onSetMode('local')}>切回本机执行</button>
@@ -2188,18 +2274,16 @@ function HTCondorPage({ status, busy, message, clusterForm, setClusterForm, onRe
           </div>
         </div>
 
-        <div style={{ ...styles.card, padding: 18 }}>
-          <div style={{ fontSize: 20, fontWeight: 900, color: '#12385f', marginBottom: 12 }}>父节点 / 子节点配置</div>
-          <div style={{ color: '#5c7189', lineHeight: 1.7, marginBottom: 12 }}>
-            父节点负责调度，子节点只负责执行。这里会自动写入 HTCondor 配置、开放端口并重启 Condor 服务；如果弹出管理员授权窗口，点“是”。
-          </div>
+        <div style={commonColumnStyle}>
+          {cardTitle('集群配置', '父节点负责调度，子节点负责执行。')}
+
           <div style={{ display: 'grid', gap: 10 }}>
             <label>
               <div style={labelStyle}>父节点 IP</div>
               <input
                 style={styles.input}
                 value={clusterForm.parent_ip}
-                placeholder="例如 10.187.60.154"
+                placeholder="例如 192.168.2.136"
                 onChange={(e) => setClusterForm({ ...clusterForm, parent_ip: e.target.value })}
               />
             </label>
@@ -2231,9 +2315,10 @@ function HTCondorPage({ status, busy, message, clusterForm, setClusterForm, onRe
               </label>
             </div>
           </div>
-          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 14 }}>
-            <button style={styles.blueBtn} disabled={!!busy} onClick={onCreateParent}>创建为父节点</button>
-            <button style={styles.whiteBtn} disabled={!!busy} onClick={onJoinParent}>加入父节点</button>
+
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 16 }}>
+            <button style={styles.blueBtn} disabled={!!busy} onClick={onCreateParent}>启动集群</button>
+            <button style={styles.whiteBtn} disabled={!!busy} onClick={onJoinParent}>加入集群</button>
             <button
               style={leaveButtonStyle}
               disabled={leaveDisabled}
@@ -2243,25 +2328,53 @@ function HTCondorPage({ status, busy, message, clusterForm, setClusterForm, onRe
               退出 HTCondor 集群
             </button>
           </div>
-          <div style={{ marginTop: 12, fontSize: 13, color: '#64748b', lineHeight: 1.7 }}>
-            子节点加入后，在父节点页面点击“刷新状态”，condor_status 里应能看到子节点机器名。
+
+          <div style={{
+            marginTop: 14,
+            padding: '12px 14px',
+            borderRadius: 14,
+            background: '#ffffff',
+            border: '1px solid #dce8f3',
+            lineHeight: 1.65,
+            color: '#5b6f86',
+            fontSize: 13,
+          }}>
+            <div style={{ fontWeight: 900, color: '#17406b', marginBottom: 6 }}>当前配置</div>
+            <div>父节点：{clusterForm.parent_ip || '-'}</div>
+            <div>本机绑定：{clusterForm.bind_ip || localIps[0] || '-'}</div>
+            <div>端口范围：{clusterForm.low_port || 9700} - {clusterForm.high_port || 9800}</div>
+          </div>
+
+          <div style={{
+            marginTop: 'auto',
+            padding: '14px 16px',
+            borderRadius: 14,
+            background: '#f8fbff',
+            border: '1px dashed #cfe0f2',
+            color: '#5b6f86',
+            lineHeight: 1.7,
+            fontSize: 13,
+          }}>
+            <div style={{ fontWeight: 900, color: '#17406b', marginBottom: 6 }}>操作说明</div>
+            <div>1. 父节点点击“启动集群”。</div>
+            <div>2. 子节点填写父节点 IP 后点击“加入集群”。</div>
+            <div>3. 父节点刷新状态，在执行节点列表中确认子节点机器名。</div>
           </div>
         </div>
 
-        <div style={{ ...styles.card, padding: 18 }}>
-          <div style={{ fontSize: 20, fontWeight: 900, color: '#12385f', marginBottom: 12 }}>队列和 Slot</div>
+        <div style={commonColumnStyle}>
+          {cardTitle('队列和 Slot', '查看执行节点、队列和 WRITE 权限状态。')}
           <div style={{ display: 'grid', gap: 12 }}>
-            {logBlock('执行节点列表', nodes.text, 180)}
-            {logBlock('condor_status', slot.text, 220)}
-            {logBlock('condor_q', queue.text, 220)}
-            {logBlock('condor_ping WRITE', ping.text, 160)}
+            {logBlock('执行节点列表', nodes.text, 120)}
+            {logBlock('condor_status', slot.text, 190)}
+            {logBlock('condor_q', queue.text, 165)}
+            {logBlock('condor_ping WRITE', ping.text, 120)}
           </div>
         </div>
       </div>
     </section>
   );
 }
-
 
 function DistributedPage({
   status,
