@@ -14,5 +14,13 @@
     "enabled": true,
     "security_question": "默认用户账号",
     "security_answer_hash": "e606e38b0d8c19b24cf0ee3808183162ea7cd63ff7912dbb22b5e803286b4446"
+  },
+  {
+    "username": "22",
+    "password_hash": "785f3ec7eb32f30b90cd0fcf3657d388b5ff4297f2f9716ff66e9b69c05ddd09",
+    "role": "admin",
+    "enabled": true,
+    "security_question": "",
+    "security_answer_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
   }
 ]

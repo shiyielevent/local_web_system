@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import ipaddress
 import locale
 import os
 import re
@@ -335,6 +336,96 @@ class HTCondorClusterManager:
                 pass
         return items
 
+    def _lan_allow_pattern(self, ip: str) -> str:
+        """把 192.168.2.136 变成 192.168.2.*。
+
+        HTCondor 的父节点和子节点只需要在同一个小局域网内互相通信。
+        这里不做复杂网段计算，先按教学/实验环境常见的 C 段处理，代码更容易看懂。
+        """
+        ip = str(ip or "").strip()
+        try:
+            obj = ipaddress.ip_address(ip)
+            if obj.version != 4:
+                return ""
+        except Exception:
+            return ""
+
+        parts = ip.split(".")
+        if len(parts) != 4:
+            return ""
+        return f"{parts[0]}.{parts[1]}.{parts[2]}.*"
+
+    def _same_lan_segment(self, ip_a: str, ip_b: str) -> bool:
+        """简单判断两个 IPv4 是否属于同一个前三段网段。"""
+        pattern_a = self._lan_allow_pattern(ip_a)
+        pattern_b = self._lan_allow_pattern(ip_b)
+        return bool(pattern_a and pattern_b and pattern_a == pattern_b)
+
+    def _build_allow_hosts(self, bind_ip: str, parent_ip: str = "") -> str:
+        """生成 HTCondor 的 ALLOW_* 主机范围。
+
+        修复点：
+        子节点 startd 会向父节点 collector 上报自己。
+        如果父节点没有放行 ALLOW_ADVERTISE_STARTD，就会出现 DENIED。
+        """
+        hosts: List[str] = ["127.0.0.1", "localhost"]
+        for ip in [bind_ip, parent_ip]:
+            ip = str(ip or "").strip()
+            if not ip:
+                continue
+            if ip not in hosts:
+                hosts.append(ip)
+            pattern = self._lan_allow_pattern(ip)
+            if pattern and pattern not in hosts:
+                hosts.append(pattern)
+        return ", ".join(hosts)
+
+    def _pick_bind_ip(self, requested_ip: str = "", parent_ip: str = "") -> str:
+        """选择并检查本机绑定 IP。
+
+        这个函数用来避免用户把子节点绑定到错误网卡，
+        例如父节点是 192.168.2.136，却把子节点填成 192.168.43.129。
+        """
+        requested_ip = str(requested_ip or "").strip()
+        parent_ip = str(parent_ip or "").strip()
+        local_ips = self._local_ipv4_list()
+
+        if requested_ip:
+            if local_ips and requested_ip not in local_ips:
+                raise HTCondorClusterError(
+                    f"本机绑定 IP {requested_ip} 不是当前电脑检测到的可用 IP。"
+                    f"当前可用 IP：{', '.join(local_ips)}"
+                )
+            if parent_ip and not self._same_lan_segment(requested_ip, parent_ip):
+                suggestion = ""
+                for ip in local_ips:
+                    if self._same_lan_segment(ip, parent_ip):
+                        suggestion = ip
+                        break
+                if suggestion:
+                    raise HTCondorClusterError(
+                        f"本机绑定 IP {requested_ip} 与父节点 {parent_ip} 不在同一网段，"
+                        f"建议改用 {suggestion}。"
+                    )
+                raise HTCondorClusterError(
+                    f"本机绑定 IP {requested_ip} 与父节点 {parent_ip} 不在同一网段。"
+                )
+            return requested_ip
+
+        if parent_ip:
+            for ip in local_ips:
+                if self._same_lan_segment(ip, parent_ip):
+                    return ip
+            raise HTCondorClusterError(
+                f"没有找到与父节点 {parent_ip} 同网段的本机 IP。"
+                f"当前可用 IP：{', '.join(local_ips)}"
+            )
+
+        for ip in local_ips:
+            if ip.startswith("192.168."):
+                return ip
+        return local_ips[0] if local_ips else "127.0.0.1"
+
     def _ps_quote(self, value: str) -> str:
         return "'" + str(value).replace("'", "''") + "'"
 
@@ -432,6 +523,7 @@ Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile','-ExecutionP
         low_port = int(low_port or 9700)
         high_port = int(high_port or 9800)
         machine = socket.gethostname().lower()
+        allow_hosts = self._build_allow_hosts(bind_ip=bind_ip, parent_ip=parent_ip or bind_ip)
 
         if role == "parent":
             daemon_list = "MASTER, COLLECTOR, NEGOTIATOR, SCHEDD, STARTD"
@@ -460,16 +552,32 @@ COLLECTOR_HOST = {collector_host}
 NETWORK_INTERFACE = {bind_ip}
 UID_DOMAIN = {machine}
 FILESYSTEM_DOMAIN = {machine}
+# 下面这段是集群通信权限，课堂/局域网测试使用。
+# 如果没有 ALLOW_ADVERTISE_STARTD，子节点会启动成功但父节点会 DENIED。
+LOCAL_WEB_ALLOW_HOSTS = {allow_hosts}
+ALLOW_READ = {allow_hosts}
+ALLOW_WRITE = {allow_hosts}
+ALLOW_DAEMON = {allow_hosts}
+ALLOW_CLIENT = {allow_hosts}
+ALLOW_ADMINISTRATOR = {allow_hosts}
+ALLOW_ADVERTISE_MASTER = {allow_hosts}
+ALLOW_ADVERTISE_STARTD = {allow_hosts}
+ALLOW_ADVERTISE_SCHEDD = {allow_hosts}
+
 SEC_DEFAULT_AUTHENTICATION = OPTIONAL
 SEC_READ_AUTHENTICATION = OPTIONAL
 SEC_WRITE_AUTHENTICATION = OPTIONAL
+SEC_DAEMON_AUTHENTICATION = OPTIONAL
+SEC_CLIENT_AUTHENTICATION = OPTIONAL
 SEC_ADMINISTRATOR_AUTHENTICATION = OPTIONAL
-SEC_CLIENT_AUTHENTICATION_METHODS = NTSSPI
-ALLOW_READ = *
-ALLOW_WRITE = *
-ALLOW_ADMINISTRATOR = *
+SEC_ADVERTISE_MASTER_AUTHENTICATION = OPTIONAL
+SEC_ADVERTISE_STARTD_AUTHENTICATION = OPTIONAL
+SEC_ADVERTISE_SCHEDD_AUTHENTICATION = OPTIONAL
+SEC_DEFAULT_ENCRYPTION = OPTIONAL
+SEC_DEFAULT_INTEGRITY = OPTIONAL
+SEC_CLIENT_AUTHENTICATION_METHODS = NTSSPI, CLAIMTOBE
 QUEUE_SUPER_USERS = SYSTEM, condor, LocalWebCondor
-ALLOW_SUBMIT_FROM_KNOWN_USERS_ONLY = TRUE
+ALLOW_SUBMIT_FROM_KNOWN_USERS_ONLY = FALSE
 LOWPORT = {low_port}
 HIGHPORT = {high_port}
 START = TRUE
@@ -482,53 +590,94 @@ KILL = FALSE
 
         restart_condor_script = r"""
 $serviceName = 'Condor'
+$warnings = New-Object System.Collections.Generic.List[string]
+
+function Wait-CondorServiceState {
+    param(
+        [string]$Wanted,
+        [int]$Seconds
+    )
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    while ((Get-Date) -lt $deadline) {
+        $svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+        if ($null -eq $svc) {
+            return $false
+        }
+        if ([string]$svc.Status -eq $Wanted) {
+            return $true
+        }
+        Start-Sleep -Seconds 1
+    }
+    return $false
+}
 
 try {
-    $svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
-
-    if ($null -ne $svc -and $svc.Status -ne 'Stopped') {
+    # 先尝试温和重载。安全配置修改后，很多情况下 reconfig 就可以生效。
+    $reconfigExe = Join-Path 'C:/Condor/bin' 'condor_reconfig.exe'
+    if (Test-Path -LiteralPath $reconfigExe -PathType Leaf) {
         try {
-            Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
+            & $reconfigExe 2>&1 | Out-String | Out-Null
+            Start-Sleep -Seconds 3
         } catch {
-            # Stop-Service 在部分机器上会卡住或报错，后面会强制清理 condor 进程。
-        }
-
-        $deadline = (Get-Date).AddSeconds(35)
-        while ((Get-Date) -lt $deadline) {
-            $svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
-            if ($null -eq $svc -or $svc.Status -eq 'Stopped') {
-                break
-            }
-            Start-Sleep -Seconds 1
+            $warnings.Add('condor_reconfig 失败：' + $_.Exception.Message) | Out-Null
         }
     }
 
     $svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+    if ($null -eq $svc) {
+        throw '找不到 Condor 服务。'
+    }
+
+    # 角色变化涉及 DAEMON_LIST，仍然尽量重启服务。
+    if ($svc.Status -ne 'Stopped') {
+        try {
+            Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
+        } catch {
+            $warnings.Add('Stop-Service Condor 失败：' + $_.Exception.Message) | Out-Null
+        }
+        [void](Wait-CondorServiceState -Wanted 'Stopped' -Seconds 25)
+    }
+
+    $svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
     if ($null -ne $svc -and $svc.Status -ne 'Stopped') {
+        # 有些机器上 Windows 服务保护导致 Stop-Process 显示拒绝访问。
+        # 这里把错误吞掉，不让系统卡死；后面以服务最终 Running 为准。
         Get-Process condor* -ErrorAction SilentlyContinue | ForEach-Object {
-            Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+            try {
+                Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+            } catch {
+                $warnings.Add('无法结束进程 ' + $_.ProcessName + '：' + $_.Exception.Message) | Out-Null
+            }
         }
         Start-Sleep -Seconds 3
     }
 
-    Start-Service -Name $serviceName -ErrorAction Stop
-
-    $deadline = (Get-Date).AddSeconds(45)
-    while ((Get-Date) -lt $deadline) {
-        $svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
-        if ($null -ne $svc -and $svc.Status -eq 'Running') {
-            break
-        }
-        Start-Sleep -Seconds 1
-    }
-
     $svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
-    if ($null -eq $svc -or $svc.Status -ne 'Running') {
-        throw "Condor 服务启动失败，当前状态：$($svc.Status)"
+    if ($null -ne $svc -and $svc.Status -eq 'Stopped') {
+        Start-Service -Name $serviceName -ErrorAction Stop
+    }
+    elseif ($null -ne $svc -and $svc.Status -eq 'Running') {
+        # 如果服务没有完全停下来，至少再重载一次配置。
+        if (Test-Path -LiteralPath $reconfigExe -PathType Leaf) {
+            try { & $reconfigExe 2>&1 | Out-String | Out-Null } catch {}
+        }
+    }
+    else {
+        Start-Service -Name $serviceName -ErrorAction Stop
     }
 
-    Start-Sleep -Seconds 8
+    if (-not (Wait-CondorServiceState -Wanted 'Running' -Seconds 45)) {
+        $svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+        $statusText = if ($null -eq $svc) { 'missing' } else { [string]$svc.Status }
+        throw "Condor 服务没有进入 Running 状态，当前状态：$statusText"
+    }
+
+    Start-Sleep -Seconds 10
 } catch {
+    $warningText = ($warnings -join '; ')
+    if ($warningText) {
+        throw "重启 Condor 服务失败：$($_.Exception.Message)。附加信息：$warningText"
+    }
     throw "重启 Condor 服务失败：$($_.Exception.Message)"
 }
 """.strip()
@@ -541,7 +690,7 @@ $ErrorActionPreference = 'Stop'
 $resultPath = {self._ps_quote(str(self.runtime_dir / 'cluster_admin' / f'{role_text}_result.json'))}
 $result = @{{ success = $false; message = ''; role = {self._ps_quote(role_text)}; stdout = ''; stderr = '' }}
 try {{
-    $cfg = 'C:\Condor\condor_config.local'
+    $cfg = 'C:/Condor/condor_config.local'
     if (-not (Test-Path -LiteralPath $cfg -PathType Leaf)) {{
         throw "找不到 HTCondor 配置文件：$cfg。请先完成一键安装。"
     }}
@@ -570,7 +719,7 @@ try {{
 
     $statusText = ''
     try {{
-        $statusText = & 'C:\Condor\bin\condor_status.exe' -af Name Machine State Activity 2>&1 | Out-String
+        $statusText = & 'C:/Condor/bin/condor_status.exe' -af Name Machine State Activity 2>&1 | Out-String
     }} catch {{
         $statusText = $_.Exception.Message
     }}
@@ -591,33 +740,55 @@ finally {{
 }}
 """
 
+    def _query_pool_nodes(self, pool_ip: str = "") -> Dict[str, Any]:
+        """查询指定父节点池中的执行节点。"""
+        args = [self._exe("condor_status.exe")]
+        if pool_ip:
+            args.extend(["-pool", f"{pool_ip}:9618"])
+        args.extend(["-af", "Name", "Machine", "State", "Activity", "Cpus", "Memory"])
+        result = self._run(args, timeout=15)
+        text = "\n".join(x for x in [result.get("stdout", ""), result.get("stderr", ""), result.get("error", "")] if x).strip()
+        items = []
+        for line in text.splitlines():
+            parts = line.split()
+            if len(parts) >= 6:
+                items.append({
+                    "name": parts[0],
+                    "machine": parts[1],
+                    "state": parts[2],
+                    "activity": parts[3],
+                    "cpus": parts[4],
+                    "memory": parts[5],
+                })
+        return {"ok": bool(result.get("ok")), "text": text, "items": items}
+
+    def _wait_machine_visible_in_pool(self, pool_ip: str, machine: str, timeout_seconds: int = 60) -> Dict[str, Any]:
+        """等待父节点 condor_status 里出现当前子节点。
+
+        这样可以避免“页面提示加入成功，但父节点实际只有 1 个节点”的假成功。
+        """
+        machine = str(machine or "").strip().lower()
+        deadline = time.time() + max(5, int(timeout_seconds or 60))
+        last = {"ok": False, "text": "", "items": []}
+        while time.time() < deadline:
+            last = self._query_pool_nodes(pool_ip)
+            text = str(last.get("text") or "").lower()
+            if machine and machine in text:
+                last["verified"] = True
+                return last
+            time.sleep(3)
+        last["verified"] = False
+        return last
+
     def node_status(self) -> Dict[str, Any]:
         """返回当前 HTCondor 池里的执行节点。"""
         try:
-            result = self._run(
-                [self._exe("condor_status.exe"), "-af", "Name", "Machine", "State", "Activity", "Cpus", "Memory"],
-                timeout=15,
-            )
-            text = "\n".join(x for x in [result.get("stdout", ""), result.get("stderr", ""), result.get("error", "")] if x).strip()
-            items = []
-            for line in text.splitlines():
-                parts = line.split()
-                if len(parts) >= 6:
-                    items.append({
-                        "name": parts[0],
-                        "machine": parts[1],
-                        "state": parts[2],
-                        "activity": parts[3],
-                        "cpus": parts[4],
-                        "memory": parts[5],
-                    })
-            return {"ok": bool(result.get("ok")), "text": text, "items": items}
+            return self._query_pool_nodes()
         except Exception as exc:
             return {"ok": False, "text": str(exc), "items": []}
 
     def create_parent_node(self, bind_ip: str = "", low_port: int = 9700, high_port: int = 9800) -> Dict[str, Any]:
-        local_ips = self._local_ipv4_list()
-        bind_ip = str(bind_ip or "").strip() or (local_ips[0] if local_ips else "127.0.0.1")
+        bind_ip = self._pick_bind_ip(bind_ip)
         script = self._make_pool_config_script(
             role="parent",
             bind_ip=bind_ip,
@@ -643,8 +814,7 @@ finally {{
         parent_ip = str(parent_ip or "").strip()
         if not parent_ip:
             raise HTCondorClusterError("请填写父节点 IP。")
-        local_ips = self._local_ipv4_list()
-        child_ip = str(child_ip or "").strip() or (local_ips[0] if local_ips else "")
+        child_ip = self._pick_bind_ip(child_ip, parent_ip=parent_ip)
         script = self._make_pool_config_script(
             role="child",
             bind_ip=child_ip,
@@ -661,6 +831,18 @@ finally {{
             self.state["low_port"] = int(low_port or 9700)
             self.state["high_port"] = int(high_port or 9800)
             self._save_state()
+
+            verify = self._wait_machine_visible_in_pool(parent_ip, socket.gethostname(), timeout_seconds=60)
+            result["verify"] = verify
+            if verify.get("verified"):
+                result["message"] = "子节点已成功加入父节点，父节点已经能看到本机执行节点。"
+            else:
+                result["success"] = False
+                result["message"] = (
+                    "子节点配置已写入，但父节点还没有看到本机执行节点。"
+                    "常见原因是父节点安全配置没有放行 ALLOW_ADVERTISE_STARTD，"
+                    "或父节点 Condor 服务还没有完成重载。"
+                )
         data = self.status()
         data["action_result"] = result
         data["message"] = result.get("message") or ("已加入父节点" if result.get("success") else "加入父节点失败")
