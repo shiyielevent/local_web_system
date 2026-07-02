@@ -1,4 +1,5 @@
 from __future__ import annotations
+import copy
 import json
 import time
 import os
@@ -663,6 +664,355 @@ class TaskManager:
         )
         return status
 
+    def _htcondor_available_machines(self) -> List[str]:
+        """取当前 HTCondor 池里的可用执行机器。
+
+        返回的是 Machine 名称，不是 slot 名称。比如：
+        slot1@LAPTOP-40D4C67U -> LAPTOP-40D4C67U
+        """
+        manager = self.htcondor_manager
+        if manager is None:
+            return []
+
+        try:
+            data = manager.node_status()
+            items = data.get("items") or []
+        except Exception:
+            return []
+
+        machines: List[str] = []
+        # 优先使用空闲节点；如果暂时没有 Idle，也保留节点名，方便 HTCondor 自己排队。
+        idle_items = [
+            item for item in items
+            if str(item.get("state") or "").lower() == "unclaimed"
+            and str(item.get("activity") or "").lower() == "idle"
+        ]
+        chosen_items = idle_items or items
+
+        for item in chosen_items:
+            machine = str(item.get("machine") or "").strip()
+            if machine and machine not in machines:
+                machines.append(machine)
+        return machines
+
+    def _find_json_config_arg(self, command: List[str]) -> tuple[int, Path] | tuple[None, None]:
+        """从命令中找最后一个 json 配置文件参数。"""
+        for index in range(len(command) - 1, -1, -1):
+            try:
+                path = Path(str(command[index]).strip().strip('"'))
+                if path.suffix.lower() == ".json" and path.is_file():
+                    return index, path
+            except Exception:
+                pass
+        return None, None
+
+    def _is_path_text(self, value: str) -> bool:
+        """粗略判断字符串是不是路径。"""
+        text = str(value or "").strip().strip('"')
+        if not text:
+            return False
+        if re.match(r"^[A-Za-z]:[\\/]", text):
+            return True
+        if text.startswith("\\\\"):
+            return True
+        if "/" in text or "\\" in text:
+            return True
+        suffix = Path(text).suffix.lower()
+        return suffix in {".nc", ".hdf", ".h5", ".tif", ".tiff", ".dat", ".json", ".txt", ".csv"}
+
+    def _split_score_for_key(self, key: str) -> int:
+        """判断某个 json key 是否像可以拆分的输入列表。"""
+        key = str(key or "").lower()
+        score = 0
+        for word in ["input", "file", "files", "list", "task", "job", "data", "image", "nc", "hdf", "h8", "fy4"]:
+            if word in key:
+                score += 2
+        for word in ["output", "result", "model", "pkl", "lut", "resource"]:
+            if word in key:
+                score -= 5
+        return score
+
+    def _get_by_path(self, data: Any, path: List[Any]) -> Any:
+        obj = data
+        for key in path:
+            obj = obj[key]
+        return obj
+
+    def _set_by_path(self, data: Any, path: List[Any], value: Any):
+        obj = data
+        for key in path[:-1]:
+            obj = obj[key]
+        obj[path[-1]] = value
+
+    def _find_split_list_path(self, data: Any) -> List[Any]:
+        """在 config.json 里找最适合拆分的列表。
+
+        这不是为某一个固定模块硬编码，而是优先找 input_files、file_list、
+        tasks 这类名字明显的列表。找不到时就不强拆，避免把模型参数列表拆坏。
+        """
+        candidates: List[tuple[int, List[Any], int]] = []
+
+        def walk(obj: Any, path: List[Any], key_name: str = ""):
+            if isinstance(obj, dict):
+                for key, value in obj.items():
+                    walk(value, path + [key], str(key))
+                return
+
+            if isinstance(obj, list) and len(obj) >= 2:
+                score = self._split_score_for_key(key_name)
+                path_like_count = 0
+                for item in obj[:20]:
+                    if isinstance(item, str) and self._is_path_text(item):
+                        path_like_count += 1
+                    elif isinstance(item, dict):
+                        text_values = [str(v) for v in item.values() if isinstance(v, str)]
+                        if any(self._is_path_text(v) for v in text_values):
+                            path_like_count += 1
+
+                if path_like_count > 0:
+                    score += 10
+                if score >= 2:
+                    candidates.append((score, path, len(obj)))
+
+        walk(data, [])
+        if not candidates:
+            return []
+
+        candidates.sort(key=lambda x: (x[0], x[2]), reverse=True)
+        return candidates[0][1]
+
+    def _find_input_dir_path(self, data: Any) -> List[Any]:
+        """在 config.json 里找输入目录字段。找不到列表时才用这个兜底。"""
+        names = {"input_dir", "input_folder", "input_path", "data_dir", "source_dir", "src_dir", "in_dir"}
+
+        def walk(obj: Any, path: List[Any], key_name: str = "") -> List[Any]:
+            if isinstance(obj, dict):
+                for key, value in obj.items():
+                    found = walk(value, path + [key], str(key))
+                    if found:
+                        return found
+            elif isinstance(obj, str) and key_name.lower() in names:
+                try:
+                    p = Path(obj)
+                    if p.is_dir():
+                        return path
+                except Exception:
+                    return []
+            return []
+
+        return walk(data, [])
+
+    def _rewrite_output_paths_for_part(self, data: Any, part_name: str):
+        """给每个子任务改一个独立输出目录，避免两个节点写同一个目录。"""
+        output_words = ["output", "out_dir", "outpath", "result", "save_dir", "target_dir"]
+
+        def walk(obj: Any, key_name: str = ""):
+            if isinstance(obj, dict):
+                for key, value in list(obj.items()):
+                    low_key = str(key).lower()
+                    if isinstance(value, str) and any(word in low_key for word in output_words):
+                        try:
+                            old_path = Path(value)
+                            # 文件路径保持后缀，目录路径追加 part_x。
+                            if old_path.suffix:
+                                new_path = old_path.with_name(f"{old_path.stem}_{part_name}{old_path.suffix}")
+                            else:
+                                new_path = old_path / part_name
+                            new_path.parent.mkdir(parents=True, exist_ok=True)
+                            if not new_path.suffix:
+                                new_path.mkdir(parents=True, exist_ok=True)
+                            obj[key] = str(new_path)
+                            continue
+                        except Exception:
+                            pass
+                    walk(value, str(key))
+            elif isinstance(obj, list):
+                for item in obj:
+                    walk(item, key_name)
+
+        walk(data)
+
+    def _link_or_copy_file(self, source: Path, target: Path) -> str:
+        """优先硬链接，失败再复制。"""
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if target.exists():
+                target.unlink()
+            os.link(source, target)
+            return "hardlink"
+        except Exception:
+            try:
+                shutil.copy2(source, target)
+                return "copy"
+            except Exception:
+                return "failed"
+
+    def _make_htcondor_split_entries(
+        self,
+        parent_id: str,
+        command: List[str],
+        working_dir: str | None,
+        env: Dict[str, str] | None,
+        machines: List[str],
+    ) -> List[Dict[str, Any]]:
+        """把一个模块任务拆成多个 HTCondor 子任务。
+
+        设计原则：
+        1. 能按 config.json 中的输入文件列表拆，就按列表拆；
+        2. 如果只有输入目录，就把目录里的文件分到 part 目录；
+        3. 如果无法安全拆分，就返回空列表，由外层退回单任务。
+        """
+        if len(machines) < 2:
+            return []
+
+        config_index, config_path = self._find_json_config_arg(command)
+        if config_index is None or config_path is None:
+            return []
+
+        try:
+            config_data = json.loads(config_path.read_text(encoding="utf-8-sig"))
+        except Exception:
+            return []
+
+        split_root = self.runtime_dir / "htcondor_splits" / parent_id
+        if split_root.exists():
+            shutil.rmtree(split_root, ignore_errors=True)
+        split_root.mkdir(parents=True, exist_ok=True)
+
+        entries: List[Dict[str, Any]] = []
+        link_modes: List[str] = []
+
+        list_path = self._find_split_list_path(config_data)
+        if list_path:
+            original_list = self._get_by_path(config_data, list_path)
+            if not isinstance(original_list, list) or len(original_list) < 2:
+                return []
+
+            chunks = [[] for _ in machines]
+            for index, item in enumerate(original_list):
+                chunks[index % len(machines)].append(item)
+
+            for index, machine in enumerate(machines):
+                if not chunks[index]:
+                    continue
+                part_name = f"part_{index + 1}_{machine}"
+                part_dir = split_root / part_name
+                part_dir.mkdir(parents=True, exist_ok=True)
+
+                part_config = copy.deepcopy(config_data)
+                self._set_by_path(part_config, list_path, chunks[index])
+                self._rewrite_output_paths_for_part(part_config, part_name)
+
+                part_config_path = part_dir / "config.json"
+                part_config_path.write_text(
+                    json.dumps(part_config, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+
+                part_command = [str(x) for x in command]
+                part_command[config_index] = str(part_config_path)
+                entries.append({
+                    "spec": {
+                        "label": f"HTCondor 子任务 {index + 1} / {machine}",
+                        "command": part_command,
+                        "working_dir": working_dir,
+                        "env": env or {},
+                        "target_machine": machine,
+                        "inputs": {
+                            "split_mode": "config_list",
+                            "machine": machine,
+                            "part_config": str(part_config_path),
+                            "part_count": len(chunks[index]),
+                        },
+                    }
+                })
+            return entries
+
+        # 兜底：如果 config 只有输入目录，就拆目录里的文件。
+        dir_path = self._find_input_dir_path(config_data)
+        if dir_path:
+            input_dir_text = self._get_by_path(config_data, dir_path)
+            input_dir = Path(str(input_dir_text))
+            if not input_dir.is_dir():
+                return []
+
+            files = [
+                p for p in sorted(input_dir.iterdir())
+                if p.is_file() and p.suffix.lower() in {
+                    ".nc", ".hdf", ".h5", ".tif", ".tiff", ".dat", ".txt", ".csv", ".bin"
+                }
+            ]
+            if len(files) < 2:
+                return []
+
+            chunks = [[] for _ in machines]
+            for index, file_path in enumerate(files):
+                chunks[index % len(machines)].append(file_path)
+
+            for index, machine in enumerate(machines):
+                if not chunks[index]:
+                    continue
+                part_name = f"part_{index + 1}_{machine}"
+                part_dir = split_root / part_name
+                part_input_dir = part_dir / "input"
+                part_input_dir.mkdir(parents=True, exist_ok=True)
+
+                used_modes = []
+                for source in chunks[index]:
+                    mode = self._link_or_copy_file(source, part_input_dir / source.name)
+                    used_modes.append(mode)
+                link_modes.extend(used_modes)
+
+                part_config = copy.deepcopy(config_data)
+                self._set_by_path(part_config, dir_path, str(part_input_dir))
+                self._rewrite_output_paths_for_part(part_config, part_name)
+
+                part_config_path = part_dir / "config.json"
+                part_config_path.write_text(
+                    json.dumps(part_config, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+
+                part_command = [str(x) for x in command]
+                part_command[config_index] = str(part_config_path)
+                entries.append({
+                    "spec": {
+                        "label": f"HTCondor 子任务 {index + 1} / {machine}",
+                        "command": part_command,
+                        "working_dir": working_dir,
+                        "env": env or {},
+                        "target_machine": machine,
+                        "inputs": {
+                            "split_mode": "input_dir",
+                            "machine": machine,
+                            "part_config": str(part_config_path),
+                            "part_input_dir": str(part_input_dir),
+                            "part_count": len(chunks[index]),
+                            "link_modes": sorted(set(used_modes)),
+                        },
+                        "cleanup_root": str(split_root),
+                        "link_modes": sorted(set(link_modes)),
+                    }
+                })
+            return entries
+
+        return []
+
+    def _assign_htcondor_targets(self, entries: List[Dict[str, Any]], machines: List[str]) -> List[Dict[str, Any]]:
+        """给没有指定 target_machine 的子任务自动分配执行节点。"""
+        if not machines:
+            return entries
+
+        result: List[Dict[str, Any]] = []
+        for index, entry in enumerate(entries):
+            new_entry = dict(entry)
+            spec = dict(new_entry.get("spec") or {})
+            if not spec.get("target_machine"):
+                spec["target_machine"] = machines[index % len(machines)]
+            new_entry["spec"] = spec
+            result.append(new_entry)
+        return result
+
     def _run_htcondor_single_task(
         self,
         task_id: str,
@@ -674,6 +1024,38 @@ class TaskManager:
         if manager is None:
             self._run_process_task(task_id, command, working_dir, env)
             return
+
+        # 开启 HTCondor 后，单个云反演任务也优先尝试按节点拆分。
+        # 如果 config.json 找不到可拆分输入，就退回旧的单任务提交。
+        machines = self._htcondor_available_machines()
+        auto_split = str(os.environ.get("LOCAL_WEB_HTCONDOR_AUTO_SPLIT", "1")).strip().lower() not in {"0", "false", "no", "off"}
+        if auto_split and len(machines) >= 2:
+            entries = self._make_htcondor_split_entries(
+                parent_id=task_id,
+                command=command,
+                working_dir=working_dir,
+                env=env or {},
+                machines=machines,
+            )
+            if entries:
+                self.append_log(task_id, f"[HTCONDOR] 检测到 {len(machines)} 个可用执行节点：{', '.join(machines)}")
+                self.append_log(task_id, f"[HTCONDOR] 已将本次任务自动拆分为 {len(entries)} 个子任务，并指定到不同节点执行。")
+                self.update_task(
+                    task_id,
+                    kind="htcondor_parent",
+                    parallel_total=len(entries),
+                    parallel_done=0,
+                    parallel_failed=0,
+                    max_workers=len(entries),
+                    execution_backend="htcondor",
+                )
+                self._run_htcondor_job_group(task_id, entries, len(entries), "自动多节点任务")
+                return
+
+            self.append_log(
+                task_id,
+                "[HTCONDOR] 当前任务没有找到可安全拆分的输入列表或输入目录，退回单任务提交。"
+            )
 
         self.update_task(
             task_id,
@@ -695,13 +1077,17 @@ class TaskManager:
             if kind == "submitted":
                 cluster_id = str(info.get("cluster_id") or "")
                 job_dir = str(info.get("job_dir") or "")
+                target = str(info.get("target_machine") or "")
                 self.update_task(
                     task_id,
                     htcondor_cluster_id=cluster_id,
                     htcondor_job_dir=job_dir,
                     execution_backend="htcondor",
                 )
-                self.append_log(task_id, f"[HTCONDOR] ClusterId={cluster_id}，已进入 HTCondor 队列")
+                if target:
+                    self.append_log(task_id, f"[HTCONDOR] ClusterId={cluster_id}，目标节点={target}，已进入 HTCondor 队列")
+                else:
+                    self.append_log(task_id, f"[HTCONDOR] ClusterId={cluster_id}，已进入 HTCondor 队列")
                 return
 
             text = str(info.get("text") or "")
@@ -764,8 +1150,16 @@ class TaskManager:
         max_workers: int,
         group_name: str,
     ):
+        machines = self._htcondor_available_machines()
+        entries = self._assign_htcondor_targets(entries, machines)
+
         total = len(entries)
+        if machines:
+            # HTCondor 模式下并发数按可用节点自动放大。
+            # 这样用户只点一次运行，也能让父节点和子节点同时拿到任务。
+            max_workers = max(int(max_workers or 1), min(len(machines), max(1, total)))
         max_workers = max(1, min(int(max_workers or 1), max(1, total)))
+
         manager = self.htcondor_manager
         if manager is None:
             raise RuntimeError("HTCondorClusterManager 未初始化")
@@ -781,7 +1175,10 @@ class TaskManager:
             execution_backend="htcondor",
         )
         self.append_log(parent_id, f"[HTCONDOR] {group_name}启动：总任务数={total}，最多同时提交={max_workers}")
-        self.append_log(parent_id, "[HTCONDOR] 这是第一版接入，要求各执行节点安装相同模块，输入输出路径按 config.json 保持不变。")
+        if machines:
+            self.append_log(parent_id, f"[HTCONDOR] 当前可用执行节点：{', '.join(machines)}")
+        self.append_log(parent_id, "[HTCONDOR] 系统会为每个子任务写入 target_machine，尽量让不同节点同时运行。")
+        self.append_log(parent_id, "[HTCONDOR] 各节点需要能访问 config.json 中写入的大型输入/输出路径。")
 
         done_count = 0
         failures = 0
@@ -795,6 +1192,7 @@ class TaskManager:
                     spec = entry["spec"]
                     child_id = entry.get("child_id")
                     label = str(spec.get("label") or f"子任务 {index + 1}")
+                    target_machine = str(spec.get("target_machine") or "")
 
                     if not child_id:
                         parent_task = self.get_task(parent_id) or {}
@@ -809,6 +1207,7 @@ class TaskManager:
                                 "job_index": index + 1,
                                 "owner_username": str(parent_task.get("owner_username") or ""),
                                 "execution_backend": "htcondor",
+                                "target_machine": target_machine,
                             },
                         )
                         child_id = child["id"]
@@ -822,26 +1221,88 @@ class TaskManager:
                             status="running",
                             started_at=now_iso(),
                             execution_backend="htcondor",
+                            target_machine=target_machine,
                         )
+
+                    def make_on_update(current_child_id: str, current_label: str, current_target: str):
+                        def on_update(info):
+                            info = info or {}
+                            kind = str(info.get("type") or "")
+                            text = str(info.get("text") or "")
+
+                            if kind == "submitted":
+                                cluster_id = str(info.get("cluster_id") or "")
+                                job_dir = str(info.get("job_dir") or "")
+                                self.update_task(
+                                    current_child_id,
+                                    htcondor_cluster_id=cluster_id,
+                                    htcondor_job_dir=job_dir,
+                                    execution_backend="htcondor",
+                                )
+                                self.append_log(
+                                    parent_id,
+                                    f"[HTCONDOR] {current_label} 已进入队列，ClusterId={cluster_id}，目标节点={current_target or '-'}"
+                                )
+                                return
+
+                            if not text:
+                                return
+                            if kind == "stdout":
+                                self._append_htcondor_output(current_child_id, "STDOUT", text)
+                            elif kind == "stderr":
+                                self._append_htcondor_output(current_child_id, "STDERR", text)
+                            elif kind == "event":
+                                useful = []
+                                for line in text.splitlines():
+                                    raw = str(line or "").strip()
+                                    low = raw.lower()
+                                    if (
+                                        "submitted" in low
+                                        or "executing" in low
+                                        or "terminated" in low
+                                        or "aborted" in low
+                                        or "held" in low
+                                        or "removed" in low
+                                    ):
+                                        useful.append(raw)
+                                if useful:
+                                    self._append_htcondor_output(current_child_id, "CONDOR", "\n".join(useful), max_lines=80)
+                        return on_update
+
+                    def make_should_cancel(current_child_id: str):
+                        def should_cancel():
+                            task = self.get_task(current_child_id) or {}
+                            return (
+                                parent_id in self.cancel_flags
+                                or current_child_id in self.cancel_flags
+                                or task.get("status") == "cancelled"
+                            )
+                        return should_cancel
 
                     future = pool.submit(
                         manager.run_job,
-                        child_id,
-                        spec.get("command") or [],
-                        spec.get("working_dir"),
-                        spec.get("env") or {},
-                        self.htcondor_job_timeout_seconds,
+                        job_id=child_id,
+                        command=spec.get("command") or [],
+                        working_dir=spec.get("working_dir"),
+                        env=spec.get("env") or {},
+                        timeout_seconds=self.htcondor_job_timeout_seconds,
+                        on_update=make_on_update(child_id, label, target_machine),
+                        should_cancel=make_should_cancel(child_id),
+                        target_machine=target_machine,
                     )
                     future_map[future] = {
                         "child_id": child_id,
                         "label": label,
+                        "target_machine": target_machine,
                     }
-                    self.append_log(parent_id, f"[HTCONDOR] 已提交 {index + 1}/{total}: {label}")
+                    if target_machine:
+                        self.append_log(parent_id, f"[HTCONDOR] 已提交 {index + 1}/{total}: {label} -> {target_machine}")
+                    else:
+                        self.append_log(parent_id, f"[HTCONDOR] 已提交 {index + 1}/{total}: {label}")
 
                 while future_map:
                     if parent_id in self.cancel_flags:
-                        self.append_log(parent_id, "[HTCONDOR] 收到取消请求，等待已提交的任务结束。")
-                        break
+                        self.append_log(parent_id, "[HTCONDOR] 收到取消请求，正在等待已提交的任务结束或取消。")
 
                     done, _ = wait(list(future_map.keys()), timeout=0.5, return_when=FIRST_COMPLETED)
                     if not done:
@@ -880,12 +1341,15 @@ class TaskManager:
 
             if parent_id in self.cancel_flags:
                 final_status = "cancelled"
+                return_code = -1
             else:
                 final_status = "success" if failures == 0 and done_count == total else "failed"
+                return_code = 0 if final_status == "success" else 1
 
             self.update_task(
                 parent_id,
                 status=final_status,
+                return_code=return_code,
                 ended_at=now_iso(),
                 parallel_done=done_count,
                 parallel_failed=failures,

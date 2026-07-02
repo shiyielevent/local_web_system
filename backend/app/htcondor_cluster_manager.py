@@ -1296,6 +1296,7 @@ else {
         command: List[str],
         working_dir: str | None,
         env: Dict[str, str] | None,
+        target_machine: str = "",
     ) -> Dict[str, Path]:
         job_path = self.job_dir / job_id
         if job_path.exists():
@@ -1326,15 +1327,41 @@ else {
         run_cmd = job_path / "run_job.cmd"
         sub_file = job_path / "job.sub"
 
+        # 为了让子节点也能读到平台生成的 config.json，
+        # 这里把较小的 json 配置文件随作业一起传输。
+        # 大型输入数据仍然按 config.json 中的路径读取，不在这里传。
         safe_command = [str(x) for x in command]
-        cmd_line = " ".join(self._batch_quote(x) for x in safe_command)
+        transfer_files = ["run_job.cmd"]
+        config_arg_index = None
+        config_copy = job_path / "localweb_config.json"
+        for idx in range(len(safe_command) - 1, -1, -1):
+            try:
+                p = Path(safe_command[idx].strip().strip('"'))
+                if p.suffix.lower() == ".json" and p.is_file() and p.stat().st_size <= 10 * 1024 * 1024:
+                    shutil.copy2(p, config_copy)
+                    config_arg_index = idx
+                    transfer_files.append("localweb_config.json")
+                    break
+            except Exception:
+                pass
+
+        cmd_parts = []
+        for idx, item in enumerate(safe_command):
+            if config_arg_index is not None and idx == config_arg_index:
+                cmd_parts.append('"%LOCAL_WEB_CONFIG_JSON%"')
+            else:
+                cmd_parts.append(self._batch_quote(item))
+        cmd_line = " ".join(cmd_parts)
 
         lines = [
             "@echo off",
             "chcp 65001 >nul",
             "setlocal EnableExtensions",
+            "set LOCAL_WEB_JOB_DIR=%CD%",
+            "set LOCAL_WEB_CONFIG_JSON=%LOCAL_WEB_JOB_DIR%\\localweb_config.json",
             "echo [HTCONDOR] job started",
             "echo [HTCONDOR] computer=%COMPUTERNAME%",
+            "echo [HTCONDOR] target_machine=" + str(target_machine or ""),
             "echo [HTCONDOR] date=%DATE% %TIME%",
         ]
 
@@ -1363,13 +1390,21 @@ else {
         run_cmd.write_text("\r\n".join(lines) + "\r\n", encoding="ascii", errors="ignore")
 
         job_dir_posix = str(job_path).replace("\\", "/")
+        target_machine = str(target_machine or "").strip()
+        requirements_line = ""
+        if target_machine:
+            # 指定执行节点。这样父节点和子节点可以各拿到一份子任务。
+            safe_machine = target_machine.replace('\\', '\\\\').replace('"', '\\"')
+            requirements_line = f'requirements = (Machine == "{safe_machine}")\n'
+
+        transfer_input_files = ", ".join(transfer_files)
         sub_text = f"""universe = vanilla
 executable = C:/Windows/System32/cmd.exe
 arguments = /D /C run_job.cmd
 initialdir = {job_dir_posix}
-should_transfer_files = YES
+{requirements_line}should_transfer_files = YES
 when_to_transfer_output = ON_EXIT
-transfer_input_files = run_job.cmd
+transfer_input_files = {transfer_input_files}
 stream_output = True
 stream_error = True
 output = stdout.txt
@@ -1556,11 +1591,12 @@ queue 1
         timeout_seconds: int | None = None,
         on_update=None,
         should_cancel=None,
+        target_machine: str = "",
     ) -> Dict[str, Any]:
         if not self.distributed_execution_enabled():
             raise HTCondorClusterError("HTCondor 当前不可用，任务没有提交。")
 
-        files = self._write_job_files(job_id, command, working_dir, env)
+        files = self._write_job_files(job_id, command, working_dir, env, target_machine=target_machine)
         timeout_seconds = int(timeout_seconds or self.default_timeout_seconds)
 
         # condor_submit 必须用 LocalWebCondor 提交，不能用当前登录用户提交。
@@ -1587,6 +1623,7 @@ queue 1
                     "job_id": job_id,
                     "cluster_id": cluster_id,
                     "job_dir": str(files["job_dir"]),
+                    "target_machine": str(target_machine or ""),
                 })
             except Exception:
                 pass
@@ -1742,6 +1779,7 @@ queue 1
             "cluster_id": cluster_id,
             "job_dir": str(files["job_dir"]),
             "hostname": computer or socket.gethostname(),
+            "target_machine": str(target_machine or ""),
             "return_code": return_code,
             "stdout": "" if on_update else stdout,
             "stderr": "" if on_update else stderr,
