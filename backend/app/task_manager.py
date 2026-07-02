@@ -1,5 +1,6 @@
 from __future__ import annotations
 import copy
+import fnmatch
 import json
 import time
 import os
@@ -744,6 +745,324 @@ class TaskManager:
             obj = obj[key]
         obj[path[-1]] = value
 
+
+    def _load_module_items(self) -> List[Dict[str, Any]]:
+        """读取 backend/data/modules.json 中的模块定义。
+
+        这里不把某一个模块的字段名写死在代码里。
+        平台安装模块时，输入、输出字段已经写在 modules.json 里，
+        HTCondor 自动拆分任务时也应该优先使用这份配置。
+        """
+        path = self.base_dir / "data" / "modules.json"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def _find_module_item(self, module_id: str) -> Dict[str, Any]:
+        """根据 module_id 找到当前任务对应的模块配置。"""
+        module_id = str(module_id or "").strip()
+        if not module_id:
+            return {}
+
+        for item in self._load_module_items():
+            if str(item.get("id") or "").strip() == module_id:
+                return item if isinstance(item, dict) else {}
+        return {}
+
+    def _module_input_defs(self, module_item: Dict[str, Any]) -> List[Dict[str, Any]]:
+        items = module_item.get("inputs") or []
+        return [x for x in items if isinstance(x, dict)]
+
+    def _module_split_input_def(self, module_item: Dict[str, Any], config_data: Dict[str, Any]) -> Dict[str, Any]:
+        """从模块配置中选择最适合拆分的输入字段。
+
+        优先级：
+        1. inputs 里 batch_role=input 的目录字段；
+        2. parallel.input_key 指定的字段；
+        3. io_role=input 且 match_mode=each_file 的目录字段。
+        """
+        input_defs = self._module_input_defs(module_item)
+        parallel = module_item.get("parallel") if isinstance(module_item.get("parallel"), dict) else {}
+        parallel_input_key = str((parallel or {}).get("input_key") or "").strip()
+
+        candidates: List[tuple[int, Dict[str, Any]]] = []
+        for item in input_defs:
+            key = str(item.get("key") or "").strip()
+            if not key or key not in config_data:
+                continue
+
+            value = config_data.get(key)
+            if not isinstance(value, str):
+                continue
+
+            try:
+                if not Path(value).is_dir():
+                    continue
+            except Exception:
+                continue
+
+            score = 0
+            if key == parallel_input_key and key:
+                score += 100
+            if str(item.get("batch_role") or "").lower() == "input":
+                score += 80
+            if str(item.get("io_role") or "").lower() == "input":
+                score += 20
+            if str(item.get("match_mode") or "").lower() == "each_file":
+                score += 20
+            if str(item.get("type") or "").lower() in {"dir_path", "folder", "directory"}:
+                score += 10
+            if str(item.get("file_patterns") or "").strip():
+                score += 10
+            # 明确是输出的字段不能作为拆分输入。
+            if str(item.get("io_role") or "").lower() == "output":
+                score -= 100
+            if str(item.get("batch_role") or "").lower() == "output":
+                score -= 30
+
+            if score > 0:
+                candidates.append((score, item))
+
+        if not candidates:
+            return {}
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1]
+
+    def _module_output_defs(self, module_item: Dict[str, Any], split_key: str = "") -> List[Dict[str, Any]]:
+        """返回需要给每个子任务单独改路径的输出字段。
+
+        注意：
+        有些模块会把中间结果目录写成 io_role=input、batch_role=output。
+        这种字段虽然是程序参数里的输入项，但批处理语义上是输出目录，
+        也应该按 part 分开，避免多个节点写到同一个目录。
+        """
+        result: List[Dict[str, Any]] = []
+        for item in self._module_input_defs(module_item):
+            key = str(item.get("key") or "").strip()
+            if not key or key == split_key:
+                continue
+            io_role = str(item.get("io_role") or "").lower()
+            batch_role = str(item.get("batch_role") or "").lower()
+            if io_role == "output" or batch_role == "output":
+                result.append(item)
+        return result
+
+    def _module_aux_input_defs(self, module_item: Dict[str, Any], split_key: str = "") -> List[Dict[str, Any]]:
+        """返回不参与拆分但运行时需要读取的辅助输入目录。"""
+        result: List[Dict[str, Any]] = []
+        for item in self._module_input_defs(module_item):
+            key = str(item.get("key") or "").strip()
+            if not key or key == split_key:
+                continue
+            io_role = str(item.get("io_role") or "").lower()
+            batch_role = str(item.get("batch_role") or "").lower()
+            if io_role == "input" and batch_role != "output":
+                result.append(item)
+        return result
+
+    def _split_patterns(self, text: str) -> List[str]:
+        patterns = []
+        for item in str(text or "").replace(",", ";").split(";"):
+            item = item.strip()
+            if item:
+                patterns.append(item)
+        return patterns
+
+    def _module_file_patterns(self, module_item: Dict[str, Any], input_def: Dict[str, Any]) -> List[str]:
+        """读取模块配置中的文件匹配规则。"""
+        patterns = self._split_patterns(str(input_def.get("file_patterns") or ""))
+        if patterns:
+            return patterns
+
+        parallel = module_item.get("parallel") if isinstance(module_item.get("parallel"), dict) else {}
+        patterns = self._split_patterns(str((parallel or {}).get("file_patterns") or ""))
+        return patterns or ["*"]
+
+    def _matches_any_pattern(self, path: Path, patterns: List[str]) -> bool:
+        if not patterns:
+            return True
+        name = path.name
+        for pattern in patterns:
+            if fnmatch.fnmatch(name, pattern):
+                return True
+        return False
+
+    def _collect_module_input_files(self, input_dir: Path, module_item: Dict[str, Any], input_def: Dict[str, Any]) -> List[Path]:
+        """按 modules.json 中的 file_patterns 收集输入文件。"""
+        if not input_dir.is_dir():
+            return []
+
+        patterns = self._module_file_patterns(module_item, input_def)
+        files = [
+            p for p in sorted(input_dir.iterdir())
+            if p.is_file() and self._matches_any_pattern(p, patterns)
+        ]
+
+        # 如果配置允许所有文件，或者匹配规则没有命中，就退一步使用目录下全部文件。
+        allow_all = bool(input_def.get("batch_allow_all_files"))
+        if not files and allow_all:
+            files = [p for p in sorted(input_dir.iterdir()) if p.is_file()]
+
+        allow_no_extension = bool(input_def.get("batch_allow_no_extension"))
+        if allow_no_extension:
+            no_ext_files = [
+                p for p in sorted(input_dir.iterdir())
+                if p.is_file() and not p.suffix and p not in files
+            ]
+            files.extend(no_ext_files)
+
+        # 去重，保持顺序。
+        result: List[Path] = []
+        seen: set[str] = set()
+        for p in files:
+            key = str(p).lower()
+            if key not in seen:
+                seen.add(key)
+                result.append(p)
+        return result
+
+    def _make_htcondor_split_entries_by_module(
+        self,
+        parent_id: str,
+        command: List[str],
+        working_dir: str | None,
+        env: Dict[str, str] | None,
+        machines: List[str],
+        config_index: int,
+        config_path: Path,
+        config_data: Dict[str, Any],
+        split_root: Path,
+    ) -> List[Dict[str, Any]]:
+        """按照 modules.json 的字段定义拆分 HTCondor 子任务。"""
+        parent_task = self.get_task(parent_id) or {}
+        module_id = str(parent_task.get("module_id") or "").strip()
+        module_item = self._find_module_item(module_id)
+        if not module_item:
+            return []
+
+        if not isinstance(config_data, dict):
+            return []
+
+        split_input = self._module_split_input_def(module_item, config_data)
+        if not split_input:
+            return []
+
+        split_key = str(split_input.get("key") or "").strip()
+        if not split_key:
+            return []
+
+        input_dir = Path(str(config_data.get(split_key) or ""))
+        files = self._collect_module_input_files(input_dir, module_item, split_input)
+        if len(files) < 2:
+            return []
+
+        # 按机器数量把文件平均切开。第 1 个文件给第 1 台机器，第 2 个给第 2 台机器，循环分配。
+        chunks = [[] for _ in machines]
+        for index, file_path in enumerate(files):
+            chunks[index % len(machines)].append(file_path)
+
+        output_defs = self._module_output_defs(module_item, split_key=split_key)
+        aux_input_defs = self._module_aux_input_defs(module_item, split_key=split_key)
+
+        entries: List[Dict[str, Any]] = []
+        for index, machine in enumerate(machines):
+            if not chunks[index]:
+                continue
+
+            part_name = f"part_{index + 1}_{machine}"
+            part_dir = split_root / part_name
+            part_dir.mkdir(parents=True, exist_ok=True)
+
+            # 目录名直接使用模块字段 key，便于排查。
+            part_input_dir = part_dir / split_key
+            part_input_dir.mkdir(parents=True, exist_ok=True)
+
+            used_modes = []
+            for source in chunks[index]:
+                mode = self._link_or_copy_file(source, part_input_dir / source.name)
+                used_modes.append(mode)
+
+            part_config = copy.deepcopy(config_data)
+
+            # 子节点运行时真实路径由 htcondor_cluster_manager.py 中的
+            # __LOCAL_WEB_JOB_DIR__ 占位符替换得到。
+            part_config[split_key] = f"__LOCAL_WEB_JOB_DIR__/{split_key}"
+
+            for out_def in output_defs:
+                out_key = str(out_def.get("key") or "").strip()
+                if not out_key or out_key not in part_config:
+                    continue
+                out_dir = part_dir / out_key
+                out_dir.mkdir(parents=True, exist_ok=True)
+                part_config[out_key] = f"__LOCAL_WEB_JOB_DIR__/{out_key}"
+
+            # 辅助输入目录不拆分。为了避免子节点读不到父节点磁盘，
+            # 这里把辅助目录复制/硬链接到子任务目录。
+            for aux_def in aux_input_defs:
+                aux_key = str(aux_def.get("key") or "").strip()
+                if not aux_key or aux_key not in config_data:
+                    continue
+                aux_source = Path(str(config_data.get(aux_key) or ""))
+                if not aux_source.is_dir():
+                    continue
+                aux_dir = part_dir / aux_key
+                aux_dir.mkdir(parents=True, exist_ok=True)
+                aux_patterns = self._module_file_patterns(module_item, aux_def)
+                aux_files = [
+                    p for p in sorted(aux_source.iterdir())
+                    if p.is_file() and self._matches_any_pattern(p, aux_patterns)
+                ]
+                if not aux_files and bool(aux_def.get("batch_allow_all_files")):
+                    aux_files = [p for p in sorted(aux_source.iterdir()) if p.is_file()]
+                for source in aux_files:
+                    self._link_or_copy_file(source, aux_dir / source.name)
+                part_config[aux_key] = f"__LOCAL_WEB_JOB_DIR__/{aux_key}"
+
+            # 每个子任务只处理一部分文件，内部并行数按节点数拆开。
+            # 这样可以避免两台机器同时各开很多进程，把电脑拖死。
+            for key in ["parallel_workers", "_parallel_workers", "_effective_parallel_workers"]:
+                if isinstance(part_config.get(key), int):
+                    part_config[key] = max(1, int(part_config[key]) // max(1, len(machines)))
+
+            part_config_path = part_dir / "config.json"
+            part_config_path.write_text(
+                json.dumps(part_config, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+            part_command = [str(x) for x in command]
+            part_command[config_index] = str(part_config_path)
+
+            entries.append({
+                "spec": {
+                    "label": f"{module_item.get('name') or 'HTCondor'} 子任务 {index + 1} / {machine}",
+                    "module_id": module_id,
+                    "module_name": str(module_item.get("name") or parent_task.get("module_name") or ""),
+                    "command": part_command,
+                    "working_dir": working_dir,
+                    "env": env or {},
+                    "target_machine": machine,
+                    "inputs": {
+                        "split_mode": "module_config",
+                        "module_id": module_id,
+                        "split_key": split_key,
+                        "machine": machine,
+                        "part_config": str(part_config_path),
+                        "part_input_dir": str(part_input_dir),
+                        "part_count": len(chunks[index]),
+                        "file_patterns": self._module_file_patterns(module_item, split_input),
+                        "link_modes": sorted(set(used_modes)),
+                    },
+                    "cleanup_root": str(split_root),
+                }
+            })
+
+        return entries
+
+
     def _find_split_list_path(self, data: Any) -> List[Any]:
         """在 config.json 里找最适合拆分的列表。
 
@@ -881,6 +1200,22 @@ class TaskManager:
 
         entries: List[Dict[str, Any]] = []
         link_modes: List[str] = []
+
+        # 优先按 modules.json 中的输入/输出字段拆分。
+        # 这样不同模块可以使用不同字段名，例如 file、input_dir、data_path 等。
+        module_entries = self._make_htcondor_split_entries_by_module(
+            parent_id=parent_id,
+            command=command,
+            working_dir=working_dir,
+            env=env or {},
+            machines=machines,
+            config_index=int(config_index),
+            config_path=config_path,
+            config_data=config_data,
+            split_root=split_root,
+        )
+        if module_entries:
+            return module_entries
 
         list_path = self._find_split_list_path(config_data)
         if list_path:

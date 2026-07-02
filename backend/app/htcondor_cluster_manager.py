@@ -1329,21 +1329,63 @@ else {
 
         # 为了让子节点也能读到平台生成的 config.json，
         # 这里把较小的 json 配置文件随作业一起传输。
-        # 大型输入数据仍然按 config.json 中的路径读取，不在这里传。
+        #
+        # 如果 TaskManager 生成的 config.json 里包含 __LOCAL_WEB_JOB_DIR__，
+        # 说明这是自动拆分后的子任务配置。系统会把 config.json 同目录下的
+        # input/output 子目录一起传给 HTCondor，并在执行节点上把占位符替换成
+        # 当前 HTCondor 作业目录。
         safe_command = [str(x) for x in command]
         transfer_files = ["run_job.cmd"]
         config_arg_index = None
         config_copy = job_path / "localweb_config.json"
+        rewrite_script = job_path / "rewrite_config.ps1"
         for idx in range(len(safe_command) - 1, -1, -1):
             try:
                 p = Path(safe_command[idx].strip().strip('"'))
                 if p.suffix.lower() == ".json" and p.is_file() and p.stat().st_size <= 10 * 1024 * 1024:
+                    config_text = p.read_text(encoding="utf-8-sig", errors="replace")
                     shutil.copy2(p, config_copy)
                     config_arg_index = idx
                     transfer_files.append("localweb_config.json")
+
+                    if "__LOCAL_WEB_JOB_DIR__" in config_text:
+                        rewrite_script.write_text(
+                            "\n".join([
+                                "$ErrorActionPreference = 'Stop'",
+                                "$jobDir = $env:LOCAL_WEB_JOB_DIR",
+                                "$jobDirForJson = $jobDir -replace '\\\\','/'",
+                                "$src = Join-Path $jobDir 'localweb_config.json'",
+                                "$dst = Join-Path $jobDir 'localweb_runtime_config.json'",
+                                "$text = Get-Content -LiteralPath $src -Raw",
+                                "$text = $text.Replace('__LOCAL_WEB_JOB_DIR__', $jobDirForJson)",
+                                "Set-Content -LiteralPath $dst -Value $text -Encoding UTF8",
+                            ]) + "\n",
+                            encoding="utf-8-sig",
+                        )
+                        transfer_files.append("rewrite_config.ps1")
+
+                        # 把 part_config.json 同目录下的子目录一起作为输入文件传输。
+                        # 这些目录通常是按节点拆出来的 input、output、cm_files 等。
+                        for child in sorted(p.parent.iterdir()):
+                            if not child.is_dir():
+                                continue
+                            target_dir = job_path / child.name
+                            if target_dir.exists():
+                                shutil.rmtree(target_dir, ignore_errors=True)
+                            shutil.copytree(child, target_dir)
+                            transfer_files.append(child.name)
                     break
             except Exception:
                 pass
+
+        # 去重，避免 transfer_input_files 中重复出现同名文件。
+        clean_transfer_files = []
+        seen_transfer = set()
+        for item in transfer_files:
+            if item not in seen_transfer:
+                seen_transfer.add(item)
+                clean_transfer_files.append(item)
+        transfer_files = clean_transfer_files
 
         cmd_parts = []
         for idx, item in enumerate(safe_command):
@@ -1359,6 +1401,11 @@ else {
             "setlocal EnableExtensions",
             "set LOCAL_WEB_JOB_DIR=%CD%",
             "set LOCAL_WEB_CONFIG_JSON=%LOCAL_WEB_JOB_DIR%\\localweb_config.json",
+            "if exist \"%LOCAL_WEB_JOB_DIR%\\rewrite_config.ps1\" (",
+            "  powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%LOCAL_WEB_JOB_DIR%\\rewrite_config.ps1\"",
+            "  if errorlevel 1 exit /b 101",
+            "  set LOCAL_WEB_CONFIG_JSON=%LOCAL_WEB_JOB_DIR%\\localweb_runtime_config.json",
+            ")",
             "echo [HTCONDOR] job started",
             "echo [HTCONDOR] computer=%COMPUTERNAME%",
             "echo [HTCONDOR] target_machine=" + str(target_machine or ""),
