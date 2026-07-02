@@ -1336,6 +1336,7 @@ else {
         # 当前 HTCondor 作业目录。
         safe_command = [str(x) for x in command]
         transfer_files = ["run_job.cmd"]
+        transfer_output_items = ["result.txt"]
         config_arg_index = None
         config_copy = job_path / "localweb_config.json"
         rewrite_script = job_path / "rewrite_config.ps1"
@@ -1373,8 +1374,15 @@ else {
                             target_dir = job_path / child.name
                             if target_dir.exists():
                                 shutil.rmtree(target_dir, ignore_errors=True)
+
+                            # 这里会把子任务目录中的 input/output/cm_files 等目录传给执行节点。
+                            # 输入目录通常已经包含 nc 文件；输出目录一般是空目录。
+                            # 只有空目录才加入 transfer_output_files，避免把大型输入文件又从子节点传回父节点。
+                            has_initial_files = any(x.is_file() for x in child.rglob('*'))
                             shutil.copytree(child, target_dir)
                             transfer_files.append(child.name)
+                            if not has_initial_files:
+                                transfer_output_items.append(child.name)
                     break
             except Exception:
                 pass
@@ -1446,6 +1454,15 @@ else {
             requirements_line = f'requirements = (Machine == "{safe_machine}")\n'
 
         transfer_input_files = ", ".join(transfer_files)
+        clean_transfer_output_items = []
+        seen_output_items = set()
+        for item in transfer_output_items:
+            if item and item not in seen_output_items:
+                seen_output_items.add(item)
+                clean_transfer_output_items.append(item)
+        transfer_output_files = ", ".join(clean_transfer_output_items)
+        transfer_output_line = f"transfer_output_files = {transfer_output_files}\n" if transfer_output_files else ""
+
         sub_text = f"""universe = vanilla
 executable = C:/Windows/System32/cmd.exe
 arguments = /D /C run_job.cmd
@@ -1453,7 +1470,7 @@ initialdir = {job_dir_posix}
 {requirements_line}should_transfer_files = YES
 when_to_transfer_output = ON_EXIT
 transfer_input_files = {transfer_input_files}
-stream_output = True
+{transfer_output_line}stream_output = True
 stream_error = True
 output = stdout.txt
 error = stderr.txt

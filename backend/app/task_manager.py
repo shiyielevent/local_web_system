@@ -665,6 +665,87 @@ class TaskManager:
         )
         return status
 
+    def _copy_tree_contents(self, source_dir: Path, target_dir: Path) -> tuple[int, int]:
+        """把一个目录下的文件复制到目标目录，返回 文件数、字节数。"""
+        file_count = 0
+        byte_count = 0
+        if not source_dir.is_dir():
+            return file_count, byte_count
+
+        for source in source_dir.rglob('*'):
+            if not source.is_file():
+                continue
+            try:
+                relative = source.relative_to(source_dir)
+                target = target_dir / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
+                file_count += 1
+                try:
+                    byte_count += int(source.stat().st_size)
+                except Exception:
+                    pass
+            except Exception:
+                continue
+        return file_count, byte_count
+
+    def _collect_htcondor_transferred_outputs(
+        self,
+        parent_id: str,
+        child_id: str,
+        spec: Dict[str, Any],
+        result: Dict[str, Any],
+        label: str = '',
+    ):
+        """把 HTCondor 执行目录传回来的输出复制回用户原始输出目录。
+
+        自动拆分任务时，config.json 中的 outpath/cm_files 等输出路径会被改成
+        __LOCAL_WEB_JOB_DIR__/outpath 这类 HTCondor 临时目录。
+        HTCondor 作业结束后，这些目录会先传回 backend/runtime/htcondor/jobs/<job>/。
+        这里再把它们整理复制到用户原本选择的输出目录下，避免用户在 D:/H8/data/output 里看不到结果。
+        """
+        result = result or {}
+        job_dir_text = str(result.get('job_dir') or '').strip()
+        if not job_dir_text:
+            return
+        job_dir = Path(job_dir_text)
+        inputs = spec.get('inputs') if isinstance(spec.get('inputs'), dict) else {}
+        mappings = inputs.get('output_mappings') or []
+        if not isinstance(mappings, list) or not mappings:
+            return
+
+        for item in mappings:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get('key') or '').strip()
+            job_subdir = str(item.get('job_subdir') or key).strip()
+            original_path = str(item.get('original_path') or '').strip()
+            part_name = str(item.get('part_name') or inputs.get('part_name') or '').strip()
+            if not job_subdir or not original_path:
+                continue
+
+            source_dir = job_dir / job_subdir
+            target_root = Path(original_path)
+            target_dir = target_root / part_name if part_name else target_root
+
+            if not source_dir.exists():
+                self.append_log(
+                    parent_id,
+                    f"[HTCONDOR-WARN] {label or child_id} 未发现传回输出目录：{source_dir}",
+                )
+                continue
+
+            file_count, byte_count = self._copy_tree_contents(source_dir, target_dir)
+            self.append_log(
+                parent_id,
+                f"[HTCONDOR] 已回收 {label or child_id} 的输出字段 {key}："
+                f"{file_count} 个文件 -> {target_dir}",
+            )
+            self.update_task(
+                child_id,
+                htcondor_collected_output_dir=str(target_dir),
+            )
+
     def _htcondor_available_machines(self) -> List[str]:
         """取当前 HTCondor 池里的可用执行机器。
 
@@ -986,6 +1067,7 @@ class TaskManager:
                 used_modes.append(mode)
 
             part_config = copy.deepcopy(config_data)
+            output_mappings: List[Dict[str, Any]] = []
 
             # 子节点运行时真实路径由 htcondor_cluster_manager.py 中的
             # __LOCAL_WEB_JOB_DIR__ 占位符替换得到。
@@ -995,9 +1077,17 @@ class TaskManager:
                 out_key = str(out_def.get("key") or "").strip()
                 if not out_key or out_key not in part_config:
                     continue
+                original_out_path = str(config_data.get(out_key) or '').strip()
                 out_dir = part_dir / out_key
                 out_dir.mkdir(parents=True, exist_ok=True)
                 part_config[out_key] = f"__LOCAL_WEB_JOB_DIR__/{out_key}"
+                if original_out_path:
+                    output_mappings.append({
+                        "key": out_key,
+                        "job_subdir": out_key,
+                        "original_path": original_out_path,
+                        "part_name": part_name,
+                    })
 
             # 辅助输入目录不拆分。为了避免子节点读不到父节点磁盘，
             # 这里把辅助目录复制/硬链接到子任务目录。
@@ -1052,8 +1142,10 @@ class TaskManager:
                         "machine": machine,
                         "part_config": str(part_config_path),
                         "part_input_dir": str(part_input_dir),
+                        "part_name": part_name,
                         "part_count": len(chunks[index]),
                         "file_patterns": self._module_file_patterns(module_item, split_input),
+                        "output_mappings": output_mappings,
                         "link_modes": sorted(set(used_modes)),
                     },
                     "cleanup_root": str(split_root),
@@ -1629,6 +1721,7 @@ class TaskManager:
                         "child_id": child_id,
                         "label": label,
                         "target_machine": target_machine,
+                        "spec": spec,
                     }
                     if target_machine:
                         self.append_log(parent_id, f"[HTCONDOR] 已提交 {index + 1}/{total}: {label} -> {target_machine}")
@@ -1652,6 +1745,14 @@ class TaskManager:
                         try:
                             result = future.result()
                             status = self._apply_htcondor_result(child_id, result)
+                            if status == "success":
+                                self._collect_htcondor_transferred_outputs(
+                                    parent_id=parent_id,
+                                    child_id=child_id,
+                                    spec=meta.get("spec") or {},
+                                    result=result,
+                                    label=label,
+                                )
                         except Exception as exc:
                             status = "failed"
                             self.append_log(child_id, f"[HTCONDOR-ERROR] {type(exc).__name__}: {exc}")
