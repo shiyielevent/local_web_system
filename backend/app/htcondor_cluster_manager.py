@@ -592,6 +592,13 @@ KILL = FALSE
 $serviceName = 'Condor'
 $warnings = New-Object System.Collections.Generic.List[string]
 
+function Add-WarningText {
+    param([string]$Text)
+    if (-not [string]::IsNullOrWhiteSpace($Text)) {
+        $warnings.Add($Text) | Out-Null
+    }
+}
+
 function Wait-CondorServiceState {
     param(
         [string]$Wanted,
@@ -606,21 +613,86 @@ function Wait-CondorServiceState {
         if ([string]$svc.Status -eq $Wanted) {
             return $true
         }
-        Start-Sleep -Seconds 1
+        Start-Sleep -Milliseconds 500
     }
     return $false
 }
 
-try {
-    # 先尝试温和重载。安全配置修改后，很多情况下 reconfig 就可以生效。
-    $reconfigExe = Join-Path 'C:/Condor/bin' 'condor_reconfig.exe'
-    if (Test-Path -LiteralPath $reconfigExe -PathType Leaf) {
-        try {
-            & $reconfigExe 2>&1 | Out-String | Out-Null
-            Start-Sleep -Seconds 3
-        } catch {
-            $warnings.Add('condor_reconfig 失败：' + $_.Exception.Message) | Out-Null
+function Find-CondorExe {
+    param([string]$Name)
+    $candidates = @(
+        (Join-Path 'C:/Condor/bin' $Name),
+        (Join-Path 'C:/condor/bin' $Name),
+        (Join-Path (Join-Path $env:ProgramFiles 'HTCondor\bin') $Name),
+        (Join-Path (Join-Path $env:ProgramFiles 'Condor\bin') $Name)
+    )
+    foreach ($candidate in $candidates) {
+        if ($candidate -and (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+            return $candidate
         }
+    }
+    return ''
+}
+
+function Invoke-ExternalWithTimeout {
+    param(
+        [string]$FilePath,
+        [string]$Arguments,
+        [int]$Seconds
+    )
+    if (-not (Test-Path -LiteralPath $FilePath -PathType Leaf)) {
+        Add-WarningText "找不到命令：$FilePath"
+        return $false
+    }
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $FilePath
+        $psi.Arguments = $Arguments
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.CreateNoWindow = $true
+        $proc = New-Object System.Diagnostics.Process
+        $proc.StartInfo = $psi
+        [void]$proc.Start()
+        if (-not $proc.WaitForExit($Seconds * 1000)) {
+            try { $proc.Kill() } catch {}
+            Add-WarningText "$FilePath $Arguments 执行超过 ${Seconds}s，已跳过等待。"
+            return $false
+        }
+        $out = $proc.StandardOutput.ReadToEnd()
+        $err = $proc.StandardError.ReadToEnd()
+        if ($proc.ExitCode -ne 0) {
+            Add-WarningText "$FilePath $Arguments 返回码=$($proc.ExitCode)：$out $err"
+            return $false
+        }
+        return $true
+    } catch {
+        Add-WarningText "$FilePath $Arguments 执行异常：$($_.Exception.Message)"
+        return $false
+    }
+}
+
+try {
+    $svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+    if ($null -eq $svc) {
+        throw '找不到 Condor 服务。'
+    }
+
+    $reconfigExe = Find-CondorExe 'condor_reconfig.exe'
+    $restartExe = Find-CondorExe 'condor_restart.exe'
+
+    # 第一优先级：使用 HTCondor 自己的 reconfig/restart。
+    # 这样不会触发 Windows Stop-Service 的长时间阻塞，也不会刷屏输出
+    # “正在等待服务 Condor 停止...”。
+    if ($reconfigExe) {
+        [void](Invoke-ExternalWithTimeout -FilePath $reconfigExe -Arguments '' -Seconds 12)
+        Start-Sleep -Seconds 2
+    }
+
+    if ($restartExe) {
+        [void](Invoke-ExternalWithTimeout -FilePath $restartExe -Arguments '-master' -Seconds 20)
+        Start-Sleep -Seconds 6
     }
 
     $svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
@@ -628,57 +700,36 @@ try {
         throw '找不到 Condor 服务。'
     }
 
-    # 角色变化涉及 DAEMON_LIST，仍然尽量重启服务。
-    if ($svc.Status -ne 'Stopped') {
-        try {
-            Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
-        } catch {
-            $warnings.Add('Stop-Service Condor 失败：' + $_.Exception.Message) | Out-Null
-        }
-        [void](Wait-CondorServiceState -Wanted 'Stopped' -Seconds 25)
-    }
-
-    $svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
-    if ($null -ne $svc -and $svc.Status -ne 'Stopped') {
-        # 有些机器上 Windows 服务保护导致 Stop-Process 显示拒绝访问。
-        # 这里把错误吞掉，不让系统卡死；后面以服务最终 Running 为准。
-        Get-Process condor* -ErrorAction SilentlyContinue | ForEach-Object {
-            try {
-                Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
-            } catch {
-                $warnings.Add('无法结束进程 ' + $_.ProcessName + '：' + $_.Exception.Message) | Out-Null
-            }
-        }
-        Start-Sleep -Seconds 3
-    }
-
-    $svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
-    if ($null -ne $svc -and $svc.Status -eq 'Stopped') {
+    if ($svc.Status -eq 'Stopped') {
         Start-Service -Name $serviceName -ErrorAction Stop
+        if (-not (Wait-CondorServiceState -Wanted 'Running' -Seconds 45)) {
+            throw 'Condor 服务启动超时。'
+        }
     }
-    elseif ($null -ne $svc -and $svc.Status -eq 'Running') {
-        # 如果服务没有完全停下来，至少再重载一次配置。
-        if (Test-Path -LiteralPath $reconfigExe -PathType Leaf) {
-            try { & $reconfigExe 2>&1 | Out-String | Out-Null } catch {}
+    elseif ($svc.Status -eq 'Running') {
+        # 服务已经运行，说明配置重载/重启请求已完成或服务没有必要停止。
+        # 再做一次轻量 reconfig，确保新配置被 master/schedd/startd 看见。
+        if ($reconfigExe) {
+            [void](Invoke-ExternalWithTimeout -FilePath $reconfigExe -Arguments '' -Seconds 12)
         }
     }
     else {
-        Start-Service -Name $serviceName -ErrorAction Stop
+        # 兜底：服务处于 StopPending/StartPending 等中间状态时，只等待有限时间。
+        # 不能再调用 Stop-Service，因为它会在部分机器上一直刷屏等待。
+        if (-not (Wait-CondorServiceState -Wanted 'Running' -Seconds 20)) {
+            $svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+            $statusText = if ($null -eq $svc) { 'missing' } else { [string]$svc.Status }
+            throw "Condor 服务处于 $statusText，系统已停止继续等待，避免管理员 PowerShell 卡死。请手动重启系统或在没有任务运行时重启 Condor 服务。"
+        }
     }
 
-    if (-not (Wait-CondorServiceState -Wanted 'Running' -Seconds 45)) {
-        $svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
-        $statusText = if ($null -eq $svc) { 'missing' } else { [string]$svc.Status }
-        throw "Condor 服务没有进入 Running 状态，当前状态：$statusText"
-    }
-
-    Start-Sleep -Seconds 10
+    Start-Sleep -Seconds 5
 } catch {
     $warningText = ($warnings -join '; ')
     if ($warningText) {
-        throw "重启 Condor 服务失败：$($_.Exception.Message)。附加信息：$warningText"
+        throw "刷新 Condor 服务失败：$($_.Exception.Message)。附加信息：$warningText"
     }
-    throw "重启 Condor 服务失败：$($_.Exception.Message)"
+    throw "刷新 Condor 服务失败：$($_.Exception.Message)"
 }
 """.strip()
 
