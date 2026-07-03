@@ -1503,7 +1503,8 @@ else {
             "  echo return_code=%LOCAL_WEB_EXIT%",
             "  echo computer=%COMPUTERNAME%",
             "  echo ended_at=%DATE% %TIME%",
-            ") > result.txt",
+            ") > \"%LOCAL_WEB_JOB_DIR%\\result.txt\"",
+            "if not exist \"%LOCAL_WEB_JOB_DIR%\\result.txt\" echo return_code=%LOCAL_WEB_EXIT% > \"%LOCAL_WEB_JOB_DIR%\\result.txt\"",
             "echo [HTCONDOR] job finished, return_code=%LOCAL_WEB_EXIT%",
             "exit /b %LOCAL_WEB_EXIT%",
         ])
@@ -1527,6 +1528,12 @@ else {
         transfer_output_files = ", ".join(clean_transfer_output_items)
         transfer_output_line = f"transfer_output_files = {transfer_output_files}\n" if transfer_output_files else ""
 
+        try:
+            request_memory_mb = int(os.environ.get("LOCAL_WEB_HTCONDOR_REQUEST_MEMORY_MB", "8192") or "8192")
+        except Exception:
+            request_memory_mb = 8192
+        request_memory_mb = max(1024, request_memory_mb)
+
         sub_text = f"""universe = vanilla
 executable = C:/Windows/System32/cmd.exe
 arguments = /D /C run_job.cmd
@@ -1540,7 +1547,7 @@ output = stdout.txt
 error = stderr.txt
 log = event.log
 request_cpus = 1
-request_memory = 1024MB
+request_memory = {request_memory_mb}MB
 request_disk = 1024MB
 run_as_owner = false
 queue 1
@@ -1813,6 +1820,51 @@ queue 1
                 last_stdout_len = self._emit_live_text(on_update, job_id, "stdout", stdout_text, last_stdout_len)
                 last_stderr_len = self._emit_live_text(on_update, job_id, "stderr", stderr_text, last_stderr_len)
                 last_event_len = self._emit_live_text(on_update, job_id, "event", event_text, last_event_len)
+
+                # HTCondor 传输输出失败时，作业会进入 Hold，condor_wait 不会自然返回。
+                # 典型情况：EXE 已经 return_code=0，但 result.txt 没有写在执行沙箱根目录，
+                # HTCondor 因找不到 result.txt 把作业 Hold。这里主动识别，避免前端一直显示运行中。
+                event_lower = (event_text or "").lower()
+                if ("job was held" in event_lower or "job is held" in event_lower or "transfer output files failure" in event_lower):
+                    combined_now = "\n".join([stdout_text or "", stderr_text or "", event_text or ""])
+                    exe_finished_ok = bool(
+                        re.search(r"job finished,\s*return_code\s*=\s*0", combined_now, re.IGNORECASE)
+                        or re.search(r"return_code\s*=\s*0", combined_now, re.IGNORECASE)
+                    )
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
+
+                    if exe_finished_ok:
+                        # 作业已经完成，只是 HTCondor 因 transfer_output_files 中的某个文件缺失而 Hold。
+                        # 清理 held 队列项，但不要把平台任务判为 cancelled。
+                        try:
+                            self._run_as_submit_account(
+                                [self._exe("condor_rm.exe"), cluster_id],
+                                working_dir=files["job_dir"],
+                                timeout=60,
+                            )
+                        except Exception:
+                            pass
+                        wait_stdout += "\n[LOCAL-WEB] HTCondor 作业在 EXE return_code=0 后进入 Hold，已按完成处理并清理队列。"
+                        break
+
+                    hold_lines = [
+                        line.strip()
+                        for line in (event_text or "").splitlines()
+                        if "Hold" in line or "held" in line.lower() or "Transfer output" in line
+                    ]
+                    detail = hold_lines[-1] if hold_lines else "HTCondor 作业进入 Hold。"
+                    try:
+                        self._run_as_submit_account(
+                            [self._exe("condor_rm.exe"), cluster_id],
+                            working_dir=files["job_dir"],
+                            timeout=60,
+                        )
+                    except Exception:
+                        pass
+                    raise HTCondorClusterError(f"HTCondor 作业进入 Hold：{detail}")
 
                 if process.poll() is not None:
                     break
