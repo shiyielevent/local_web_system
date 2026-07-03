@@ -641,10 +641,14 @@ class TaskManager:
         self._append_htcondor_output(task_id, "CONDOR", str(result.get("wait_output") or ""), max_lines=80)
 
         return_code = int(result.get("return_code", -1))
-        if bool(result.get("cancelled")) or return_code == -2:
+        # return_code=0 表示 EXE 已经自然结束。即使用户曾经点过取消，
+        # 只要 HTCondor 最终拿到的是正常退出，就按 success 处理，后续才能回收输出文件。
+        if return_code == 0:
+            status = "success"
+        elif bool(result.get("cancelled")) or return_code == -2:
             status = "cancelled"
         else:
-            status = "success" if return_code == 0 else "failed"
+            status = "failed"
 
         remote_name = str(result.get("hostname") or "unknown")
         cluster_id = str(result.get("cluster_id") or "")
@@ -712,7 +716,16 @@ class TaskManager:
         inputs = spec.get('inputs') if isinstance(spec.get('inputs'), dict) else {}
         mappings = inputs.get('output_mappings') or []
         if not isinstance(mappings, list) or not mappings:
+            self.append_log(
+                parent_id,
+                f"[HTCONDOR-WARN] {label or child_id} 没有 output_mappings，无法自动回收输出。job_dir={job_dir}",
+            )
             return
+
+        self.append_log(
+            parent_id,
+            f"[HTCONDOR] 开始回收 {label or child_id} 的 HTCondor 输出，job_dir={job_dir}",
+        )
 
         for item in mappings:
             if not isinstance(item, dict):
@@ -736,11 +749,18 @@ class TaskManager:
                 continue
 
             file_count, byte_count = self._copy_tree_contents(source_dir, target_dir)
-            self.append_log(
-                parent_id,
-                f"[HTCONDOR] 已回收 {label or child_id} 的输出字段 {key}："
-                f"{file_count} 个文件 -> {target_dir}",
-            )
+            if file_count <= 0:
+                self.append_log(
+                    parent_id,
+                    f"[HTCONDOR-WARN] {label or child_id} 的输出字段 {key} 已传回但为空："
+                    f"{source_dir} -> {target_dir}",
+                )
+            else:
+                self.append_log(
+                    parent_id,
+                    f"[HTCONDOR] 已回收 {label or child_id} 的输出字段 {key}："
+                    f"{file_count} 个文件，{byte_count} 字节 -> {target_dir}",
+                )
             self.update_task(
                 child_id,
                 htcondor_collected_output_dir=str(target_dir),
@@ -1777,12 +1797,17 @@ class TaskManager:
                         )
                         self.append_log(parent_id, f"[HTCONDOR] 完成 {done_count}/{total}: {label}，状态={status}")
 
-            if parent_id in self.cancel_flags:
+            # 如果用户曾经点过“取消”，但两个 HTCondor 子任务最终都已经正常 return_code=0，
+            # 仍然应该按 success 收尾，否则输出回收会被误判为取消任务而跳过。
+            if failures == 0 and done_count == total:
+                final_status = "success"
+                return_code = 0
+            elif parent_id in self.cancel_flags:
                 final_status = "cancelled"
                 return_code = -1
             else:
-                final_status = "success" if failures == 0 and done_count == total else "failed"
-                return_code = 0 if final_status == "success" else 1
+                final_status = "failed"
+                return_code = 1
 
             self.update_task(
                 parent_id,

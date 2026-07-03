@@ -867,6 +867,19 @@ finally {{
         text = text.replace('"', '\\"')
         return f'"{text}"'
 
+    def _batch_arg(self, value: str) -> str:
+        """生成 Windows bat/cmd 中可用的单个命令参数。
+
+        cmd.exe 的 /D、/C 这类开关不能强行加双引号。
+        之前自检任务会生成类似 cmd.exe "/D" "/C" "echo ..."，
+        在部分 Windows cmd 解析下会导致 echo 命令失败，result.txt 不生成，
+        最终表现为 condor_wait 超时或作业进入 Hold。
+        """
+        text = str(value)
+        if re.fullmatch(r"[-/][A-Za-z0-9_:.,=+\-]+", text):
+            return text.replace("%", "%%")
+        return self._batch_quote(text)
+
 
     def _read_submit_account_password(self) -> str:
         """读取一键安装脚本保存的 LocalWebCondor 密码。
@@ -1401,7 +1414,7 @@ else {
             if config_arg_index is not None and idx == config_arg_index:
                 cmd_parts.append('"%LOCAL_WEB_CONFIG_JSON%"')
             else:
-                cmd_parts.append(self._batch_quote(item))
+                cmd_parts.append(self._batch_arg(item))
         cmd_line = " ".join(cmd_parts)
 
         lines = [
@@ -1835,6 +1848,22 @@ queue 1
             else:
                 return_code = 1
 
+        # 如果用户在 EXE 已经自然结束后才点了“取消”，condor_rm 可能已经来不及真正杀掉作业。
+        # 这种情况下 event.log / result.txt 会显示 return_code=0 或 Normal termination。
+        # 旧逻辑只要看到 cancel_flags 就把任务判为 cancelled，导致后续不回收输出文件。
+        # 这里以真实退出码和 HTCondor 终止事件为准：正常退出 return_code=0 优先判为成功。
+        combined_runtime_text = "\n".join([stdout or "", stderr or "", result_text or "", event_text or ""]).lower()
+        normal_success = (
+            return_code == 0
+            and (
+                "normal termination" in combined_runtime_text
+                or "job finished, return_code=0" in combined_runtime_text
+                or "return_code=0" in combined_runtime_text
+                or "return_code = 0" in combined_runtime_text
+            )
+        )
+        final_cancelled = bool(cancelled and not normal_success)
+
         computer = ""
         m = re.search(r"computer\s*=\s*([^\r\n]+)", result_text)
         if m:
@@ -1853,7 +1882,8 @@ queue 1
             "started_at": now_iso(),
             "ended_at": now_iso(),
             "live_output_sent": bool(on_update),
-            "cancelled": cancelled,
+            "cancelled": final_cancelled,
+            "cancel_requested": cancelled,
         }
 
     def smoke_test(self) -> Dict[str, Any]:
