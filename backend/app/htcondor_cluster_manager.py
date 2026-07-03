@@ -1541,8 +1541,10 @@ initialdir = {job_dir_posix}
 {requirements_line}should_transfer_files = YES
 when_to_transfer_output = ON_EXIT
 transfer_input_files = {transfer_input_files}
-{transfer_output_line}stream_output = True
-stream_error = True
+{transfer_output_line}# 关闭 HTCondor stdout/stderr 实时流，避免 tqdm 进度条频繁刷屏拖慢局域网传输。
+# 任务结束后系统仍会读取 stdout.txt / stderr.txt 并写入平台日志。
+stream_output = False
+stream_error = False
 output = stdout.txt
 error = stderr.txt
 log = event.log
