@@ -30,6 +30,13 @@ class TaskManager:
         self.parallel_chunks_dir = self.runtime_dir / "parallel_chunks"
         self.parallel_chunks_dir.mkdir(parents=True, exist_ok=True)
 
+        # HTCondor 自动拆分和提交会产生大量临时输入/输出副本。
+        # 这两个目录只保存运行期缓存，任务结束后应自动清理，避免长期占用几十 GB 磁盘。
+        self.htcondor_splits_dir = self.runtime_dir / "htcondor_splits"
+        self.htcondor_jobs_dir = self.runtime_dir / "htcondor" / "jobs"
+        self.htcondor_splits_dir.mkdir(parents=True, exist_ok=True)
+        self.htcondor_jobs_dir.mkdir(parents=True, exist_ok=True)
+
         self.lock = threading.RLock()
         self.tasks: Dict[str, Dict[str, Any]] = {}
         self.processes: Dict[str, subprocess.Popen] = {}
@@ -114,6 +121,7 @@ class TaskManager:
 
         self._load_tasks()
         self._mark_interrupted_tasks()
+        self._cleanup_old_htcondor_runtime_dirs_on_startup()
         self._scheduler_heartbeat_thread = threading.Thread(
             target=self._scheduler_heartbeat,
             daemon=True,
@@ -1631,6 +1639,13 @@ class TaskManager:
         failures = 0
         future_map: Dict[Any, Dict[str, Any]] = {}
 
+        htcondor_cleanup_roots: list[str] = []
+        for entry in entries:
+            spec = entry.get("spec") if isinstance(entry, dict) else {}
+            cleanup_root = str((spec or {}).get("cleanup_root") or "").strip()
+            if cleanup_root and cleanup_root not in htcondor_cleanup_roots:
+                htcondor_cleanup_roots.append(cleanup_root)
+
         try:
             with ThreadPoolExecutor(max_workers=max_workers) as pool:
                 for index, entry in enumerate(entries):
@@ -1773,6 +1788,15 @@ class TaskManager:
                                     result=result,
                                     label=label,
                                 )
+
+                            # 输出已经回收到用户目录后，立即删除 job_dir 里的 file/cm_files/outpath 等大副本。
+                            # 即使子任务失败，也只保留日志文件，避免失败任务长期占用大量磁盘。
+                            self._cleanup_htcondor_job_dir(
+                                parent_id,
+                                str((result or {}).get("job_dir") or ""),
+                                label=label,
+                                reason=f"HTCondor 子任务结束，状态={status}",
+                            )
                         except Exception as exc:
                             status = "failed"
                             self.append_log(child_id, f"[HTCONDOR-ERROR] {type(exc).__name__}: {exc}")
@@ -1819,6 +1843,7 @@ class TaskManager:
                 execution_backend="htcondor",
             )
             self.append_log(parent_id, f"[HTCONDOR] {group_name}结束，状态={final_status}")
+            self._cleanup_runtime_roots(parent_id, htcondor_cleanup_roots, reason=f"HTCondor {group_name}结束，状态={final_status}")
             self._cleanup_runtime_roots_for_task(parent_id, reason=f"HTCondor {group_name}结束，状态={final_status}")
         except Exception as exc:
             self.append_log(parent_id, f"[HTCONDOR-ERROR] {type(exc).__name__}: {exc}")
@@ -1830,6 +1855,7 @@ class TaskManager:
                 ended_at=now_iso(),
                 execution_backend="htcondor",
             )
+            self._cleanup_runtime_roots(parent_id, htcondor_cleanup_roots, reason=f"HTCondor {group_name}异常结束")
             self._cleanup_runtime_roots_for_task(parent_id, reason=f"HTCondor {group_name}异常结束")
         finally:
             self.cancel_flags.discard(parent_id)
@@ -1934,6 +1960,10 @@ class TaskManager:
             allowed_roots.append(self.parallel_chunks_dir.resolve())
         except Exception:
             pass
+        try:
+            allowed_roots.append(self.htcondor_splits_dir.resolve())
+        except Exception:
+            pass
 
         manager = self.cluster_manager
         if manager is not None:
@@ -1997,6 +2027,104 @@ class TaskManager:
                 self.append_log(task_id, f"[CLEANUP] {reason}，已清理 {removed} 个平台拆分临时输入目录，避免占用磁盘空间。")
             except Exception:
                 pass
+
+    def _cleanup_htcondor_job_dir(self, task_id: str, job_dir_text: str, label: str = "", reason: str = "任务结束"):
+        """清理单个 HTCondor job 目录里的大文件夹，只保留小日志文件。
+
+        HTCondor 作业目录中通常包含：
+        - file / cm_files / outpath 等输入输出目录；
+        - job.sub / run_job.cmd / event.log / stdout.txt / stderr.txt / result.txt 等小日志。
+
+        输出已经回收到用户原始目录后，file、cm_files、outpath 这些运行副本就没有继续保留的必要。
+        这里只删除 job_dir 下的子目录，不删除 job_dir 本身和日志文件，方便后续排错。
+        """
+        if str(os.environ.get("LOCAL_WEB_KEEP_HTCONDOR_RUNTIME", "")).strip().lower() in {"1", "true", "yes", "on"}:
+            return
+
+        job_dir_text = str(job_dir_text or "").strip()
+        if not job_dir_text:
+            return
+
+        try:
+            job_dir = Path(job_dir_text).resolve()
+            allowed_root = self.htcondor_jobs_dir.resolve()
+            job_dir.relative_to(allowed_root)
+        except Exception:
+            return
+
+        if not job_dir.is_dir():
+            return
+
+        removed_dirs = 0
+        removed_files = 0
+        removed_bytes = 0
+
+        for child in list(job_dir.iterdir()):
+            if not child.is_dir():
+                continue
+
+            try:
+                for f in child.rglob("*"):
+                    if f.is_file():
+                        removed_files += 1
+                        try:
+                            removed_bytes += int(f.stat().st_size)
+                        except Exception:
+                            pass
+                shutil.rmtree(child, ignore_errors=True)
+                removed_dirs += 1
+            except Exception as exc:
+                try:
+                    self.append_log(task_id, f"[CLEANUP-WARN] 清理 HTCondor job 子目录失败：{child}，原因：{type(exc).__name__}: {exc}")
+                except Exception:
+                    pass
+
+        if removed_dirs:
+            try:
+                size_mb = removed_bytes / 1024 / 1024
+                who = label or job_dir.name
+                self.append_log(
+                    task_id,
+                    f"[CLEANUP] {reason}，已清理 {who} 的 HTCondor job 运行副本："
+                    f"{removed_dirs} 个目录、{removed_files} 个文件、约 {size_mb:.2f} MB；日志文件已保留。"
+                )
+            except Exception:
+                pass
+
+    def _cleanup_old_htcondor_runtime_dirs_on_startup(self):
+        """系统启动时清理过期 HTCondor 临时目录。
+
+        只清理 runtime/htcondor/jobs 与 runtime/htcondor_splits 下的子目录，
+        不会删除 submit_account_secret.bin、state.json、install_result.json 等配置文件。
+        默认保留 24 小时以内的目录，可用 LOCAL_WEB_HTCONDOR_RUNTIME_KEEP_HOURS 调整。
+        """
+        if str(os.environ.get("LOCAL_WEB_KEEP_HTCONDOR_RUNTIME", "")).strip().lower() in {"1", "true", "yes", "on"}:
+            return
+
+        try:
+            keep_hours = float(os.environ.get("LOCAL_WEB_HTCONDOR_RUNTIME_KEEP_HOURS", "24") or "24")
+        except Exception:
+            keep_hours = 24.0
+
+        keep_hours = max(1.0, keep_hours)
+        cutoff = time.time() - keep_hours * 3600.0
+
+        for root in [self.htcondor_jobs_dir, self.htcondor_splits_dir]:
+            try:
+                root = Path(root).resolve()
+            except Exception:
+                continue
+            if not root.is_dir():
+                continue
+
+            for child in list(root.iterdir()):
+                if not child.is_dir():
+                    continue
+                try:
+                    if child.stat().st_mtime < cutoff:
+                        shutil.rmtree(child, ignore_errors=True)
+                except Exception:
+                    pass
 
     def _cleanup_runtime_roots_for_task(self, task_id: str, reason: str = "任务结束"):
         task = self.get_task(task_id) or {}
