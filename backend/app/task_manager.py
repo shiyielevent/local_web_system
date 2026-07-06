@@ -4,6 +4,7 @@ import fnmatch
 import json
 import time
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -13,7 +14,6 @@ from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-import re
 
 
 def now_iso() -> str:
@@ -118,6 +118,35 @@ class TaskManager:
     def set_htcondor_manager(self, htcondor_manager):
         """注入 HTCondor 管理器。"""
         self.htcondor_manager = htcondor_manager
+
+    def _make_htcondor_safe_env(self, env: Dict[str, str] | None = None) -> Dict[str, str]:
+        """为 HTCondor 远程 EXE 注入稳定性环境变量。
+
+        系统层面限制 sklearn/joblib/BLAS 的内部线程数，避免：
+        平台多节点并行 + EXE 内部 RandomForest/joblib 多线程
+        叠加后在远程节点形成异常内存峰值。
+
+        这里只改运行环境，不改算法代码和模块 config。
+        """
+        safe_env = dict(env or {})
+
+        thread_limits = {
+            "OMP_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+            "OPENBLAS_NUM_THREADS": "1",
+            "NUMEXPR_NUM_THREADS": "1",
+            "VECLIB_MAXIMUM_THREADS": "1",
+            "BLIS_NUM_THREADS": "1",
+            # joblib 在 n_jobs=-1 时会参考 CPU 数；限制为 1 可显著降低 RandomForest 预测峰值内存。
+            "LOKY_MAX_CPU_COUNT": "1",
+            "PYTHONUNBUFFERED": "1",
+        }
+
+        # 不覆盖用户/模块显式传入的环境变量；只给缺省值。
+        for key, value in thread_limits.items():
+            safe_env.setdefault(key, value)
+
+        return safe_env
 
     def _htcondor_execution_requested(self) -> bool:
         manager = self.htcondor_manager
@@ -303,7 +332,6 @@ class TaskManager:
             else:
                 target_dir.mkdir(parents=True, exist_ok=True)
 
-            file_count, byte_count = self._copy_tree_contents(source_dir, target_dir)
             file_count, byte_count = self._copy_tree_contents(source_dir, target_dir)
             if file_count <= 0:
                 self.append_log(
@@ -1219,6 +1247,7 @@ class TaskManager:
             execution_backend="htcondor",
         )
         self.append_log(task_id, "[HTCONDOR] 单任务已提交给 HTCondor")
+        self.append_log(task_id, "[HTCONDOR] 已启用远程 EXE 稳定性环境：限制 sklearn/joblib/BLAS 内部线程数，降低远程节点内存峰值。")
         self.append_log(task_id, "[HTCONDOR] 当前版本要求执行节点具备相同的软件安装路径；大型输入输出仍按 config.json 中的路径读取和写入。")
 
         def should_cancel():
@@ -1279,7 +1308,7 @@ class TaskManager:
                 job_id=task_id,
                 command=command,
                 working_dir=working_dir,
-                env=env or {},
+                env=self._make_htcondor_safe_env(env or {}),
                 timeout_seconds=self.htcondor_job_timeout_seconds,
                 on_update=on_update,
                 should_cancel=should_cancel,
@@ -1332,6 +1361,7 @@ class TaskManager:
         self.append_log(parent_id, f"[HTCONDOR] {group_name}启动：总任务数={total}，最多同时提交={max_workers}")
         if machines:
             self.append_log(parent_id, f"[HTCONDOR] 当前可用执行节点：{', '.join(machines)}")
+        self.append_log(parent_id, "[HTCONDOR] 已启用远程 EXE 稳定性环境：限制 sklearn/joblib/BLAS 内部线程数，降低远程节点内存峰值。")
         self.append_log(parent_id, "[HTCONDOR] 系统会为每个子任务写入 target_machine，尽量让不同节点同时运行。")
         self.append_log(parent_id, "[HTCONDOR] 系统会为拆分任务传输子任务 config.json 和对应输入子目录；输出目录按子任务隔离。")
 
@@ -1446,7 +1476,7 @@ class TaskManager:
                         job_id=child_id,
                         command=spec.get("command") or [],
                         working_dir=spec.get("working_dir"),
-                        env=spec.get("env") or {},
+                        env=self._make_htcondor_safe_env(spec.get("env") or {}),
                         timeout_seconds=self.htcondor_job_timeout_seconds,
                         on_update=make_on_update(child_id, label, target_machine),
                         should_cancel=make_should_cancel(child_id),
