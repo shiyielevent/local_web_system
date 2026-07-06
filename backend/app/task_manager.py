@@ -455,6 +455,140 @@ class TaskManager:
                 result[machine] = self._clamp_htcondor_node_weight(default_weights.get(machine, 1), default=1)
         return result
 
+    def _htcondor_default_node_slots(self, machines: List[str]) -> Dict[str, int]:
+        """根据节点 CPU/内存生成默认 EXE 并发槽位建议。
+
+        slots 控制同一节点同时启动几个 EXE 子任务；不是输入文件权重。
+        """
+        machines = [str(x).strip() for x in machines if str(x).strip()]
+        if not machines:
+            return {}
+
+        result: Dict[str, int] = {machine: 1 for machine in machines}
+        manager = self.htcondor_manager
+        if manager is not None:
+            try:
+                data = manager.node_status()
+                for item in data.get("items") or []:
+                    machine = str(item.get("machine") or "").strip()
+                    if machine not in result:
+                        continue
+                    try:
+                        cpus = max(1, int(float(item.get("cpus") or 1)))
+                    except Exception:
+                        cpus = 1
+                    try:
+                        memory_mb = max(512.0, float(item.get("memory") or 1024))
+                    except Exception:
+                        memory_mb = 1024.0
+
+                    suggested = max(1, cpus // 8)
+                    if memory_mb < 8192:
+                        suggested = 1
+                    elif memory_mb < 12288:
+                        suggested = min(suggested, 2)
+                    else:
+                        suggested = min(suggested, 4)
+
+                    result[machine] = self._clamp_htcondor_node_slot(suggested, default=1)
+            except Exception:
+                pass
+        return result
+
+    def _clamp_htcondor_node_slot(self, value: Any, default: int = 1) -> int:
+        try:
+            n = int(value)
+        except Exception:
+            n = default
+        try:
+            max_slots = int(os.environ.get("LOCAL_WEB_HTCONDOR_MAX_NODE_SLOTS", "8") or "8")
+        except Exception:
+            max_slots = 8
+        return max(1, min(max(1, max_slots), n))
+
+    def _htcondor_machine_slots(self, machines: List[str]) -> Dict[str, int]:
+        """读取管理员设置的节点 EXE 并发槽位；没有设置时使用设备信息建议槽位。"""
+        machines = [str(x).strip() for x in machines if str(x).strip()]
+        default_slots = self._htcondor_default_node_slots(machines)
+        manager = self.htcondor_manager
+        state = getattr(manager, "state", {}) if manager is not None else {}
+        config = (state or {}).get("node_weight_config") or {}
+        if not isinstance(config, dict):
+            config = {}
+
+        raw_slots = config.get("slots") or {}
+        result: Dict[str, int] = {}
+        for machine in machines:
+            if isinstance(raw_slots, dict) and machine in raw_slots:
+                result[machine] = self._clamp_htcondor_node_slot(raw_slots.get(machine), default=default_slots.get(machine, 1))
+            else:
+                result[machine] = self._clamp_htcondor_node_slot(default_slots.get(machine, 1), default=1)
+        return result
+
+    def _split_items_evenly(self, items: List[Any], part_count: int) -> List[List[Any]]:
+        """把一个节点内的文件再按并发槽位均匀拆分。"""
+        part_count = max(1, int(part_count or 1))
+        chunks: List[List[Any]] = [[] for _ in range(part_count)]
+        if not items:
+            return chunks
+
+        total = len(items)
+        base = total // part_count
+        remainder = total % part_count
+        cursor = 0
+        for index in range(part_count):
+            size = base + (1 if index < remainder else 0)
+            if size <= 0:
+                continue
+            end = min(cursor + size, total)
+            chunks[index] = list(items[cursor:end])
+            cursor = end
+        return chunks
+
+    def _split_items_by_machine_weight_and_slots(self, items: List[Any], machines: List[str]) -> List[Dict[str, Any]]:
+        """先按节点权重分文件，再按节点 slots 拆成多个 EXE 子任务。
+
+        返回的每一项对应一个 HTCondor 子任务：
+        {
+            machine, node_weight, node_slots, slot_index, items
+        }
+        """
+        machines = [str(x).strip() for x in machines if str(x).strip()]
+        if not items or not machines:
+            return []
+
+        machine_chunks = self._split_items_by_machine_weight(items, machines)
+        weights_map = self._htcondor_machine_weights(machines)
+        slots_map = self._htcondor_machine_slots(machines)
+
+        result: List[Dict[str, Any]] = []
+        for machine_index, machine in enumerate(machines):
+            machine_items = machine_chunks[machine_index] if machine_index < len(machine_chunks) else []
+            if not machine_items:
+                continue
+
+            requested_slots = self._clamp_htcondor_node_slot(slots_map.get(machine, 1), default=1)
+            # 文件数少时不创建空子任务；例如该节点只有 2 个文件，最多生成 2 个 EXE。
+            effective_slots = max(1, min(requested_slots, len(machine_items)))
+            slot_chunks = self._split_items_evenly(machine_items, effective_slots)
+
+            for slot_index, slot_items in enumerate(slot_chunks, start=1):
+                if not slot_items:
+                    continue
+                result.append({
+                    "machine": machine,
+                    "machine_index": machine_index,
+                    "slot_index": slot_index,
+                    "node_slots": requested_slots,
+                    "effective_slots": effective_slots,
+                    "node_weight": self._clamp_htcondor_node_weight(weights_map.get(machine, 1), default=1),
+                    "items": slot_items,
+                    "machine_total_count": len(machine_items),
+                    "slot_count": len(slot_items),
+                })
+
+        return result
+
     def _split_items_by_machine_weight(self, items: List[Any], machines: List[str]) -> List[List[Any]]:
         """按节点权重直接计算每台机器应分配的输入数量。
 
@@ -533,10 +667,49 @@ class TaskManager:
             if not machine:
                 continue
             weight = inputs.get("node_weight", "")
+            slot_index = inputs.get("slot_index", "")
+            node_slots = inputs.get("node_slots", "")
             part_count = inputs.get("part_count", "")
             if part_count == "":
                 continue
-            rows.append(f"{machine}=权重{weight}, {part_count}个文件")
+            if slot_index:
+                rows.append(f"{machine}=权重{weight}, 槽位{slot_index}/{node_slots or '-'}, {part_count}个文件")
+            else:
+                rows.append(f"{machine}=权重{weight}, {part_count}个文件")
+        return "；".join(rows)
+
+    def _htcondor_machine_plan_text(self, entries: List[Dict[str, Any]]) -> str:
+        """汇总每台机器的权重、并发槽位、文件总数和 EXE 子任务数。"""
+        summary: Dict[str, Dict[str, Any]] = {}
+        for entry in entries or []:
+            spec = entry.get("spec") if isinstance(entry, dict) else {}
+            spec = spec if isinstance(spec, dict) else {}
+            inputs = spec.get("inputs") if isinstance(spec.get("inputs"), dict) else {}
+            machine = str(inputs.get("machine") or spec.get("target_machine") or "").strip()
+            if not machine:
+                continue
+            row = summary.setdefault(machine, {
+                "weight": inputs.get("node_weight", ""),
+                "slots": inputs.get("node_slots", ""),
+                "files": 0,
+                "tasks": 0,
+            })
+            try:
+                row["files"] += int(inputs.get("part_count") or 0)
+            except Exception:
+                pass
+            row["tasks"] += 1
+            if inputs.get("node_weight") != "":
+                row["weight"] = inputs.get("node_weight")
+            if inputs.get("node_slots") != "":
+                row["slots"] = inputs.get("node_slots")
+
+        rows = []
+        for machine, row in summary.items():
+            rows.append(
+                f"{machine}=权重{row.get('weight')}, 并发槽位{row.get('slots')}, "
+                f"分配{row.get('files')}个文件, 生成{row.get('tasks')}个EXE子任务"
+            )
         return "；".join(rows)
 
     def _find_json_config_arg(self, command: List[str]) -> tuple[int, Path] | tuple[None, None]:
@@ -802,18 +975,23 @@ class TaskManager:
         if len(files) < 2:
             return []
 
-        # 按公式 文件总数 * 节点权重 / 权重总和 计算每台机器的文件数。
-        chunks = self._split_items_by_machine_weight(files, machines)
+        # 先按节点权重分文件，再按每个节点的 EXE 并发槽位拆成多个子任务。
+        slot_parts = self._split_items_by_machine_weight_and_slots(files, machines)
 
         output_defs = self._module_output_defs(module_item, split_key=split_key)
         aux_input_defs = self._module_aux_input_defs(module_item, split_key=split_key)
 
         entries: List[Dict[str, Any]] = []
-        for index, machine in enumerate(machines):
-            if not chunks[index]:
+        total_child_count = max(1, len(slot_parts))
+        for entry_index, part in enumerate(slot_parts, start=1):
+            machine = str(part.get("machine") or "").strip()
+            part_items = list(part.get("items") or [])
+            if not machine or not part_items:
                 continue
 
-            part_name = f"part_{index + 1}_{machine}"
+            slot_index = int(part.get("slot_index") or 1)
+            node_slots = int(part.get("node_slots") or 1)
+            part_name = f"part_{entry_index}_{machine}_slot{slot_index}"
             part_dir = split_root / part_name
             part_dir.mkdir(parents=True, exist_ok=True)
 
@@ -822,7 +1000,7 @@ class TaskManager:
             part_input_dir.mkdir(parents=True, exist_ok=True)
 
             used_modes = []
-            for source in chunks[index]:
+            for source in part_items:
                 mode = self._link_or_copy_file(source, part_input_dir / source.name)
                 used_modes.append(mode)
 
@@ -871,11 +1049,11 @@ class TaskManager:
                     self._link_or_copy_file(source, aux_dir / source.name)
                 part_config[aux_key] = f"__LOCAL_WEB_JOB_DIR__/{aux_key}"
 
-            # 每个子任务只处理一部分文件，内部并行数按节点数拆开。
-            # 这样可以避免两台机器同时各开很多进程，把电脑拖死。
+            # 系统层已经通过“每节点多个 EXE 子任务”实现并发。
+            # 如果模块 config 里也有内部并行字段，则按总子任务数拆小，避免并发倍增。
             for key in ["parallel_workers", "_parallel_workers", "_effective_parallel_workers"]:
                 if isinstance(part_config.get(key), int):
-                    part_config[key] = max(1, int(part_config[key]) // max(1, len(machines)))
+                    part_config[key] = max(1, int(part_config[key]) // total_child_count)
 
             part_config_path = part_dir / "config.json"
             part_config_path.write_text(
@@ -888,7 +1066,7 @@ class TaskManager:
 
             entries.append({
                 "spec": {
-                    "label": f"{module_item.get('name') or 'HTCondor'} 子任务 {index + 1} / {machine}",
+                    "label": f"{module_item.get('name') or 'HTCondor'} 子任务 {entry_index} / {machine} / slot{slot_index}",
                     "module_id": module_id,
                     "module_name": str(module_item.get("name") or parent_task.get("module_name") or ""),
                     "command": part_command,
@@ -900,11 +1078,15 @@ class TaskManager:
                         "module_id": module_id,
                         "split_key": split_key,
                         "machine": machine,
-                        "node_weight": self._htcondor_machine_weights(machines).get(machine, 1),
+                        "node_weight": part.get("node_weight", self._htcondor_machine_weights(machines).get(machine, 1)),
+                        "node_slots": node_slots,
+                        "slot_index": slot_index,
+                        "effective_slots": part.get("effective_slots", node_slots),
+                        "machine_total_count": part.get("machine_total_count", len(part_items)),
                         "part_config": str(part_config_path),
                         "part_input_dir": str(part_input_dir),
                         "part_name": part_name,
-                        "part_count": len(chunks[index]),
+                        "part_count": len(part_items),
                         "file_patterns": self._module_file_patterns(module_item, split_input),
                         "output_mappings": output_mappings,
                         "link_modes": sorted(set(used_modes)),
@@ -1076,17 +1258,22 @@ class TaskManager:
             if not isinstance(original_list, list) or len(original_list) < 2:
                 return []
 
-            chunks = self._split_items_by_machine_weight(original_list, machines)
+            slot_parts = self._split_items_by_machine_weight_and_slots(original_list, machines)
 
-            for index, machine in enumerate(machines):
-                if not chunks[index]:
+            for entry_index, part in enumerate(slot_parts, start=1):
+                machine = str(part.get("machine") or "").strip()
+                part_items = list(part.get("items") or [])
+                if not machine or not part_items:
                     continue
-                part_name = f"part_{index + 1}_{machine}"
+                slot_index = int(part.get("slot_index") or 1)
+                node_slots = int(part.get("node_slots") or 1)
+
+                part_name = f"part_{entry_index}_{machine}_slot{slot_index}"
                 part_dir = split_root / part_name
                 part_dir.mkdir(parents=True, exist_ok=True)
 
                 part_config = copy.deepcopy(config_data)
-                self._set_by_path(part_config, list_path, chunks[index])
+                self._set_by_path(part_config, list_path, part_items)
                 self._rewrite_output_paths_for_part(part_config, part_name)
 
                 part_config_path = part_dir / "config.json"
@@ -1099,7 +1286,7 @@ class TaskManager:
                 part_command[config_index] = str(part_config_path)
                 entries.append({
                     "spec": {
-                        "label": f"HTCondor 子任务 {index + 1} / {machine}",
+                        "label": f"HTCondor 子任务 {entry_index} / {machine} / slot{slot_index}",
                         "command": part_command,
                         "working_dir": working_dir,
                         "env": env or {},
@@ -1107,9 +1294,13 @@ class TaskManager:
                         "inputs": {
                             "split_mode": "config_list",
                             "machine": machine,
-                            "node_weight": self._htcondor_machine_weights(machines).get(machine, 1),
+                            "node_weight": part.get("node_weight", self._htcondor_machine_weights(machines).get(machine, 1)),
+                            "node_slots": node_slots,
+                            "slot_index": slot_index,
+                            "effective_slots": part.get("effective_slots", node_slots),
+                            "machine_total_count": part.get("machine_total_count", len(part_items)),
                             "part_config": str(part_config_path),
-                            "part_count": len(chunks[index]),
+                            "part_count": len(part_items),
                         },
                     }
                 })
@@ -1132,18 +1323,23 @@ class TaskManager:
             if len(files) < 2:
                 return []
 
-            chunks = self._split_items_by_machine_weight(files, machines)
+            slot_parts = self._split_items_by_machine_weight_and_slots(files, machines)
 
-            for index, machine in enumerate(machines):
-                if not chunks[index]:
+            for entry_index, part in enumerate(slot_parts, start=1):
+                machine = str(part.get("machine") or "").strip()
+                part_items = list(part.get("items") or [])
+                if not machine or not part_items:
                     continue
-                part_name = f"part_{index + 1}_{machine}"
+                slot_index = int(part.get("slot_index") or 1)
+                node_slots = int(part.get("node_slots") or 1)
+
+                part_name = f"part_{entry_index}_{machine}_slot{slot_index}"
                 part_dir = split_root / part_name
                 part_input_dir = part_dir / "input"
                 part_input_dir.mkdir(parents=True, exist_ok=True)
 
                 used_modes = []
-                for source in chunks[index]:
+                for source in part_items:
                     mode = self._link_or_copy_file(source, part_input_dir / source.name)
                     used_modes.append(mode)
                 link_modes.extend(used_modes)
@@ -1162,7 +1358,7 @@ class TaskManager:
                 part_command[config_index] = str(part_config_path)
                 entries.append({
                     "spec": {
-                        "label": f"HTCondor 子任务 {index + 1} / {machine}",
+                        "label": f"HTCondor 子任务 {entry_index} / {machine} / slot{slot_index}",
                         "command": part_command,
                         "working_dir": working_dir,
                         "env": env or {},
@@ -1170,10 +1366,14 @@ class TaskManager:
                         "inputs": {
                             "split_mode": "input_dir",
                             "machine": machine,
-                            "node_weight": self._htcondor_machine_weights(machines).get(machine, 1),
+                            "node_weight": part.get("node_weight", self._htcondor_machine_weights(machines).get(machine, 1)),
+                            "node_slots": node_slots,
+                            "slot_index": slot_index,
+                            "effective_slots": part.get("effective_slots", node_slots),
+                            "machine_total_count": part.get("machine_total_count", len(part_items)),
                             "part_config": str(part_config_path),
                             "part_input_dir": str(part_input_dir),
-                            "part_count": len(chunks[index]),
+                            "part_count": len(part_items),
                             "link_modes": sorted(set(used_modes)),
                         },
                         "cleanup_root": str(split_root),
@@ -1225,11 +1425,16 @@ class TaskManager:
             )
             if entries:
                 self.append_log(task_id, f"[HTCONDOR] 检测到 {len(machines)} 个可用执行节点：{', '.join(machines)}")
-                weight_text = ', '.join([f"{m}={self._htcondor_machine_weights(machines).get(m, 1)}" for m in machines])
-                self.append_log(task_id, f"[HTCONDOR] 节点任务权重：{weight_text}。系统按 文件总数 * 节点权重 / 权重总和 计算各节点文件数。")
+                weights_map = self._htcondor_machine_weights(machines)
+                slots_map = self._htcondor_machine_slots(machines)
+                weight_text = ', '.join([f"{m}=权重{weights_map.get(m, 1)}, 并发槽位{slots_map.get(m, 1)}" for m in machines])
+                self.append_log(task_id, f"[HTCONDOR] 节点任务权重与并发槽位：{weight_text}。系统先按权重分配文件，再按槽位在节点内生成多个 EXE 子任务。")
+                machine_plan_text = self._htcondor_machine_plan_text(entries)
+                if machine_plan_text:
+                    self.append_log(task_id, f"[HTCONDOR] 节点执行计划：{machine_plan_text}")
                 distribution_text = self._htcondor_entries_distribution_text(entries)
                 if distribution_text:
-                    self.append_log(task_id, f"[HTCONDOR] 实际文件分配：{distribution_text}")
+                    self.append_log(task_id, f"[HTCONDOR] 实际子任务分配：{distribution_text}")
                 self.append_log(task_id, f"[HTCONDOR] 已将本次任务自动拆分为 {len(entries)} 个子任务，并指定到不同节点执行。")
                 self.update_task(
                     task_id,
@@ -1378,7 +1583,7 @@ class TaskManager:
             self.append_log(parent_id, f"[HTCONDOR] 已启用远程 EXE 线程限制：每个任务最多 {thread_limit} 个内部线程。")
         else:
             self.append_log(parent_id, "[HTCONDOR] 未启用远程 EXE 线程限制，优先保证节点计算性能。")
-        self.append_log(parent_id, "[HTCONDOR] 系统会为每个子任务写入 target_machine，尽量让不同节点同时运行。")
+        self.append_log(parent_id, "[HTCONDOR] 系统会为每个子任务写入 target_machine；同一节点配置多个并发槽位时，会同时提交多个 EXE 子任务到该节点。")
         self.append_log(parent_id, "[HTCONDOR] 系统会为拆分任务传输子任务 config.json 和对应输入子目录；输出目录按子任务隔离。")
 
         done_count = 0

@@ -188,8 +188,11 @@ class HTCondorJoinParentRequest(BaseModel):
 
 class HTCondorNodeWeightsRequest(BaseModel):
     # mode=weighted 时按各节点权重分配输入文件；mode=equal 时退回平均分配。
+    # weights 控制每个节点分到的输入文件数量比例。
+    # slots 控制每个节点最多同时启动几个 EXE 子任务。
     mode: str = "weighted"
     weights: Dict[str, int] = {}
+    slots: Dict[str, int] = {}
 
 
 def _clamp_node_weight(value: Any, default: int = 1) -> int:
@@ -198,6 +201,22 @@ def _clamp_node_weight(value: Any, default: int = 1) -> int:
     except Exception:
         n = default
     return max(1, min(8, n))
+
+
+def _clamp_node_slot(value: Any, default: int = 1) -> int:
+    """限制单节点 EXE 并发槽位，避免误设过高把节点打满。
+
+    默认上限 8，可用环境变量 LOCAL_WEB_HTCONDOR_MAX_NODE_SLOTS 调整。
+    """
+    try:
+        n = int(value)
+    except Exception:
+        n = default
+    try:
+        max_slots = int(os.environ.get("LOCAL_WEB_HTCONDOR_MAX_NODE_SLOTS", "8") or "8")
+    except Exception:
+        max_slots = 8
+    return max(1, min(max(1, max_slots), n))
 
 
 def _htcondor_weight_suggestions_from_nodes(nodes_items: List[Dict[str, Any]]) -> Dict[str, int]:
@@ -233,6 +252,38 @@ def _htcondor_weight_suggestions_from_nodes(nodes_items: List[Dict[str, Any]]) -
     return suggestions
 
 
+def _htcondor_slot_suggestions_from_nodes(nodes_items: List[Dict[str, Any]]) -> Dict[str, int]:
+    """根据节点 CPU/内存生成默认 EXE 并发槽位建议。
+
+    slots 控制“同一节点同时启动几个 EXE”。这是调度并发，不是文件数量权重。
+    为了稳妥，默认按 CPU/8 估算，内存低于 8GB 时最多建议 1。
+    """
+    suggestions: Dict[str, int] = {}
+    for item in nodes_items or []:
+        machine = str(item.get("machine") or "").strip()
+        if not machine:
+            continue
+        try:
+            cpus = max(1, int(float(item.get("cpus") or 1)))
+        except Exception:
+            cpus = 1
+        try:
+            memory_mb = max(512.0, float(item.get("memory") or 1024))
+        except Exception:
+            memory_mb = 1024.0
+
+        suggested = max(1, cpus // 8)
+        if memory_mb < 8192:
+            suggested = 1
+        elif memory_mb < 12288:
+            suggested = min(suggested, 2)
+        else:
+            suggested = min(suggested, 4)
+
+        suggestions[machine] = _clamp_node_slot(suggested, default=1)
+    return suggestions
+
+
 def _htcondor_node_weight_summary(status_data: Dict[str, Any]) -> Dict[str, Any]:
     nodes = status_data.get("nodes") or {}
     items = nodes.get("items") if isinstance(nodes, dict) else []
@@ -254,7 +305,15 @@ def _htcondor_node_weight_summary(status_data: Dict[str, Any]) -> Dict[str, Any]
         if str(k).strip()
     }
 
+    saved_slots_raw = raw_config.get("slots") or {}
+    saved_slots = {
+        str(k): _clamp_node_slot(v)
+        for k, v in (saved_slots_raw.items() if isinstance(saved_slots_raw, dict) else [])
+        if str(k).strip()
+    }
+
     suggestions = _htcondor_weight_suggestions_from_nodes(items)
+    slot_suggestions = _htcondor_slot_suggestions_from_nodes(items)
     machine_names: List[str] = []
     for item in items:
         machine = str(item.get("machine") or "").strip()
@@ -265,7 +324,9 @@ def _htcondor_node_weight_summary(status_data: Dict[str, Any]) -> Dict[str, Any]
     for machine in machine_names:
         node = next((x for x in items if str(x.get("machine") or "").strip() == machine), {})
         suggested = _clamp_node_weight(suggestions.get(machine, 1))
+        suggested_slots = _clamp_node_slot(slot_suggestions.get(machine, 1))
         weight = 1 if mode == "equal" else _clamp_node_weight(saved_weights.get(machine, suggested))
+        slots = _clamp_node_slot(saved_slots.get(machine, suggested_slots), default=suggested_slots)
         rows.append({
             "machine": machine,
             "name": node.get("name") or "",
@@ -276,12 +337,17 @@ def _htcondor_node_weight_summary(status_data: Dict[str, Any]) -> Dict[str, Any]
             "suggested_weight": suggested,
             "weight": weight,
             "source": "manual" if machine in saved_weights and mode == "weighted" else ("equal" if mode == "equal" else "suggested"),
+            "suggested_slots": suggested_slots,
+            "slots": slots,
+            "slot_source": "manual" if machine in saved_slots else "suggested",
         })
 
     return {
         "mode": mode,
         "weights": saved_weights,
+        "slots": saved_slots,
         "suggestions": suggestions,
+        "slot_suggestions": slot_suggestions,
         "items": rows,
         "updated_at": raw_config.get("updated_at") or "",
     }
@@ -323,16 +389,24 @@ def api_htcondor_save_node_weights(
             continue
         clean_weights[machine_name] = _clamp_node_weight(value)
 
+    clean_slots: Dict[str, int] = {}
+    for machine, value in (payload.slots or {}).items():
+        machine_name = str(machine or "").strip()
+        if not machine_name:
+            continue
+        clean_slots[machine_name] = _clamp_node_slot(value)
+
     htcondor_cluster_manager.state["node_weight_config"] = {
         "mode": mode,
         "weights": clean_weights,
+        "slots": clean_slots,
         "updated_at": now_iso(),
     }
     htcondor_cluster_manager._save_state()
 
     data = htcondor_cluster_manager.status()
     summary = _htcondor_node_weight_summary(data)
-    summary["message"] = "节点任务权重已保存，后续 HTCondor 任务将按该权重分配输入文件。"
+    summary["message"] = "节点任务权重和并发槽位已保存，后续 HTCondor 任务将按权重分配输入文件，并按槽位在节点内启动多个 EXE。"
     return summary
 
 

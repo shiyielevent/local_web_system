@@ -2183,18 +2183,32 @@ function HTCondorPage({
   const weightRows = Array.isArray(weightPlan.items) ? weightPlan.items : [];
   const [weightMode, setWeightMode] = useState(weightPlan.mode || 'weighted');
   const [nodeWeightsDraft, setNodeWeightsDraft] = useState({});
+  const [nodeSlotsDraft, setNodeSlotsDraft] = useState({});
 
   useEffect(() => {
     const nextWeights = {};
+    const nextSlots = {};
     weightRows.forEach((item) => {
       const machine = String(item.machine || '').trim();
       if (!machine) return;
-      const value = Number.parseInt(String(item.weight || item.suggested_weight || 1), 10) || 1;
-      nextWeights[machine] = Math.max(1, Math.min(8, value));
+      const weightValue = Number.parseInt(String(item.weight || item.suggested_weight || 1), 10) || 1;
+      const slotValue = Number.parseInt(String(item.slots || item.suggested_slots || 1), 10) || 1;
+      nextWeights[machine] = Math.max(1, Math.min(8, weightValue));
+      nextSlots[machine] = Math.max(1, Math.min(8, slotValue));
     });
     setNodeWeightsDraft(nextWeights);
+    setNodeSlotsDraft(nextSlots);
     setWeightMode(weightPlan.mode || 'weighted');
-  }, [JSON.stringify(weightRows.map((item) => [item.machine, item.weight, item.suggested_weight])), weightPlan.mode]);
+  }, [
+    JSON.stringify(weightRows.map((item) => [
+      item.machine,
+      item.weight,
+      item.suggested_weight,
+      item.slots,
+      item.suggested_slots,
+    ])),
+    weightPlan.mode,
+  ]);
 
   const setDraftWeight = (machine, value) => {
     const n = Number.parseInt(String(value || '1'), 10) || 1;
@@ -2204,24 +2218,36 @@ function HTCondorPage({
     }));
   };
 
+  const setDraftSlot = (machine, value) => {
+    const n = Number.parseInt(String(value || '1'), 10) || 1;
+    setNodeSlotsDraft((old) => ({
+      ...old,
+      [machine]: Math.max(1, Math.min(8, n)),
+    }));
+  };
+
   const resetWeightsToSuggested = () => {
     const nextWeights = {};
+    const nextSlots = {};
     weightRows.forEach((item) => {
       const machine = String(item.machine || '').trim();
       if (!machine) return;
       nextWeights[machine] = Math.max(1, Math.min(8, Number.parseInt(String(item.suggested_weight || 1), 10) || 1));
+      nextSlots[machine] = Math.max(1, Math.min(8, Number.parseInt(String(item.suggested_slots || 1), 10) || 1));
     });
     setNodeWeightsDraft(nextWeights);
+    setNodeSlotsDraft(nextSlots);
     setWeightMode('weighted');
   };
 
   const saveWeights = () => {
     if (typeof onSaveWeights === 'function') {
-      onSaveWeights({ mode: weightMode, weights: nodeWeightsDraft });
+      onSaveWeights({ mode: weightMode, weights: nodeWeightsDraft, slots: nodeSlotsDraft });
     }
   };
 
   const weightOptions = Array.from({ length: 8 }, (_, idx) => idx + 1);
+  const slotOptions = Array.from({ length: 8 }, (_, idx) => idx + 1);
 
   return (
     <section style={{ display: 'grid', gap: 16, minHeight: 'calc(100vh - 98px)' }}>
@@ -2314,7 +2340,7 @@ function HTCondorPage({
               <div>
                 <div style={{ fontSize: 16, fontWeight: 900, color: '#12385f' }}>节点信息与任务权重</div>
                 <div style={{ marginTop: 4, fontSize: 12, color: '#64748b', lineHeight: 1.45 }}>
-                  默认按 CPU/内存生成建议权重；管理员可手动调整。权重只影响输入文件数量分配。
+                  权重控制输入文件数量比例；并发槽位控制同一节点同时启动几个 EXE 子任务。
                 </div>
               </div>
               <select
@@ -2332,6 +2358,7 @@ function HTCondorPage({
                 {weightRows.map((node) => {
                   const machine = String(node.machine || '').trim();
                   const draftValue = nodeWeightsDraft[machine] || node.weight || node.suggested_weight || 1;
+                  const draftSlots = nodeSlotsDraft[machine] || node.slots || node.suggested_slots || 1;
                   const memGb = node.memory ? (Number(node.memory) / 1024).toFixed(1) : '-';
                   const isCurrent = machine && machine === info.machine;
                   return (
@@ -2339,7 +2366,7 @@ function HTCondorPage({
                       key={machine || node.name}
                       style={{
                         display: 'grid',
-                        gridTemplateColumns: 'minmax(0, 1.2fr) 0.8fr 0.75fr 94px',
+                        gridTemplateColumns: 'minmax(0, 1.2fr) 0.75fr 0.9fr 86px 86px',
                         gap: 8,
                         alignItems: 'center',
                         padding: '9px 10px',
@@ -2361,28 +2388,44 @@ function HTCondorPage({
                         <div>内存：{memGb}GB</div>
                       </div>
                       <div style={{ fontSize: 12, color: '#475569', lineHeight: 1.45 }}>
-                        <div>建议：<strong style={{ color: '#17406b' }}>{node.suggested_weight || 1}</strong></div>
+                        <div>建议权重：<strong style={{ color: '#17406b' }}>{node.suggested_weight || 1}</strong></div>
+                        <div>建议并发：<strong style={{ color: '#17406b' }}>{node.suggested_slots || 1}</strong></div>
                         <div>来源：{node.source === 'manual' ? '手动' : (node.source === 'equal' ? '平均' : '建议')}</div>
                       </div>
-                      <select
-                        style={{ ...styles.input, minHeight: 36, padding: '0 8px', fontSize: 13 }}
-                        value={draftValue}
-                        disabled={weightMode === 'equal'}
-                        onChange={(e) => setDraftWeight(machine, e.target.value)}
-                      >
-                        {weightOptions.map((value) => (
-                          <option key={value} value={value}>{value}</option>
-                        ))}
-                      </select>
+                      <div>
+                        <div style={{ fontSize: 11, color: '#64748b', fontWeight: 800, marginBottom: 3 }}>权重</div>
+                        <select
+                          style={{ ...styles.input, minHeight: 36, padding: '0 8px', fontSize: 13 }}
+                          value={draftValue}
+                          disabled={weightMode === 'equal'}
+                          onChange={(e) => setDraftWeight(machine, e.target.value)}
+                        >
+                          {weightOptions.map((value) => (
+                            <option key={value} value={value}>{value}</option>
+                          ))}
+                        </select>
+                      </div>
+                      <div>
+                        <div style={{ fontSize: 11, color: '#64748b', fontWeight: 800, marginBottom: 3 }}>并发</div>
+                        <select
+                          style={{ ...styles.input, minHeight: 36, padding: '0 8px', fontSize: 13 }}
+                          value={draftSlots}
+                          onChange={(e) => setDraftSlot(machine, e.target.value)}
+                        >
+                          {slotOptions.map((value) => (
+                            <option key={value} value={value}>{value}</option>
+                          ))}
+                        </select>
+                      </div>
                     </div>
                   );
                 })}
                 <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end', marginTop: 2 }}>
                   <button style={{ ...styles.whiteBtn, padding: '8px 12px' }} disabled={!!busy} onClick={resetWeightsToSuggested}>
-                    恢复建议权重
+                    恢复建议配置
                   </button>
                   <button style={{ ...styles.blueBtn, padding: '8px 12px' }} disabled={!!busy} onClick={saveWeights}>
-                    保存权重
+                    保存权重/并发
                   </button>
                 </div>
               </div>
@@ -3401,7 +3444,7 @@ async function installModuleFolder() {
   }
 
   async function handleHTCondorSaveWeights(payload) {
-    return runHTCondorAction('保存节点任务权重', () => saveHTCondorNodeWeights(payload));
+    return runHTCondorAction('保存节点权重/并发槽位', () => saveHTCondorNodeWeights(payload));
   }
 
 function getCenteredTaskWindowPosition(offset = 0) {

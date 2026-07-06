@@ -1528,10 +1528,14 @@ else {
         transfer_output_files = ", ".join(clean_transfer_output_items)
         transfer_output_line = f"transfer_output_files = {transfer_output_files}\n" if transfer_output_files else ""
 
+        # 每个 HTCondor 子任务申请的内存会直接影响 partitionable slot 能拆出几个动态 slot。
+        # 之前默认 8192MB：16GB 节点上一个任务会占掉 8GB 资源请求，导致同一节点最多只能同时跑 1 个 EXE。
+        # 当前遥感 EXE 单进程实测常见内存约 4GB，因此默认改为 4096MB，允许 16GB 节点同时匹配 2~3 个 request_cpus=1 的 EXE 子任务。
+        # 如某个模块确实需要更大内存，可在启动环境中设置 LOCAL_WEB_HTCONDOR_REQUEST_MEMORY_MB 覆盖。
         try:
-            request_memory_mb = int(os.environ.get("LOCAL_WEB_HTCONDOR_REQUEST_MEMORY_MB", "8192") or "8192")
+            request_memory_mb = int(os.environ.get("LOCAL_WEB_HTCONDOR_REQUEST_MEMORY_MB", "4096") or "4096")
         except Exception:
-            request_memory_mb = 8192
+            request_memory_mb = 4096
         request_memory_mb = max(1024, request_memory_mb)
 
         sub_text = f"""universe = vanilla
