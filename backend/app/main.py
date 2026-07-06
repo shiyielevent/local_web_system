@@ -830,6 +830,19 @@ def normalize_parallel_config(module: dict) -> dict:
     except Exception:
         cfg["chunk_multiplier"] = 1
 
+    for extra_key in [
+        "output_naming",
+        "pair_mode",
+        "pair_suffixes",
+        "primary_suffixes",
+        "batch_primary_suffixes",
+        "output_mode",
+        "jd_jl_pair",
+        "jd_only",
+    ]:
+        if extra_key in raw:
+            cfg[extra_key] = raw.get(extra_key)
+
     return cfg
 
 
@@ -3243,7 +3256,7 @@ def create_python_module_env(
 # C++ / 本地可执行模块校验与运行时依赖收集
 # =========================
 CPP_INPUT_TYPES = {"text", "textarea", "number", "integer", "file_path", "dir_path", "password"}
-CPP_PARALLEL_MODES = {"none", "auto", "single_file", "folder_chunks", "module_internal"}
+CPP_PARALLEL_MODES = {"none", "auto", "single_file", "folder_chunks", "module_internal", "batch_group"}
 CPP_SYSTEM_DLLS = {
     "kernel32.dll", "user32.dll", "gdi32.dll", "winspool.drv", "comdlg32.dll", "advapi32.dll",
     "shell32.dll", "ole32.dll", "oleaut32.dll", "uuid.dll", "odbc32.dll", "odbccp32.dll",
@@ -3477,11 +3490,27 @@ def _is_new_executable_manifest(manifest_path: Path, data: dict) -> bool:
     return any(k in data for k in ["module_id", "module id", "module-name", "module_name", "entry_file", "entry file", "param_json_path", "param json path"])
 
 
+def _infer_executable_batch_role_from_key(key: str, label: str = "") -> str:
+    text = f"{key or ''} {label or ''}".upper()
+    role_patterns = [
+        ("B01", r"(^|[^A-Z0-9])B0?1([^A-Z0-9]|$)|B01_FILE"),
+        ("B03", r"(^|[^A-Z0-9])B0?3([^A-Z0-9]|$)|B03_FILE"),
+        ("B06", r"(^|[^A-Z0-9])B0?6([^A-Z0-9]|$)|B06_FILE"),
+        ("SOLAR", r"SOLAR|SUN"),
+    ]
+    for role, pattern in role_patterns:
+        if re.search(pattern, text, re.IGNORECASE):
+            return role
+    return ""
+
+
 def _infer_executable_inputs_from_config(param_json: dict, module_root: Path, module_data: dict) -> list[dict]:
     """从新版 config.json 自动生成输入表单，并补充批处理/固定资源属性。"""
     inputs = infer_inputs_from_param_json(param_json)
     parallel_cfg = module_data.get("parallel") if isinstance(module_data.get("parallel"), dict) else {}
     parallel_patterns = parallel_cfg.get("file_patterns") or parallel_cfg.get("patterns") or "*"
+    parallel_mode = str(parallel_cfg.get("mode") or "").strip()
+    parallel_input_key = str(parallel_cfg.get("input_key") or "").strip()
 
     for item in inputs:
         key = str(item.get("key") or "")
@@ -3489,10 +3518,17 @@ def _infer_executable_inputs_from_config(param_json: dict, module_root: Path, mo
         value = param_json.get(key)
         value_text = str(value or "")
 
+        if item.get("type") in {"file_path", "dir_path"} and value_text:
+            value_path = Path(value_text)
+            if not value_path.is_absolute():
+                value_path = (module_root / value_path).resolve()
+            if value_path.exists():
+                item["type"] = "file_path" if value_path.is_file() else "dir_path"
+
         # 输出目录/输出文件
         if any(x in lower for x in ["out", "output", "result", "save", "输出"]):
             item["io_role"] = "output"
-            item["batch_role"] = "output"
+            item["batch_role"] = "OUTPUT_DIR"
             if item.get("type") not in {"file_path", "dir_path"}:
                 item["type"] = "dir_path"
             continue
@@ -3519,11 +3555,15 @@ def _infer_executable_inputs_from_config(param_json: dict, module_root: Path, mo
         if item.get("type") in {"file_path", "dir_path"}:
             item["io_role"] = "input"
             if any(x in lower for x in ["input", "file", "dir", "folder", "输入"]):
-                item["batch_role"] = "input"
-                item["match_mode"] = "each_file"
-                item["file_patterns"] = parallel_patterns
-                item["batch_allow_all_files"] = True
-                item["batch_allow_no_extension"] = True
+                batch_role = _infer_executable_batch_role_from_key(key, str(item.get("label") or ""))
+                if not batch_role and key == parallel_input_key and parallel_mode == "batch_group":
+                    batch_role = str(parallel_cfg.get("batch_role") or "input").strip() or "input"
+                if batch_role:
+                    item["batch_role"] = batch_role
+                    item["match_mode"] = "each_file"
+                    item["file_patterns"] = parallel_patterns
+                    item["batch_allow_all_files"] = True
+                    item["batch_allow_no_extension"] = True
 
     return inputs
 
@@ -3600,6 +3640,13 @@ def _normalize_new_executable_manifest(module_root: Path, manifest_path: Path, r
             "output_naming": "source_stem",
         }
 
+    command_template = raw_data.get("command_template")
+    if not (
+        isinstance(command_template, list)
+        and all(isinstance(item, str) and item.strip() for item in command_template)
+    ):
+        command_template = ["{executable}", "{config_json}"]
+
     inputs = _infer_executable_inputs_from_config(param_json or {}, source_path, {"parallel": parallel_cfg})
 
     # 如果声明了 JD/JL 配对，确保输入字段只按 JD 生成任务。
@@ -3626,7 +3673,7 @@ def _normalize_new_executable_manifest(module_root: Path, manifest_path: Path, r
         "executable": executable_rel,
         "working_dir": source_dir,
         "config_mode": "json_file",
-        "command_template": ["{executable}", "{config_json}"],
+        "command_template": command_template,
         "dependency_dirs": dependency_dirs,
         "dependency_search_dirs": dependency_search_dirs,
         "resource_dirs": resource_dirs,
@@ -5150,7 +5197,7 @@ def api_install_modules_from_local_drop(
 # =========================
 # 并行执行辅助逻辑
 # =========================
-VALID_PARALLEL_MODES = {"none", "auto", "single_file", "folder_chunks", "module_internal"}
+VALID_PARALLEL_MODES = {"none", "auto", "single_file", "folder_chunks", "module_internal", "batch_group"}
 DEFAULT_PARALLEL_PATTERNS = "*.tif;*.tiff;*.nc;*.hdf;*.h5"
 
 
@@ -5598,7 +5645,7 @@ def link_or_copy_file(src: Path, dst: Path) -> str:
     errors: list[str] = []
 
     # 默认只用 symlink，避免 hardlink 在资源管理器里显示成“普通大文件”而被误判为复制。
-    raw_order = str(os.environ.get("LOCAL_WEB_INPUT_LINK_ORDER", "symlink") or "symlink")
+    raw_order = str(os.environ.get("LOCAL_WEB_INPUT_LINK_ORDER", "symlink,hardlink") or "symlink,hardlink")
     order = [
         item.strip().lower()
         for item in raw_order.replace("；", ",").replace(";", ",").split(",")
@@ -5606,7 +5653,7 @@ def link_or_copy_file(src: Path, dst: Path) -> str:
     ] or ["symlink"]
 
     allow_symlink = str(os.environ.get("LOCAL_WEB_ALLOW_INPUT_SYMLINKS", "1")).strip().lower() not in {"0", "false", "no", "off"}
-    allow_hardlink = str(os.environ.get("LOCAL_WEB_ALLOW_INPUT_HARDLINKS", "0")).strip().lower() in {"1", "true", "yes", "on"}
+    allow_hardlink = str(os.environ.get("LOCAL_WEB_ALLOW_INPUT_HARDLINKS", "1")).strip().lower() in {"1", "true", "yes", "on"}
 
     def try_symlink() -> str | None:
         if not allow_symlink:
@@ -5634,7 +5681,7 @@ def link_or_copy_file(src: Path, dst: Path) -> str:
             return None
 
     tried: set[str] = set()
-    for mode in order + ["symlink"]:
+    for mode in order + ["symlink", "hardlink"]:
         if mode in tried:
             continue
         tried.add(mode)
@@ -5725,13 +5772,80 @@ def is_parasol_jd_input_file(path: Path) -> bool:
     return bool(re.search(r"JD(?=[_.-])", name))
 
 
+def get_parasol_primary_suffixes(module: dict) -> list[str]:
+    parallel_cfg = module.get("parallel") if isinstance(module.get("parallel"), dict) else {}
+    raw = (
+        parallel_cfg.get("primary_suffixes")
+        or parallel_cfg.get("batch_primary_suffixes")
+        or ""
+    )
+    if not raw:
+        pair_suffixes = str(parallel_cfg.get("pair_suffixes") or "").strip()
+        if pair_suffixes:
+            parts = []
+            for item in pair_suffixes.replace(",", ";").split(";"):
+                if ":" in item:
+                    parts.append(item.split(":", 1)[0])
+            raw = ";".join(parts)
+    if not raw:
+        raw = "JD" if (parallel_cfg.get("jd_jl_pair") is True or parallel_cfg.get("jd_only") is True) else "MD;JD"
+
+    suffixes = []
+    for item in str(raw).replace(",", ";").split(";"):
+        cleaned = re.sub(r"[^A-Za-z0-9]", "", item or "").upper()
+        if cleaned and cleaned not in suffixes:
+            suffixes.append(cleaned)
+    return suffixes or ["MD", "JD"]
+
+
+def is_parasol_primary_input_file(module: dict, path: Path) -> bool:
+    name = path.name.upper()
+    for suffix in get_parasol_primary_suffixes(module):
+        if re.search(rf"{re.escape(suffix)}(?=[_.-]|$)", name):
+            return True
+    return False
+
+
+def parse_parasol_pair_suffix_map(module: dict) -> dict[str, str]:
+    parallel_cfg = module.get("parallel") if isinstance(module.get("parallel"), dict) else {}
+    raw = str(parallel_cfg.get("pair_suffixes") or "MD:ML;JD:JL;md:ml;jd:jl")
+    pairs: dict[str, str] = {}
+    for item in raw.replace(",", ";").split(";"):
+        item = item.strip()
+        if ":" not in item:
+            continue
+        left, right = item.split(":", 1)
+        left = re.sub(r"[^A-Za-z0-9]", "", left or "").upper()
+        right = re.sub(r"[^A-Za-z0-9]", "", right or "").upper()
+        if left and right:
+            pairs[left] = right
+    return pairs or {"MD": "ML", "JD": "JL"}
+
+
+def find_parasol_companion_file(module: dict, primary_file: Path) -> Path | None:
+    name = primary_file.name
+    upper_name = name.upper()
+    for primary_suffix, companion_suffix in parse_parasol_pair_suffix_map(module).items():
+        match = re.search(rf"{re.escape(primary_suffix)}(?=[_.-]|$)", upper_name)
+        if not match:
+            continue
+        companion_name = name[:match.start()] + companion_suffix + name[match.end():]
+        candidate = primary_file.with_name(companion_name)
+        if candidate.exists() and candidate.is_file():
+            return candidate
+        for sibling in primary_file.parent.iterdir():
+            if sibling.is_file() and sibling.name.upper() == companion_name.upper():
+                return sibling
+    return None
+
+
 def filter_parasol_jd_files_for_jobs(module: dict, files: list[Path]) -> list[Path]:
     if not is_parasol_jd_pair_module(module):
         return files
 
-    jd_files = [item for item in files if is_parasol_jd_input_file(item)]
-    # 只有在确实识别到 JD 文件时才过滤；如果没识别到，直接报错比继续把 JL 当任务更安全。
-    return jd_files
+    primary_files = [item for item in files if is_parasol_primary_input_file(module, item)]
+    # 只有在确实识别到主输入文件时才过滤；如果没识别到，直接报错比继续把配套文件当任务更安全。
+    return primary_files
 
 def is_probably_dir_output(module: dict, output_key: str, output_value: str) -> bool:
     meta = field_meta(module, output_key)
@@ -5898,6 +6012,11 @@ def prepare_parallel_jobs(module: dict, inputs: dict, parallel_workers: int) -> 
             for src in chunk:
                 dst = chunk_dir / unique_chunk_filename(src, used_names)
                 link_modes.append(link_or_copy_file(src, dst))
+                if is_parasol_jd_pair_module(module):
+                    companion = find_parasol_companion_file(module, src)
+                    if companion is not None:
+                        companion_dst = chunk_dir / unique_chunk_filename(companion, used_names)
+                        link_modes.append(link_or_copy_file(companion, companion_dst))
 
             job_inputs = dict(inputs)
             job_inputs["_parallel_chunk_link_modes"] = sorted(set(link_modes))
@@ -6239,6 +6358,24 @@ def _make_batch_output_value(module: dict, base_inputs: dict, slot: str, primary
 
     p = Path(raw_value)
     field_type = str(output_field.get("type") or "").lower()
+    output_mode = str(
+        (module.get("parallel") or {}).get("output_mode")
+        or output_field.get("output_mode")
+        or ""
+    ).strip().lower()
+
+    if output_mode in {"directory", "dir", "keep_dir", "keep_directory"}:
+        p.mkdir(parents=True, exist_ok=True)
+        job_inputs[key] = str(p.resolve())
+        return job_inputs, p.resolve()
+
+    if output_mode in {"job_directory", "job_dir", "subdir", "subdirectory", "directory_per_job"}:
+        p.mkdir(parents=True, exist_ok=True)
+        safe_slot = str(primary_file.stem).replace(":", "_").replace("/", "_").replace("\\", "_")
+        out_dir = p / safe_slot
+        out_dir.mkdir(parents=True, exist_ok=True)
+        job_inputs[key] = str(out_dir.resolve())
+        return job_inputs, out_dir.resolve()
 
     # 批处理时，输出目录类型默认生成每个 job 一个文件。
     if field_type == "dir_path" or (not p.suffix):

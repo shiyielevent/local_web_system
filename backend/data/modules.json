@@ -3,8 +3,6 @@
     "id": "H8_CM_CTH_2_EXE",
     "name": "葵花8号云类型与云相态反演",
     "description": "读取H8 NetCDF目录，生成云掩膜和云相态反演结果。",
-    "runtime": "cpp_native",
-    "entry": "CM_CTH_2.exe",
     "executable": "backend/installed_modules/H8_CM_CTH_2_EXE/CM_CTH_2.exe",
     "working_dir": "backend/installed_modules/H8_CM_CTH_2_EXE",
     "config_mode": "json_file",
@@ -12,27 +10,6 @@
       "{executable}",
       "{config_json}"
     ],
-    "dependency_dirs": [],
-    "dependency_search_dirs": [],
-    "resource_dirs": [],
-    "parallel": {
-      "mode": "none",
-      "input_key": "",
-      "output_key": "",
-      "file_patterns": "*R21*.nc;*R21*.NC",
-      "output_suffix": ".tif",
-      "files_per_job": 1,
-      "chunk_multiplier": 1
-    },
-    "tags": [
-      "h8",
-      "cloud",
-      "cloud-mask",
-      "cloud-phase",
-      "executable"
-    ],
-    "tool_type": "cloud",
-    "enabled": true,
     "inputs": [
       {
         "key": "file",
@@ -79,7 +56,287 @@
         "batch_role": "output"
       }
     ],
+    "tags": [
+      "h8",
+      "cloud",
+      "cloud-mask",
+      "cloud-phase",
+      "executable"
+    ],
+    "tool_type": "cloud",
+    "parallel": {
+      "mode": "none",
+      "input_key": "",
+      "output_key": "",
+      "file_patterns": "*R21*.nc;*R21*.NC",
+      "output_suffix": ".tif",
+      "files_per_job": 1,
+      "chunk_multiplier": 1
+    },
+    "enabled": true,
+    "runtime": "cpp_native",
+    "entry": "CM_CTH_2.exe",
+    "dependency_dirs": [],
+    "dependency_search_dirs": [],
+    "resource_dirs": [],
     "_manifest_format": "executable_module_json",
     "_param_json_path": "D:\\NEPU\\H8\\CM_CTH_2\\CTH\\dist\\CM_CTH_2\\config.json"
+  },
+  {
+    "id": "h8aod",
+    "name": "H8 AOD Retrieval",
+    "description": "Executable H8 AOD retrieval module. The system reads config.json to generate input and output fields, then passes a runtime config file to AOD_AHI.exe.",
+    "runtime": "cpp_native",
+    "entry": "AOD_AHI.exe",
+    "executable": "backend/installed_modules/h8aod/AOD_AHI.exe",
+    "working_dir": "backend/installed_modules/h8aod",
+    "config_mode": "json_file",
+    "command_template": [
+      "{executable}",
+      "{config_json}"
+    ],
+    "dependency_dirs": [
+      "deps"
+    ],
+    "dependency_search_dirs": [],
+    "resource_dirs": [
+      "resources"
+    ],
+    "parallel": {
+      "mode": "batch_group",
+      "input_key": "",
+      "output_key": "",
+      "file_patterns": "*.tif;*.tiff",
+      "output_suffix": ".tif",
+      "files_per_job": 1,
+      "chunk_multiplier": 1,
+      "output_naming": "source_stem",
+      "output_mode": "directory"
+    },
+    "tags": [
+      "h8",
+      "aod",
+      "aerosol",
+      "executable"
+    ],
+    "tool_type": "aerosol",
+    "enabled": true,
+    "inputs": [
+      {
+        "key": "B01_file",
+        "label": "B01_file",
+        "type": "dir_path",
+        "required": true,
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "input",
+        "default": "D:/yan1study/HimawariAOD/test_data/B01",
+        "batch_role": "B01",
+        "match_mode": "each_file",
+        "file_patterns": "*.tif;*.tiff",
+        "batch_allow_all_files": true,
+        "batch_allow_no_extension": true
+      },
+      {
+        "key": "B03_file",
+        "label": "B03_file",
+        "type": "dir_path",
+        "required": true,
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "input",
+        "default": "D:/yan1study/HimawariAOD/test_data/B03",
+        "batch_role": "B03",
+        "match_mode": "each_file",
+        "file_patterns": "*.tif;*.tiff",
+        "batch_allow_all_files": true,
+        "batch_allow_no_extension": true
+      },
+      {
+        "key": "B06_file",
+        "label": "B06_file",
+        "type": "dir_path",
+        "required": true,
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "input",
+        "default": "D:/yan1study/HimawariAOD/test_data/B06",
+        "batch_role": "B06",
+        "match_mode": "each_file",
+        "file_patterns": "*.tif;*.tiff",
+        "batch_allow_all_files": true,
+        "batch_allow_no_extension": true
+      },
+      {
+        "key": "SOLAR_file",
+        "label": "SOLAR_file",
+        "type": "dir_path",
+        "required": true,
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "input",
+        "default": "D:/yan1study/HimawariAOD/test_data/SOLAR",
+        "batch_role": "SOLAR",
+        "match_mode": "each_file",
+        "file_patterns": "*.tif;*.tiff",
+        "batch_allow_all_files": true,
+        "batch_allow_no_extension": true
+      },
+      {
+        "key": "GEO1_file",
+        "label": "GEO1_file",
+        "type": "file_path",
+        "required": true,
+        "visible_to_user": false,
+        "admin_fixed": true,
+        "path_mode": "relative_to_module",
+        "io_role": "input",
+        "default": "resources/lon_lat_az_zen_1000_73_19_140_54.tif",
+        "batch_role": ""
+      },
+      {
+        "key": "al_igbp",
+        "label": "al_igbp",
+        "type": "file_path",
+        "required": true,
+        "visible_to_user": false,
+        "admin_fixed": true,
+        "path_mode": "relative_to_module",
+        "io_role": "input",
+        "default": "resources/h8_aod_igbp.tif",
+        "batch_role": ""
+      },
+      {
+        "key": "al_lut",
+        "label": "al_lut",
+        "type": "file_path",
+        "required": true,
+        "visible_to_user": false,
+        "admin_fixed": true,
+        "path_mode": "relative_to_module",
+        "io_role": "input",
+        "default": "resources/h8_aod_lut.dat",
+        "batch_role": ""
+      },
+      {
+        "key": "al_dem",
+        "label": "al_dem",
+        "type": "file_path",
+        "required": true,
+        "visible_to_user": false,
+        "admin_fixed": true,
+        "path_mode": "relative_to_module",
+        "io_role": "input",
+        "default": "resources/dem_1000_73_19_140_54.tif",
+        "batch_role": ""
+      },
+      {
+        "key": "output",
+        "label": "output",
+        "type": "dir_path",
+        "required": true,
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "output",
+        "default": "D:/yan1study/HimawariAOD/test_data/output_standard",
+        "batch_role": "OUTPUT_DIR"
+      }
+    ],
+    "_manifest_format": "executable_module_json",
+    "_param_json_path": "D:\\local_module_web_system1\\h8aod\\h8aod\\h8aod\\config.json"
+  },
+  {
+    "id": "parasol_aod",
+    "name": "PARASOL AOD Retrieval",
+    "description": "Executable PARASOL AOD retrieval module. The system accepts a PARASOL Level-1 input folder, output folder, and fixed XML resource file.",
+    "runtime": "cpp_native",
+    "entry": "ParasolAOD.exe",
+    "executable": "backend/installed_modules/parasol_aod/ParasolAOD.exe",
+    "working_dir": "backend/installed_modules/parasol_aod",
+    "config_mode": "json_file",
+    "command_template": [
+      "{executable}",
+      "{input_dir}",
+      "{output_dir}",
+      "{config_xml}"
+    ],
+    "dependency_dirs": [
+      "deps"
+    ],
+    "dependency_search_dirs": [],
+    "resource_dirs": [
+      "resources"
+    ],
+    "parallel": {
+      "mode": "batch_group",
+      "input_key": "input_dir",
+      "output_key": "output_dir",
+      "file_patterns": "*JD;*jd",
+      "output_suffix": ".tif",
+      "files_per_job": 1,
+      "chunk_multiplier": 1,
+      "output_naming": "source_stem",
+      "pair_mode": "auto",
+      "pair_suffixes": "JD:JL;jd:jl",
+      "primary_suffixes": "JD",
+      "output_mode": "job_directory"
+    },
+    "tags": [
+      "parasol",
+      "aod",
+      "aerosol",
+      "executable"
+    ],
+    "tool_type": "aerosol",
+    "enabled": true,
+    "inputs": [
+      {
+        "key": "input_dir",
+        "label": "input_dir",
+        "type": "dir_path",
+        "required": true,
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "input",
+        "default": "D:/yan1study/AOD_test/AOD_model/ParasolAOD/test_data",
+        "batch_role": "input",
+        "match_mode": "each_file",
+        "file_patterns": "*JD;*jd",
+        "batch_allow_all_files": true,
+        "batch_allow_no_extension": true
+      },
+      {
+        "key": "output_dir",
+        "label": "output_dir",
+        "type": "dir_path",
+        "required": true,
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "output",
+        "default": "D:/yan1study/AOD_test/AOD_model/ParasolAOD/web_test_out_standard",
+        "batch_role": "OUTPUT_DIR"
+      },
+      {
+        "key": "config_xml",
+        "label": "config_xml",
+        "type": "file_path",
+        "required": true,
+        "visible_to_user": false,
+        "admin_fixed": true,
+        "path_mode": "relative_to_module",
+        "io_role": "input",
+        "default": "resources/ConfigXMLFile.xml",
+        "batch_role": ""
+      }
+    ],
+    "_manifest_format": "executable_module_json",
+    "_param_json_path": "D:\\local_module_web_system1\\parasol\\config.json"
   }
 ]
