@@ -1492,6 +1492,11 @@ else {
             val = str(value).replace("%", "%%")
             lines.append(f"set {key}={val}")
 
+        # joblib/loky 的临时目录默认放到当前 HTCondor 作业沙箱。
+        # 避免多个远程 EXE 同时使用系统 TEMP，导致临时文件冲突或清理困难。
+        lines.append(r"if not defined JOBLIB_TEMP_FOLDER set JOBLIB_TEMP_FOLDER=%LOCAL_WEB_JOB_DIR%\joblib_tmp")
+        lines.append('if not exist "%JOBLIB_TEMP_FOLDER%" mkdir "%JOBLIB_TEMP_FOLDER%" >nul 2>nul')
+
         if working_dir:
             lines.append(f"cd /d {self._batch_quote(str(working_dir))}")
             lines.append("if errorlevel 1 exit /b 100")

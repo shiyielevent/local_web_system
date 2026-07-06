@@ -119,23 +119,35 @@ class TaskManager:
         """注入 HTCondor 管理器。"""
         self.htcondor_manager = htcondor_manager
 
+    def _htcondor_effective_thread_limit(self) -> str:
+        """返回 HTCondor 远程 EXE 的线程限制。
+
+        分布式 + 节点内多 EXE 时，sklearn/joblib/BLAS 会在每个 EXE 内继续开线程或子进程。
+        如果完全不限制，两个 EXE 同时加载模型和预测时容易出现 MemoryError。
+
+        优先级：
+        1. LOCAL_WEB_HTCONDOR_THREAD_LIMIT：用户显式指定；
+        2. LOCAL_WEB_HTCONDOR_DEFAULT_THREAD_LIMIT：系统默认值；
+        3. 默认 1：稳定优先。
+
+        如确实要关闭限制，可设置 LOCAL_WEB_HTCONDOR_THREAD_LIMIT=0。
+        """
+        explicit = str(os.environ.get("LOCAL_WEB_HTCONDOR_THREAD_LIMIT", "")).strip()
+        if explicit:
+            return explicit
+        default = str(os.environ.get("LOCAL_WEB_HTCONDOR_DEFAULT_THREAD_LIMIT", "1")).strip()
+        return default or "1"
+
     def _make_htcondor_safe_env(self, env: Dict[str, str] | None = None) -> Dict[str, str]:
-        """为 HTCondor 远程 EXE 注入可选环境变量。
+        """为 HTCondor 远程 EXE 注入稳定性环境变量。
 
-        默认不限制 sklearn/joblib/BLAS 线程数，优先保证高性能节点性能。
-        只有设置 LOCAL_WEB_HTCONDOR_THREAD_LIMIT 时才限制内部线程数。
-
-        示例：
-            LOCAL_WEB_HTCONDOR_THREAD_LIMIT=4
-            LOCAL_WEB_HTCONDOR_THREAD_LIMIT=8
-            LOCAL_WEB_HTCONDOR_THREAD_LIMIT=1
+        这里默认限制 sklearn/joblib/BLAS 的内部线程数，解决“分布式节点内多进程”时
+        多个 EXE 同时加载模型、同时 joblib 并行预测导致的内存峰值叠加问题。
         """
         safe_env = dict(env or {})
         safe_env.setdefault("PYTHONUNBUFFERED", "1")
 
-        limit = str(os.environ.get("LOCAL_WEB_HTCONDOR_THREAD_LIMIT", "")).strip().lower()
-
-        # 默认不限制线程，避免高性能节点被强行单线程，导致分布式反而明显变慢。
+        limit = self._htcondor_effective_thread_limit().strip().lower()
         if not limit or limit in {"0", "false", "no", "off"}:
             return safe_env
 
@@ -154,6 +166,25 @@ class TaskManager:
             safe_env.setdefault(key, value)
 
         return safe_env
+
+    def _looks_like_htcondor_memory_failure(self, result: Dict[str, Any] | None) -> bool:
+        """判断 HTCondor 子任务失败是否像内存/并发导致。"""
+        result = result or {}
+        text = "\n".join(
+            str(result.get(key) or "")
+            for key in ["stdout", "stderr", "wait_output", "error"]
+        ).lower()
+        if not text:
+            return False
+        patterns = [
+            "memoryerror",
+            "_arraymemoryerror",
+            "unable to allocate",
+            "could not allocate",
+            "safe_realloc",
+            "failed to execute script",
+        ]
+        return any(item in text for item in patterns)
 
 
     def _htcondor_execution_requested(self) -> bool:
@@ -526,7 +557,7 @@ class TaskManager:
         return result
 
     def _split_items_evenly(self, items: List[Any], part_count: int) -> List[List[Any]]:
-        """把一个节点内的文件再按并发槽位均匀拆分。"""
+        """把文件列表均匀拆成 part_count 份。"""
         part_count = max(1, int(part_count or 1))
         chunks: List[List[Any]] = [[] for _ in range(part_count)]
         if not items:
@@ -545,18 +576,40 @@ class TaskManager:
             cursor = end
         return chunks
 
-    def _split_items_by_machine_weight_and_slots(self, items: List[Any], machines: List[str]) -> List[Dict[str, Any]]:
-        """先按节点权重分文件，再按节点 slots 拆成多个 EXE 子任务。
+    def _htcondor_files_per_exe_limit(self) -> int:
+        """兼容旧配置：返回单 EXE 文件上限。
 
-        返回的每一项对应一个 HTCondor 子任务：
-        {
-            machine, node_weight, node_slots, slot_index, items
-        }
+        新的 HTCondor 分布式多进程策略不再用这个值决定默认拆分数量，
+        默认拆分数量由每个节点的“并发/进程数”决定。
+        该函数保留是为了兼容旧环境变量和后续排查。
+        """
+        try:
+            value = int(os.environ.get("LOCAL_WEB_HTCONDOR_FILES_PER_EXE", "8") or "8")
+        except Exception:
+            value = 8
+        return max(1, min(9999, value))
+
+    def _split_items_by_machine_weight_and_slots(self, items: List[Any], machines: List[str]) -> List[Dict[str, Any]]:
+        """先按节点权重分文件，再按节点进程数创建 EXE 子任务。
+
+        这是当前分布式多进程的核心策略：
+        1. 先根据节点权重 weight 计算每台机器分到的输入文件数量；
+        2. 拿到每台机器的文件列表之后，再根据该机器的并发槽位 node_slots 拆成多个 EXE 子任务；
+        3. 调度阶段仍按 node_slots 做限流，保证同一节点同时运行的 EXE 数量不超过前端设置。
+
+        例子：总共 35 个文件，节点权重 1:2，节点并发 1:2。
+        - 节点 A 约分到 12 个文件，并发 1 -> 生成 1 个 EXE 子任务；
+        - 节点 B 约分到 23 个文件，并发 2 -> 生成 2 个 EXE 子任务；
+        - 总共生成 3 个子任务，B 节点可以同时跑 2 个 EXE。
+
+        注意：如果某节点只分到 1 个文件，即使并发设置为 2，也只生成 1 个非空子任务，
+        不会创建空 EXE 任务。
         """
         machines = [str(x).strip() for x in machines if str(x).strip()]
         if not items or not machines:
             return []
 
+        # 第一步：只根据权重决定每台机器拿多少文件。
         machine_chunks = self._split_items_by_machine_weight(items, machines)
         weights_map = self._htcondor_machine_weights(machines)
         slots_map = self._htcondor_machine_slots(machines)
@@ -567,24 +620,32 @@ class TaskManager:
             if not machine_items:
                 continue
 
-            requested_slots = self._clamp_htcondor_node_slot(slots_map.get(machine, 1), default=1)
-            # 文件数少时不创建空子任务；例如该节点只有 2 个文件，最多生成 2 个 EXE。
-            effective_slots = max(1, min(requested_slots, len(machine_items)))
-            slot_chunks = self._split_items_evenly(machine_items, effective_slots)
+            requested_processes = self._clamp_htcondor_node_slot(slots_map.get(machine, 1), default=1)
 
-            for slot_index, slot_items in enumerate(slot_chunks, start=1):
-                if not slot_items:
+            # 第二步：文件数量确定后，再按“进程数/并发槽位”拆分。
+            # 一个进程对应一个 EXE 子任务；如果文件数小于进程数，则只创建非空子任务。
+            process_count = max(1, min(requested_processes, len(machine_items)))
+            job_chunks = self._split_items_evenly(machine_items, process_count)
+
+            for job_index, job_items in enumerate(job_chunks, start=1):
+                if not job_items:
                     continue
+                slot_index = job_index
                 result.append({
                     "machine": machine,
                     "machine_index": machine_index,
                     "slot_index": slot_index,
-                    "node_slots": requested_slots,
-                    "effective_slots": effective_slots,
+                    "job_index": job_index,
+                    "machine_job_count": process_count,
+                    "node_slots": requested_processes,
+                    "effective_slots": process_count,
                     "node_weight": self._clamp_htcondor_node_weight(weights_map.get(machine, 1), default=1),
-                    "items": slot_items,
+                    "items": job_items,
                     "machine_total_count": len(machine_items),
-                    "slot_count": len(slot_items),
+                    "slot_count": len(job_items),
+                    "requested_processes": requested_processes,
+                    "actual_processes": process_count,
+                    "split_strategy": "weight_then_node_processes",
                 })
 
         return result
@@ -669,10 +730,17 @@ class TaskManager:
             weight = inputs.get("node_weight", "")
             slot_index = inputs.get("slot_index", "")
             node_slots = inputs.get("node_slots", "")
+            job_index = inputs.get("job_index", "")
+            machine_job_count = inputs.get("machine_job_count", "")
             part_count = inputs.get("part_count", "")
             if part_count == "":
                 continue
-            if slot_index:
+            if job_index:
+                rows.append(
+                    f"{machine}=权重{weight}, 并发上限{node_slots or '-'}, "
+                    f"子任务{job_index}/{machine_job_count or '-'}, 槽位标识{slot_index}, {part_count}个文件"
+                )
+            elif slot_index:
                 rows.append(f"{machine}=权重{weight}, 槽位{slot_index}/{node_slots or '-'}, {part_count}个文件")
             else:
                 rows.append(f"{machine}=权重{weight}, {part_count}个文件")
@@ -707,8 +775,8 @@ class TaskManager:
         rows = []
         for machine, row in summary.items():
             rows.append(
-                f"{machine}=权重{row.get('weight')}, 并发槽位{row.get('slots')}, "
-                f"分配{row.get('files')}个文件, 生成{row.get('tasks')}个EXE子任务"
+                f"{machine}=权重{row.get('weight')}, 设定进程数{row.get('slots')}, "
+                f"分配{row.get('files')}个文件, 实际生成{row.get('tasks')}个EXE子任务"
             )
         return "；".join(rows)
 
@@ -1081,7 +1149,10 @@ class TaskManager:
                         "node_weight": part.get("node_weight", self._htcondor_machine_weights(machines).get(machine, 1)),
                         "node_slots": node_slots,
                         "slot_index": slot_index,
+                        "job_index": part.get("job_index", slot_index),
+                        "machine_job_count": part.get("machine_job_count", part.get("effective_slots", node_slots)),
                         "effective_slots": part.get("effective_slots", node_slots),
+                        "files_per_exe_limit": part.get("files_per_exe_limit", self._htcondor_files_per_exe_limit()),
                         "machine_total_count": part.get("machine_total_count", len(part_items)),
                         "part_config": str(part_config_path),
                         "part_input_dir": str(part_input_dir),
@@ -1428,7 +1499,7 @@ class TaskManager:
                 weights_map = self._htcondor_machine_weights(machines)
                 slots_map = self._htcondor_machine_slots(machines)
                 weight_text = ', '.join([f"{m}=权重{weights_map.get(m, 1)}, 并发槽位{slots_map.get(m, 1)}" for m in machines])
-                self.append_log(task_id, f"[HTCONDOR] 节点任务权重与并发槽位：{weight_text}。系统先按权重分配文件，再按槽位在节点内生成多个 EXE 子任务。")
+                self.append_log(task_id, f"[HTCONDOR] 节点任务权重与并发槽位：{weight_text}。系统先按权重分配每个节点的文件数量，再按每个节点设置的并发/进程数创建多个 EXE 子任务，最后按槽位限制同一节点并发运行。")
                 machine_plan_text = self._htcondor_machine_plan_text(entries)
                 if machine_plan_text:
                     self.append_log(task_id, f"[HTCONDOR] 节点执行计划：{machine_plan_text}")
@@ -1460,11 +1531,11 @@ class TaskManager:
             execution_backend="htcondor",
         )
         self.append_log(task_id, "[HTCONDOR] 单任务已提交给 HTCondor")
-        thread_limit = str(os.environ.get("LOCAL_WEB_HTCONDOR_THREAD_LIMIT", "")).strip()
+        thread_limit = self._htcondor_effective_thread_limit().strip()
         if thread_limit and thread_limit.lower() not in {"0", "false", "no", "off"}:
             self.append_log(task_id, f"[HTCONDOR] 已启用远程 EXE 线程限制：每个任务最多 {thread_limit} 个内部线程。")
         else:
-            self.append_log(task_id, "[HTCONDOR] 未启用远程 EXE 线程限制，优先保证节点计算性能。")
+            self.append_log(task_id, "[HTCONDOR] 未启用远程 EXE 线程限制。")
         self.append_log(task_id,
                         "[HTCONDOR] 当前版本要求执行节点具备相同的软件安装路径；大型输入输出仍按 config.json 中的路径读取和写入。")
         def should_cancel():
@@ -1555,15 +1626,38 @@ class TaskManager:
         entries = self._assign_htcondor_targets(entries, machines)
 
         total = len(entries)
-        if machines:
-            # HTCondor 模式下并发数按可用节点自动放大。
-            # 这样用户只点一次运行，也能让父节点和子节点同时拿到任务。
-            max_workers = max(int(max_workers or 1), min(len(machines), max(1, total)))
-        max_workers = max(1, min(int(max_workers or 1), max(1, total)))
-
         manager = self.htcondor_manager
         if manager is None:
             raise RuntimeError("HTCondorClusterManager 未初始化")
+
+        def entry_target_and_limit(entry: Dict[str, Any]) -> tuple[str, int]:
+            spec = entry.get("spec") if isinstance(entry, dict) else {}
+            spec = spec if isinstance(spec, dict) else {}
+            inputs = spec.get("inputs") if isinstance(spec.get("inputs"), dict) else {}
+            target = str(spec.get("target_machine") or inputs.get("machine") or "").strip()
+            try:
+                limit = int(inputs.get("node_slots") or 1)
+            except Exception:
+                limit = 1
+            return target, max(1, limit)
+
+        # 这里的 node_slots 是“同一节点最多同时运行几个 EXE”。
+        # 子任务创建阶段已经按节点文件数量和前端进程数生成多个 EXE 子任务；
+        # 调度器在这里再次按 node_slots 做节点级限流，避免同一节点超量提交。
+        machine_limits: Dict[str, int] = {}
+        for entry in entries:
+            target, limit = entry_target_and_limit(entry)
+            if target:
+                machine_limits[target] = max(machine_limits.get(target, 1), limit)
+
+        if machine_limits:
+            node_limited_workers = sum(machine_limits.values())
+            max_workers = max(1, min(max(1, total), node_limited_workers))
+        elif machines:
+            max_workers = max(int(max_workers or 1), min(len(machines), max(1, total)))
+            max_workers = max(1, min(int(max_workers or 1), max(1, total)))
+        else:
+            max_workers = max(1, min(int(max_workers or 1), max(1, total)))
 
         self.update_task(
             parent_id,
@@ -1575,20 +1669,24 @@ class TaskManager:
             max_workers=max_workers,
             execution_backend="htcondor",
         )
-        self.append_log(parent_id, f"[HTCONDOR] {group_name}启动：总任务数={total}，最多同时提交={max_workers}")
+        self.append_log(parent_id, f"[HTCONDOR] {group_name}启动：总任务数={total}，节点并发控制后最多同时运行={max_workers}")
         if machines:
             self.append_log(parent_id, f"[HTCONDOR] 当前可用执行节点：{', '.join(machines)}")
-        thread_limit = str(os.environ.get("LOCAL_WEB_HTCONDOR_THREAD_LIMIT", "")).strip()
+        if machine_limits:
+            limit_text = "；".join([f"{machine}=同时最多{limit}个EXE" for machine, limit in machine_limits.items()])
+            self.append_log(parent_id, f"[HTCONDOR] 节点并发限流：{limit_text}")
+        thread_limit = self._htcondor_effective_thread_limit().strip()
         if thread_limit and thread_limit.lower() not in {"0", "false", "no", "off"}:
             self.append_log(parent_id, f"[HTCONDOR] 已启用远程 EXE 线程限制：每个任务最多 {thread_limit} 个内部线程。")
         else:
-            self.append_log(parent_id, "[HTCONDOR] 未启用远程 EXE 线程限制，优先保证节点计算性能。")
-        self.append_log(parent_id, "[HTCONDOR] 系统会为每个子任务写入 target_machine；同一节点配置多个并发槽位时，会同时提交多个 EXE 子任务到该节点。")
+            self.append_log(parent_id, "[HTCONDOR] 未启用远程 EXE 线程限制。")
+        self.append_log(parent_id, "[HTCONDOR] 系统会为每个子任务写入 target_machine，并按每个节点的并发槽位限流提交。")
         self.append_log(parent_id, "[HTCONDOR] 系统会为拆分任务传输子任务 config.json 和对应输入子目录；输出目录按子任务隔离。")
 
         done_count = 0
         failures = 0
         future_map: Dict[Any, Dict[str, Any]] = {}
+        active_by_machine: Dict[str, int] = {}
 
         htcondor_cleanup_roots: list[str] = []
         for entry in entries:
@@ -1597,11 +1695,67 @@ class TaskManager:
             if cleanup_root and cleanup_root not in htcondor_cleanup_roots:
                 htcondor_cleanup_roots.append(cleanup_root)
 
+        pending_entries = list(enumerate(entries))
+
         try:
             with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                for index, entry in enumerate(entries):
-                    if parent_id in self.cancel_flags:
-                        break
+
+                def make_on_update(current_child_id: str, current_label: str, current_target: str):
+                    def on_update(info):
+                        info = info or {}
+                        kind = str(info.get("type") or "")
+                        text = str(info.get("text") or "")
+
+                        if kind == "submitted":
+                            cluster_id = str(info.get("cluster_id") or "")
+                            job_dir = str(info.get("job_dir") or "")
+                            self.update_task(
+                                current_child_id,
+                                htcondor_cluster_id=cluster_id,
+                                htcondor_job_dir=job_dir,
+                                execution_backend="htcondor",
+                            )
+                            self.append_log(
+                                parent_id,
+                                f"[HTCONDOR] {current_label} 已进入队列，ClusterId={cluster_id}，目标节点={current_target or '-'}"
+                            )
+                            return
+
+                        if not text:
+                            return
+                        if kind == "stdout":
+                            self._append_htcondor_output(current_child_id, "STDOUT", text)
+                        elif kind == "stderr":
+                            self._append_htcondor_output(current_child_id, "STDERR", text)
+                        elif kind == "event":
+                            useful = []
+                            for line in text.splitlines():
+                                raw = str(line or "").strip()
+                                low = raw.lower()
+                                if (
+                                    "submitted" in low
+                                    or "executing" in low
+                                    or "terminated" in low
+                                    or "aborted" in low
+                                    or "held" in low
+                                    or "removed" in low
+                                ):
+                                    useful.append(raw)
+                            if useful:
+                                self._append_htcondor_output(current_child_id, "CONDOR", "\n".join(useful), max_lines=80)
+                    return on_update
+
+                def make_should_cancel(current_child_id: str):
+                    def should_cancel():
+                        task = self.get_task(current_child_id) or {}
+                        return (
+                            parent_id in self.cancel_flags
+                            or current_child_id in self.cancel_flags
+                            or task.get("status") == "cancelled"
+                        )
+                    return should_cancel
+
+                def submit_one(index: int, entry: Dict[str, Any]):
                     spec = entry["spec"]
                     child_id = entry.get("child_id")
                     label = str(spec.get("label") or f"子任务 {index + 1}")
@@ -1637,60 +1791,8 @@ class TaskManager:
                             target_machine=target_machine,
                         )
 
-                    def make_on_update(current_child_id: str, current_label: str, current_target: str):
-                        def on_update(info):
-                            info = info or {}
-                            kind = str(info.get("type") or "")
-                            text = str(info.get("text") or "")
-
-                            if kind == "submitted":
-                                cluster_id = str(info.get("cluster_id") or "")
-                                job_dir = str(info.get("job_dir") or "")
-                                self.update_task(
-                                    current_child_id,
-                                    htcondor_cluster_id=cluster_id,
-                                    htcondor_job_dir=job_dir,
-                                    execution_backend="htcondor",
-                                )
-                                self.append_log(
-                                    parent_id,
-                                    f"[HTCONDOR] {current_label} 已进入队列，ClusterId={cluster_id}，目标节点={current_target or '-'}"
-                                )
-                                return
-
-                            if not text:
-                                return
-                            if kind == "stdout":
-                                self._append_htcondor_output(current_child_id, "STDOUT", text)
-                            elif kind == "stderr":
-                                self._append_htcondor_output(current_child_id, "STDERR", text)
-                            elif kind == "event":
-                                useful = []
-                                for line in text.splitlines():
-                                    raw = str(line or "").strip()
-                                    low = raw.lower()
-                                    if (
-                                        "submitted" in low
-                                        or "executing" in low
-                                        or "terminated" in low
-                                        or "aborted" in low
-                                        or "held" in low
-                                        or "removed" in low
-                                    ):
-                                        useful.append(raw)
-                                if useful:
-                                    self._append_htcondor_output(current_child_id, "CONDOR", "\n".join(useful), max_lines=80)
-                        return on_update
-
-                    def make_should_cancel(current_child_id: str):
-                        def should_cancel():
-                            task = self.get_task(current_child_id) or {}
-                            return (
-                                parent_id in self.cancel_flags
-                                or current_child_id in self.cancel_flags
-                                or task.get("status") == "cancelled"
-                            )
-                        return should_cancel
+                    if target_machine:
+                        active_by_machine[target_machine] = active_by_machine.get(target_machine, 0) + 1
 
                     future = pool.submit(
                         manager.run_job,
@@ -1704,15 +1806,39 @@ class TaskManager:
                         target_machine=target_machine,
                     )
                     future_map[future] = {
+                        "index": index,
                         "child_id": child_id,
                         "label": label,
                         "target_machine": target_machine,
                         "spec": spec,
                     }
                     if target_machine:
-                        self.append_log(parent_id, f"[HTCONDOR] 已提交 {index + 1}/{total}: {label} -> {target_machine}")
+                        running_on_machine = active_by_machine.get(target_machine, 0)
+                        limit = machine_limits.get(target_machine, 1)
+                        self.append_log(
+                            parent_id,
+                            f"[HTCONDOR] 已提交 {index + 1}/{total}: {label} -> {target_machine} "
+                            f"（该节点当前提交中 {running_on_machine}/{limit}）"
+                        )
                     else:
                         self.append_log(parent_id, f"[HTCONDOR] 已提交 {index + 1}/{total}: {label}")
+
+                def submit_available():
+                    made_progress = True
+                    while pending_entries and len(future_map) < max_workers and made_progress and parent_id not in self.cancel_flags:
+                        made_progress = False
+                        for item in list(pending_entries):
+                            if len(future_map) >= max_workers or parent_id in self.cancel_flags:
+                                break
+                            index, entry = item
+                            target, limit = entry_target_and_limit(entry)
+                            if target and active_by_machine.get(target, 0) >= limit:
+                                continue
+                            pending_entries.remove(item)
+                            submit_one(index, entry)
+                            made_progress = True
+
+                submit_available()
 
                 cancel_notice_written = False
                 while future_map:
@@ -1728,6 +1854,12 @@ class TaskManager:
                         meta = future_map.pop(future)
                         child_id = meta["child_id"]
                         label = meta["label"]
+                        target_machine = str(meta.get("target_machine") or "")
+                        if target_machine:
+                            active_by_machine[target_machine] = max(0, active_by_machine.get(target_machine, 0) - 1)
+
+                        retry_scheduled = False
+                        result = None
                         try:
                             result = future.result()
                             status = self._apply_htcondor_result(child_id, result)
@@ -1739,15 +1871,55 @@ class TaskManager:
                                     result=result,
                                     label=label,
                                 )
+                            elif self._looks_like_htcondor_memory_failure(result):
+                                # 节点内多 EXE 同时运行导致 MemoryError 时，不把整个父任务直接判失败。
+                                # 当前任务内先把该节点并发降为 1，并把失败子任务重新排队一次。
+                                spec_for_retry = copy.deepcopy(meta.get("spec") or {})
+                                inputs_for_retry = spec_for_retry.setdefault("inputs", {})
+                                try:
+                                    retry_count = int(inputs_for_retry.get("_memory_retry_count") or 0)
+                                except Exception:
+                                    retry_count = 0
+                                try:
+                                    max_retry = int(os.environ.get("LOCAL_WEB_HTCONDOR_MEMORY_RETRY", "1") or "1")
+                                except Exception:
+                                    max_retry = 1
+
+                                if target_machine and retry_count < max(0, max_retry):
+                                    old_limit = machine_limits.get(target_machine, 1)
+                                    machine_limits[target_machine] = 1
+                                    inputs_for_retry["_memory_retry_count"] = retry_count + 1
+                                    inputs_for_retry["node_slots"] = 1
+                                    spec_for_retry["target_machine"] = target_machine
+                                    spec_for_retry["label"] = f"{label}（内存保护降级重试{retry_count + 1}）"
+
+                                    # 失败尝试的 HTCondor job 副本仍要清理，避免占用磁盘。
+                                    self._cleanup_htcondor_job_dir(
+                                        parent_id,
+                                        str((result or {}).get("job_dir") or ""),
+                                        label=label,
+                                        reason="HTCondor 子任务内存失败，准备降级重试",
+                                    )
+
+                                    retry_index = int(meta.get("index") or 0)
+                                    pending_entries.insert(0, (retry_index, {"spec": spec_for_retry}))
+                                    retry_scheduled = True
+                                    self.append_log(
+                                        parent_id,
+                                        f"[HTCONDOR-RETRY] {label} 出现内存/并发失败；"
+                                        f"已将节点 {target_machine} 本次任务并发从 {old_limit} 降为 1，"
+                                        f"并重新提交该子任务。"
+                                    )
 
                             # 输出已经回收到用户目录后，立即删除 job_dir 里的 file/cm_files/outpath 等大副本。
                             # 即使子任务失败，也只保留日志文件，避免失败任务长期占用大量磁盘。
-                            self._cleanup_htcondor_job_dir(
-                                parent_id,
-                                str((result or {}).get("job_dir") or ""),
-                                label=label,
-                                reason=f"HTCondor 子任务结束，状态={status}",
-                            )
+                            if not retry_scheduled:
+                                self._cleanup_htcondor_job_dir(
+                                    parent_id,
+                                    str((result or {}).get("job_dir") or ""),
+                                    label=label,
+                                    reason=f"HTCondor 子任务结束，状态={status}",
+                                )
                         except Exception as exc:
                             status = "failed"
                             self.append_log(child_id, f"[HTCONDOR-ERROR] {type(exc).__name__}: {exc}")
@@ -1759,6 +1931,15 @@ class TaskManager:
                                 ended_at=now_iso(),
                                 execution_backend="htcondor",
                             )
+
+                        if retry_scheduled:
+                            # 失败尝试不计入完成数，不污染父任务最终状态；等待重试结果决定。
+                            self.update_task(
+                                parent_id,
+                                parallel_done=done_count,
+                                parallel_failed=failures,
+                            )
+                            continue
 
                         done_count += 1
                         if status != "success":
@@ -1772,7 +1953,9 @@ class TaskManager:
                         )
                         self.append_log(parent_id, f"[HTCONDOR] 完成 {done_count}/{total}: {label}，状态={status}")
 
-            # 如果用户曾经点过“取消”，但两个 HTCondor 子任务最终都已经正常 return_code=0，
+                    submit_available()
+
+            # 如果用户曾经点过“取消”，但所有已生成子任务最终都已经正常 return_code=0，
             # 仍然应该按 success 收尾，否则输出回收会被误判为取消任务而跳过。
             if failures == 0 and done_count == total:
                 final_status = "success"
