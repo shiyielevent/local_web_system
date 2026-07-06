@@ -587,13 +587,20 @@ export async function leaveHTCondorPool() {
   });
 }
 
-// 兼容旧版 App.jsx 的 HTCondor 节点权重接口。
-// 当前版本暂不启用“按节点权重/每节点多 EXE”功能，保留这两个导出只用于避免前端构建失败。
-// 后续真正实现每节点多 EXE 与 CPU 绑核时，再把这里改成真实后端接口。
+// HTCondor 节点权重接口：真实调用后端保存/读取权重。
+// 后端接口：
+//   GET  /api/htcondor/node-weights
+//   POST /api/htcondor/node-weights
 export async function getHTCondorNodeWeights() {
-  return { success: true, enabled: false, node_weights: {}, message: 'HTCondor 节点权重功能暂未启用。' };
+  return request('/api/htcondor/node-weights');
 }
 
 export async function saveHTCondorNodeWeights(payload = {}) {
-  return { success: true, enabled: false, node_weights: payload || {}, message: 'HTCondor 节点权重功能暂未启用，本次仅兼容前端构建。' };
+  return request('/api/htcondor/node-weights', {
+    method: 'POST',
+    body: JSON.stringify({
+      mode: payload.mode || 'weighted',
+      weights: payload.weights || {},
+    }),
+  });
 }
