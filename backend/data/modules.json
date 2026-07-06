@@ -276,14 +276,14 @@
       "mode": "batch_group",
       "input_key": "input_dir",
       "output_key": "output_dir",
-      "file_patterns": "*JD;*jd",
+      "file_patterns": "*MD;*JD;*md;*jd",
       "output_suffix": ".tif",
       "files_per_job": 1,
       "chunk_multiplier": 1,
       "output_naming": "source_stem",
       "pair_mode": "auto",
-      "pair_suffixes": "JD:JL;jd:jl",
-      "primary_suffixes": "JD",
+      "pair_suffixes": "MD:ML;JD:JL;md:ml;jd:jl",
+      "primary_suffixes": "MD;JD",
       "output_mode": "job_directory"
     },
     "tags": [
@@ -307,7 +307,7 @@
         "default": "D:/yan1study/AOD_test/AOD_model/ParasolAOD/test_data",
         "batch_role": "input",
         "match_mode": "each_file",
-        "file_patterns": "*JD;*jd",
+        "file_patterns": "*MD;*JD;*md;*jd",
         "batch_allow_all_files": true,
         "batch_allow_no_extension": true
       },

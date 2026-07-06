@@ -6317,7 +6317,7 @@ def _list_batch_files(value: str, field: dict) -> list[Path]:
     seen: set[Path] = set()
 
     for pattern in patterns:
-        for item in p.glob(pattern):
+        for item in p.rglob(pattern):
             if item.is_file() and _batch_file_allowed(item, field, patterns):
                 rp = item.resolve()
                 if rp not in seen:
@@ -6328,7 +6328,7 @@ def _list_batch_files(value: str, field: dict) -> list[Path]:
     # 这里再扫一层目录，并套用同样的过滤规则。
     if not found:
         fallback_patterns = ["*"]
-        for item in p.iterdir():
+        for item in p.rglob("*"):
             if item.is_file() and _batch_file_allowed(item, field, fallback_patterns):
                 rp = item.resolve()
                 if rp not in seen:
