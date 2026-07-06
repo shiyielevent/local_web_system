@@ -23,7 +23,6 @@ import stat
 import time
 from .auth import (admin_reset_password,create_token,create_user,delete_user,get_current_user,get_security_question,load_users,register_user,remove_token,require_admin,reset_password_by_security_answer,sanitize_user,update_user_enabled,update_user_role,verify_user,)
 from .task_manager import TaskManager
-from .dask_cluster_manager import DaskClusterError, DaskClusterManager
 from .htcondor_cluster_manager import HTCondorClusterError, HTCondorClusterManager
 
 def now_iso() -> str:
@@ -52,10 +51,8 @@ FRONTEND_DIST_DIR = PROJECT_ROOT / "frontend" / "dist"
 
 app = FastAPI(title="云和气溶胶反演系统API")
 app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_credentials=True,allow_methods=["*"],allow_headers=["*"],)
-dask_cluster_manager = DaskClusterManager(BASE_DIR, project_root=PROJECT_ROOT)
 htcondor_cluster_manager = HTCondorClusterManager(BASE_DIR, project_root=PROJECT_ROOT)
 task_manager = TaskManager(TASKS_FILE)
-task_manager.set_cluster_manager(dask_cluster_manager)
 task_manager.set_htcondor_manager(htcondor_cluster_manager)
 
 @app.get("/api/system/resources")
@@ -166,48 +163,10 @@ class PythonModuleConfigRequest(BaseModel):
     path: str
 
 
-class DaskInstallRequest(BaseModel):
-    package_spec: str = ""
-    upgrade: bool = False
 
 
-class DaskStartHeadRequest(BaseModel):
-    bind_ip: str = ""
-    scheduler_port: int = 8786
-    dashboard_port: int = 8787
-    api_port: int = 8790
-    worker_name: str = ""
-    nworkers: int = 1
-    nthreads: int = 1
-    memory_limit: str = "4GB"
-    shared_runtime_root: str = ""
-    auto_install: bool = True
 
 
-class DaskJoinRequest(BaseModel):
-    head_ip: str
-    api_port: int = 8790
-    join_token: str
-    worker_name: str = ""
-    nworkers: int = 1
-    nthreads: int = 1
-    memory_limit: str = "4GB"
-    auto_install: bool = True
-
-
-class DaskExecutionModeRequest(BaseModel):
-    mode: str = "local"
-    shared_runtime_root: str = ""
-
-
-class DaskFirewallRequest(BaseModel):
-    api_port: int = 8790
-    scheduler_port: int = 8786
-    dashboard_port: int = 8787
-
-
-class DaskSharedPathRequest(BaseModel):
-    path: str = ""
 
 
 class HTCondorExecutionModeRequest(BaseModel):
@@ -227,146 +186,105 @@ class HTCondorJoinParentRequest(BaseModel):
     high_port: int = 9800
 
 
-# =========================
-# Dask 分布式集群管理 API
-# =========================
-@app.get("/api/distributed/status")
-def api_distributed_status(authorization: str | None = Header(default=None)):
-    user = get_current_user(authorization)
-    status = dask_cluster_manager.status()
-    if user.role != "admin":
-        status["join_token"] = ""
-    return status
+class HTCondorNodeWeightsRequest(BaseModel):
+    # mode=weighted 时按各节点权重分配输入文件；mode=equal 时退回平均分配。
+    mode: str = "weighted"
+    weights: Dict[str, int] = {}
 
 
-@app.post("/api/distributed/install")
-def api_distributed_install(
-    payload: DaskInstallRequest,
-    authorization: str | None = Header(default=None),
-):
-    # 普通用户也允许在当前节点安装 Dask，以便把该电脑加入集群。
-    get_current_user(authorization)
+def _clamp_node_weight(value: Any, default: int = 1) -> int:
     try:
-        return dask_cluster_manager.install(
-            package_spec=payload.package_spec,
-            upgrade=payload.upgrade,
-        )
-    except DaskClusterError as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        n = int(value)
+    except Exception:
+        n = default
+    return max(1, min(8, n))
 
 
-@app.post("/api/distributed/firewall")
-def api_distributed_firewall(
-    payload: DaskFirewallRequest,
-    authorization: str | None = Header(default=None),
-):
-    require_admin(authorization)
-    return dask_cluster_manager.open_firewall(
-        api_port=payload.api_port,
-        scheduler_port=payload.scheduler_port,
-        dashboard_port=payload.dashboard_port,
-    )
+def _htcondor_weight_suggestions_from_nodes(nodes_items: List[Dict[str, Any]]) -> Dict[str, int]:
+    """根据节点 CPU/内存生成默认任务权重。
+
+    权重只控制“输入文件数量分配”，不代表同一节点同时启动多个 EXE。
+    为了避免权重过大导致界面和分配不可控，默认限制在 1~8。
+    """
+    machines: Dict[str, float] = {}
+    for item in nodes_items or []:
+        machine = str(item.get("machine") or "").strip()
+        if not machine:
+            continue
+        try:
+            cpus = max(1.0, float(item.get("cpus") or 1))
+        except Exception:
+            cpus = 1.0
+        try:
+            memory_mb = max(512.0, float(item.get("memory") or 1024))
+        except Exception:
+            memory_mb = 1024.0
+        # CPU 是主要因素，内存作为温和修正，避免单纯大内存导致权重过高。
+        score = cpus * max(1.0, (memory_mb / 1024.0) ** 0.5)
+        machines[machine] = max(machines.get(machine, 0.0), score)
+
+    if not machines:
+        return {}
+
+    min_score = max(1.0, min(machines.values()))
+    suggestions: Dict[str, int] = {}
+    for machine, score in machines.items():
+        suggestions[machine] = _clamp_node_weight(round(score / min_score), default=1)
+    return suggestions
 
 
-@app.post("/api/distributed/start-head")
-def api_distributed_start_head(
-    payload: DaskStartHeadRequest,
-    authorization: str | None = Header(default=None),
-):
-    require_admin(authorization)
-    try:
-        return dask_cluster_manager.start_head(
-            bind_ip=payload.bind_ip,
-            scheduler_port=payload.scheduler_port,
-            dashboard_port=payload.dashboard_port,
-            api_port=payload.api_port,
-            worker_name=payload.worker_name,
-            nworkers=payload.nworkers,
-            nthreads=payload.nthreads,
-            memory_limit=payload.memory_limit,
-            shared_runtime_root=payload.shared_runtime_root,
-            auto_install=payload.auto_install,
-        )
-    except DaskClusterError as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+def _htcondor_node_weight_summary(status_data: Dict[str, Any]) -> Dict[str, Any]:
+    nodes = status_data.get("nodes") or {}
+    items = nodes.get("items") if isinstance(nodes, dict) else []
+    items = items if isinstance(items, list) else []
 
+    state = getattr(htcondor_cluster_manager, "state", {}) or {}
+    raw_config = state.get("node_weight_config") or {}
+    if not isinstance(raw_config, dict):
+        raw_config = {}
 
-@app.get("/api/distributed/join-info")
-def api_distributed_join_info(token: str):
-    # 此接口供子节点后端执行加入握手；使用独立高强度随机令牌验证，
-    # 不复用浏览器登录 token。
-    try:
-        return dask_cluster_manager.get_join_info(token)
-    except DaskClusterError as exc:
-        raise HTTPException(status_code=403, detail=str(exc))
+    mode = str(raw_config.get("mode") or "weighted").strip().lower()
+    if mode not in {"weighted", "equal"}:
+        mode = "weighted"
 
+    saved_weights_raw = raw_config.get("weights") or {}
+    saved_weights = {
+        str(k): _clamp_node_weight(v)
+        for k, v in (saved_weights_raw.items() if isinstance(saved_weights_raw, dict) else [])
+        if str(k).strip()
+    }
 
-@app.post("/api/distributed/join")
-def api_distributed_join(
-    payload: DaskJoinRequest,
-    authorization: str | None = Header(default=None),
-):
-    # 普通用户可以把当前电脑作为 Worker 加入已有集群。
-    get_current_user(authorization)
-    try:
-        return dask_cluster_manager.join_cluster(
-            head_ip=payload.head_ip,
-            api_port=payload.api_port,
-            join_token=payload.join_token,
-            worker_name=payload.worker_name,
-            nworkers=payload.nworkers,
-            nthreads=payload.nthreads,
-            memory_limit=payload.memory_limit,
-            auto_install=payload.auto_install,
-        )
-    except DaskClusterError as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+    suggestions = _htcondor_weight_suggestions_from_nodes(items)
+    machine_names: List[str] = []
+    for item in items:
+        machine = str(item.get("machine") or "").strip()
+        if machine and machine not in machine_names:
+            machine_names.append(machine)
 
+    rows: List[Dict[str, Any]] = []
+    for machine in machine_names:
+        node = next((x for x in items if str(x.get("machine") or "").strip() == machine), {})
+        suggested = _clamp_node_weight(suggestions.get(machine, 1))
+        weight = 1 if mode == "equal" else _clamp_node_weight(saved_weights.get(machine, suggested))
+        rows.append({
+            "machine": machine,
+            "name": node.get("name") or "",
+            "state": node.get("state") or "",
+            "activity": node.get("activity") or "",
+            "cpus": node.get("cpus") or "",
+            "memory": node.get("memory") or "",
+            "suggested_weight": suggested,
+            "weight": weight,
+            "source": "manual" if machine in saved_weights and mode == "weighted" else ("equal" if mode == "equal" else "suggested"),
+        })
 
-@app.post("/api/distributed/leave")
-def api_distributed_leave(authorization: str | None = Header(default=None)):
-    # 普通用户可以让当前 Worker 退出集群。
-    get_current_user(authorization)
-    return dask_cluster_manager.leave_cluster()
-
-
-@app.post("/api/distributed/stop")
-def api_distributed_stop(authorization: str | None = Header(default=None)):
-    require_admin(authorization)
-    return dask_cluster_manager.stop_cluster()
-
-
-@app.post("/api/distributed/execution-mode")
-def api_distributed_execution_mode(
-    payload: DaskExecutionModeRequest,
-    authorization: str | None = Header(default=None),
-):
-    require_admin(authorization)
-    try:
-        return dask_cluster_manager.set_execution_mode(
-            payload.mode,
-            payload.shared_runtime_root,
-        )
-    except DaskClusterError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-
-@app.post("/api/distributed/test-shared-path")
-def api_distributed_test_shared_path(
-    payload: DaskSharedPathRequest,
-    authorization: str | None = Header(default=None),
-):
-    require_admin(authorization)
-    try:
-        return dask_cluster_manager.test_shared_path(payload.path)
-    except DaskClusterError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-
-@app.get("/api/distributed/logs")
-def api_distributed_logs(authorization: str | None = Header(default=None)):
-    require_admin(authorization)
-    return dask_cluster_manager.tail_logs()
+    return {
+        "mode": mode,
+        "weights": saved_weights,
+        "suggestions": suggestions,
+        "items": rows,
+        "updated_at": raw_config.get("updated_at") or "",
+    }
 
 
 # =========================
@@ -375,7 +293,47 @@ def api_distributed_logs(authorization: str | None = Header(default=None)):
 @app.get("/api/htcondor/status")
 def api_htcondor_status(authorization: str | None = Header(default=None)):
     require_admin(authorization)
-    return htcondor_cluster_manager.status()
+    data = htcondor_cluster_manager.status()
+    data["node_weight_plan"] = _htcondor_node_weight_summary(data)
+    data["node_weight_config"] = data["node_weight_plan"]
+    return data
+
+
+@app.get("/api/htcondor/node-weights")
+def api_htcondor_node_weights(authorization: str | None = Header(default=None)):
+    require_admin(authorization)
+    data = htcondor_cluster_manager.status()
+    return _htcondor_node_weight_summary(data)
+
+
+@app.post("/api/htcondor/node-weights")
+def api_htcondor_save_node_weights(
+    payload: HTCondorNodeWeightsRequest,
+    authorization: str | None = Header(default=None),
+):
+    require_admin(authorization)
+    mode = str(payload.mode or "weighted").strip().lower()
+    if mode not in {"weighted", "equal"}:
+        raise HTTPException(status_code=400, detail="节点任务权重模式只能是 weighted 或 equal")
+
+    clean_weights: Dict[str, int] = {}
+    for machine, value in (payload.weights or {}).items():
+        machine_name = str(machine or "").strip()
+        if not machine_name:
+            continue
+        clean_weights[machine_name] = _clamp_node_weight(value)
+
+    htcondor_cluster_manager.state["node_weight_config"] = {
+        "mode": mode,
+        "weights": clean_weights,
+        "updated_at": now_iso(),
+    }
+    htcondor_cluster_manager._save_state()
+
+    data = htcondor_cluster_manager.status()
+    summary = _htcondor_node_weight_summary(data)
+    summary["message"] = "节点任务权重已保存，后续 HTCondor 任务将按该权重分配输入文件。"
+    return summary
 
 
 @app.post("/api/htcondor/execution-mode")
@@ -1643,7 +1601,7 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
         elif field_type == "file_path" and p.parent:
             p.parent.mkdir(parents=True, exist_ok=True)
 
-    # 5. 根据 CPU/内存/磁盘/模型大小自动降低进程数
+    # 5. 根据 CPU/内存/磁盘做临界保护；默认尽量尊重用户选择的进程数
     workers, adjust_report = auto_adjust_parallel_workers(
         module,
         inputs,
@@ -5447,6 +5405,10 @@ def auto_adjust_parallel_workers(module: dict, inputs: dict, requested_workers: 
     safe = requested
     reasons: list[str] = []
 
+    # 默认采用积极并行：启动前不再轻易把用户选择的进程数降到 1。
+    # 如需恢复严格自动降级，可设置 LOCAL_WEB_STRICT_PARALLEL_AUTO_ADJUST=1。
+    strict_auto_adjust = str(os.environ.get("LOCAL_WEB_STRICT_PARALLEL_AUTO_ADJUST", "0")).strip().lower() in {"1", "true", "yes", "on"}
+
     disk_probe = RUNTIME_DIR
     try:
         for field in module.get("inputs", []) or []:
@@ -5466,19 +5428,19 @@ def auto_adjust_parallel_workers(module: dict, inputs: dict, requested_workers: 
 
     # 只在系统已经接近满载时，才在启动前降级。
     if cpu is not None:
-        if cpu >= 98:
+        if cpu >= 99.7:
             safe = min(safe, 1)
             reasons.append(f"当前 CPU 使用率 {cpu:.1f}% 已接近满载")
-        elif cpu >= 95:
+        elif cpu >= 99.0:
             safe = min(safe, max(2, requested // 2))
             reasons.append(f"当前 CPU 使用率 {cpu:.1f}% 很高，先降低一部分并发")
 
     # 内存只做临界保护；不再因为可用内存 2GB 左右就直接降为 1。
     if mem_percent is not None and mem_avail is not None:
-        if mem_percent >= 99 or mem_avail <= 0.3:
+        if mem_percent >= 99.7 or mem_avail <= 0.2:
             safe = min(safe, 1)
             reasons.append(f"内存几乎耗尽：已用 {mem_percent:.1f}%，可用 {mem_avail:.1f}GB")
-        elif mem_percent >= 97 or mem_avail <= 0.8:
+        elif mem_percent >= 99.0 or mem_avail <= 0.5:
             safe = min(safe, max(2, requested // 2))
             reasons.append(f"内存压力很高：已用 {mem_percent:.1f}%，可用 {mem_avail:.1f}GB")
 
@@ -5488,12 +5450,16 @@ def auto_adjust_parallel_workers(module: dict, inputs: dict, requested_workers: 
 
     # 磁盘也只做临界保护。固定资源不复制后，磁盘压力主要来自输出文件。
     if disk_percent is not None and disk_free is not None:
-        if disk_percent >= 99.5 or disk_free <= 0.5:
+        if disk_percent >= 99.8 or disk_free <= 0.3:
             safe = min(safe, 1)
             reasons.append(f"磁盘空间几乎耗尽：使用率 {disk_percent:.1f}%，剩余 {disk_free:.1f}GB")
-        elif disk_percent >= 99 or disk_free <= 1.0:
+        elif disk_percent >= 99.5 or disk_free <= 0.6:
             safe = min(safe, max(2, requested // 2))
             reasons.append(f"磁盘空间很紧：使用率 {disk_percent:.1f}%，剩余 {disk_free:.1f}GB")
+
+    if not strict_auto_adjust:
+        # 非严格模式只记录压力信息，不在启动前改小并发；真正危险时由 TaskManager 在启动子进程前暂停补位。
+        safe = requested
 
     safe = max(1, min(requested, safe))
     adjusted = safe < requested
@@ -5921,24 +5887,7 @@ def prepare_parallel_jobs(module: dict, inputs: dict, parallel_workers: int) -> 
             for i in range(0, len(files), files_per_job):
                 job_units.append(files[i:i + files_per_job])
 
-        if dask_cluster_manager.distributed_execution_enabled():
-            shared_runtime_root = dask_cluster_manager.get_shared_runtime_root()
-            if not shared_runtime_root:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "分布式 folder_chunks 模式需要所有节点可访问的共享运行目录。"
-                        "请先在“分布式”页面填写 UNC 路径并检测，例如 "
-                        r"\\192.168.2.100\local_web_runtime"
-                    ),
-                )
-            chunk_root = (
-                Path(shared_runtime_root)
-                / "parallel_chunks"
-                / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            )
-        else:
-            chunk_root = RUNTIME_DIR / "parallel_chunks" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        chunk_root = RUNTIME_DIR / "parallel_chunks" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         chunk_root.mkdir(parents=True, exist_ok=True)
 
         for idx, chunk in enumerate(job_units, start=1):

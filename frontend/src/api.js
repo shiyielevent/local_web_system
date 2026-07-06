@@ -540,73 +540,6 @@ export async function uploadPythonModuleConfig(path) {
 }
 
 // =========================
-// Dask 分布式集群
-// =========================
-export async function getDistributedStatus() {
-  return request('/api/distributed/status');
-}
-
-export async function installDaskRuntime(payload = {}) {
-  return request('/api/distributed/install', {
-    method: 'POST',
-    body: JSON.stringify(payload),
-  });
-}
-
-export async function openDaskFirewall(payload = {}) {
-  return request('/api/distributed/firewall', {
-    method: 'POST',
-    body: JSON.stringify(payload),
-  });
-}
-
-export async function startDaskHead(payload) {
-  return request('/api/distributed/start-head', {
-    method: 'POST',
-    body: JSON.stringify(payload || {}),
-  });
-}
-
-export async function joinDaskCluster(payload) {
-  return request('/api/distributed/join', {
-    method: 'POST',
-    body: JSON.stringify(payload || {}),
-  });
-}
-
-export async function leaveDaskCluster() {
-  return request('/api/distributed/leave', {
-    method: 'POST',
-  });
-}
-
-export async function stopDaskCluster() {
-  return request('/api/distributed/stop', {
-    method: 'POST',
-  });
-}
-
-export async function setDistributedExecutionMode(mode, sharedRuntimeRoot = '') {
-  return request('/api/distributed/execution-mode', {
-    method: 'POST',
-    body: JSON.stringify({
-      mode,
-      shared_runtime_root: sharedRuntimeRoot || '',
-    }),
-  });
-}
-
-export async function testDaskSharedPath(path) {
-  return request('/api/distributed/test-shared-path', {
-    method: 'POST',
-    body: JSON.stringify({ path: path || '' }),
-  });
-}
-
-export async function getDaskLogs() {
-  return request('/api/distributed/logs');
-}
-
 export async function getHTCondorStatus() {
   return request('/api/htcondor/status');
 }
@@ -652,4 +585,15 @@ export async function leaveHTCondorPool() {
     method: 'POST',
     body: JSON.stringify({}),
   });
+}
+
+// 兼容旧版 App.jsx 的 HTCondor 节点权重接口。
+// 当前版本暂不启用“按节点权重/每节点多 EXE”功能，保留这两个导出只用于避免前端构建失败。
+// 后续真正实现每节点多 EXE 与 CPU 绑核时，再把这里改成真实后端接口。
+export async function getHTCondorNodeWeights() {
+  return { success: true, enabled: false, node_weights: {}, message: 'HTCondor 节点权重功能暂未启用。' };
+}
+
+export async function saveHTCondorNodeWeights(payload = {}) {
+  return { success: true, enabled: false, node_weights: payload || {}, message: 'HTCondor 节点权重功能暂未启用，本次仅兼容前端构建。' };
 }

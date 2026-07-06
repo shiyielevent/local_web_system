@@ -45,22 +45,13 @@ import {
   listDataFiles,
   previewDataFile,
   revealDataFile,
-  deleteDataFile,
-  getDistributedStatus,
-  installDaskRuntime,
-  openDaskFirewall,
-  startDaskHead,
-  joinDaskCluster,
-  leaveDaskCluster,
-  stopDaskCluster,
-  setDistributedExecutionMode,
-  testDaskSharedPath,
-  getHTCondorStatus,
+  deleteDataFile,  getHTCondorStatus,
   setHTCondorExecutionMode,
   runHTCondorSmokeTest,
   createHTCondorParent,
   joinHTCondorParent,
   leaveHTCondorPool,
+  saveHTCondorNodeWeights,
 } from './api';
 
 import clusterEarthImage from './assets/earth.jpg';
@@ -2003,6 +1994,7 @@ function HTCondorPage({
   onCreateParent,
   onJoinParent,
   onLeavePool,
+  onSaveWeights,
 }) {
   const info = status || {};
   const install = info.install_result || {};
@@ -2021,6 +2013,11 @@ function HTCondorPage({
   const roleText = poolRole === 'parent' ? '父节点' : (poolRole === 'child' ? '子节点' : '单机 / 未加入集群');
   const clusterStarted = poolRole === 'parent' || poolRole === 'child';
   const clusterHealthy = clusterStarted && !!info.service_running && !!nodes.ok;
+  const clusterStatusText = clusterHealthy
+    ? '已组建 / 正常'
+    : (clusterStarted
+      ? '已组建 / 检查异常'
+      : '未组建');
   const nodeCount = uniqueMachines.length || nodeItems.length || 0;
   const parentAddress = info.parent_ip || info.bind_ip || '-';
 
@@ -2182,9 +2179,49 @@ function HTCondorPage({
     flexDirection: 'column',
   };
 
-  const clusterStatusText = clusterHealthy
-    ? '已启动 / 可发现执行节点'
-    : (clusterStarted ? '已配置，等待确认' : '未启动');
+  const weightPlan = info.node_weight_plan || info.node_weight_config || {};
+  const weightRows = Array.isArray(weightPlan.items) ? weightPlan.items : [];
+  const [weightMode, setWeightMode] = useState(weightPlan.mode || 'weighted');
+  const [nodeWeightsDraft, setNodeWeightsDraft] = useState({});
+
+  useEffect(() => {
+    const nextWeights = {};
+    weightRows.forEach((item) => {
+      const machine = String(item.machine || '').trim();
+      if (!machine) return;
+      const value = Number.parseInt(String(item.weight || item.suggested_weight || 1), 10) || 1;
+      nextWeights[machine] = Math.max(1, Math.min(8, value));
+    });
+    setNodeWeightsDraft(nextWeights);
+    setWeightMode(weightPlan.mode || 'weighted');
+  }, [JSON.stringify(weightRows.map((item) => [item.machine, item.weight, item.suggested_weight])), weightPlan.mode]);
+
+  const setDraftWeight = (machine, value) => {
+    const n = Number.parseInt(String(value || '1'), 10) || 1;
+    setNodeWeightsDraft((old) => ({
+      ...old,
+      [machine]: Math.max(1, Math.min(8, n)),
+    }));
+  };
+
+  const resetWeightsToSuggested = () => {
+    const nextWeights = {};
+    weightRows.forEach((item) => {
+      const machine = String(item.machine || '').trim();
+      if (!machine) return;
+      nextWeights[machine] = Math.max(1, Math.min(8, Number.parseInt(String(item.suggested_weight || 1), 10) || 1));
+    });
+    setNodeWeightsDraft(nextWeights);
+    setWeightMode('weighted');
+  };
+
+  const saveWeights = () => {
+    if (typeof onSaveWeights === 'function') {
+      onSaveWeights({ mode: weightMode, weights: nodeWeightsDraft });
+    }
+  };
+
+  const weightOptions = Array.from({ length: 8 }, (_, idx) => idx + 1);
 
   return (
     <section style={{ display: 'grid', gap: 16, minHeight: 'calc(100vh - 98px)' }}>
@@ -2264,6 +2301,96 @@ function HTCondorPage({
             <div><strong style={{ color: '#17406b' }}>当前机器：</strong>{info.machine || '-'}</div>
             <div><strong style={{ color: '#17406b' }}>服务状态：</strong>{service.state || (info.service_running ? 'running' : 'stopped')}</div>
             <div><strong style={{ color: '#17406b' }}>安装结果：</strong>{install.message || install.status || '暂无安装结果'}</div>
+          </div>
+
+          <div style={{
+            marginTop: 12,
+            padding: '12px 12px',
+            borderRadius: 14,
+            background: '#ffffff',
+            border: '1px solid #dce8f3',
+          }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+              <div>
+                <div style={{ fontSize: 16, fontWeight: 900, color: '#12385f' }}>节点信息与任务权重</div>
+                <div style={{ marginTop: 4, fontSize: 12, color: '#64748b', lineHeight: 1.45 }}>
+                  默认按 CPU/内存生成建议权重；管理员可手动调整。权重只影响输入文件数量分配。
+                </div>
+              </div>
+              <select
+                style={{ ...styles.input, width: 128, minHeight: 38, fontSize: 13 }}
+                value={weightMode}
+                onChange={(e) => setWeightMode(e.target.value)}
+              >
+                <option value="weighted">按权重</option>
+                <option value="equal">平均分配</option>
+              </select>
+            </div>
+
+            {weightRows.length ? (
+              <div style={{ display: 'grid', gap: 8, marginTop: 10 }}>
+                {weightRows.map((node) => {
+                  const machine = String(node.machine || '').trim();
+                  const draftValue = nodeWeightsDraft[machine] || node.weight || node.suggested_weight || 1;
+                  const memGb = node.memory ? (Number(node.memory) / 1024).toFixed(1) : '-';
+                  const isCurrent = machine && machine === info.machine;
+                  return (
+                    <div
+                      key={machine || node.name}
+                      style={{
+                        display: 'grid',
+                        gridTemplateColumns: 'minmax(0, 1.2fr) 0.8fr 0.75fr 94px',
+                        gap: 8,
+                        alignItems: 'center',
+                        padding: '9px 10px',
+                        borderRadius: 12,
+                        border: '1px solid #e3edf7',
+                        background: isCurrent ? '#f0f7ff' : '#f8fbff',
+                      }}
+                    >
+                      <div style={{ minWidth: 0 }}>
+                        <div style={{ fontWeight: 900, color: '#17406b', overflowWrap: 'anywhere', fontSize: 13 }}>
+                          {machine || '-'}{isCurrent ? '（本机）' : ''}
+                        </div>
+                        <div style={{ marginTop: 3, fontSize: 12, color: '#64748b' }}>
+                          {node.state || '-'} / {node.activity || '-'}
+                        </div>
+                      </div>
+                      <div style={{ fontSize: 12, color: '#475569', lineHeight: 1.45 }}>
+                        <div>CPU：{node.cpus || '-'}</div>
+                        <div>内存：{memGb}GB</div>
+                      </div>
+                      <div style={{ fontSize: 12, color: '#475569', lineHeight: 1.45 }}>
+                        <div>建议：<strong style={{ color: '#17406b' }}>{node.suggested_weight || 1}</strong></div>
+                        <div>来源：{node.source === 'manual' ? '手动' : (node.source === 'equal' ? '平均' : '建议')}</div>
+                      </div>
+                      <select
+                        style={{ ...styles.input, minHeight: 36, padding: '0 8px', fontSize: 13 }}
+                        value={draftValue}
+                        disabled={weightMode === 'equal'}
+                        onChange={(e) => setDraftWeight(machine, e.target.value)}
+                      >
+                        {weightOptions.map((value) => (
+                          <option key={value} value={value}>{value}</option>
+                        ))}
+                      </select>
+                    </div>
+                  );
+                })}
+                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end', marginTop: 2 }}>
+                  <button style={{ ...styles.whiteBtn, padding: '8px 12px' }} disabled={!!busy} onClick={resetWeightsToSuggested}>
+                    恢复建议权重
+                  </button>
+                  <button style={{ ...styles.blueBtn, padding: '8px 12px' }} disabled={!!busy} onClick={saveWeights}>
+                    保存权重
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div style={{ marginTop: 10, color: '#64748b', fontSize: 13 }}>
+                暂未发现执行节点。启动父节点或加入子节点后，这里会显示节点权重设置。
+              </div>
+            )}
           </div>
 
           <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 'auto', paddingTop: 14 }}>
@@ -2376,544 +2503,7 @@ function HTCondorPage({
   );
 }
 
-function DistributedPage({
-  status,
-  form,
-  setForm,
-  busy,
-  message,
-  sharedPathTest,
-  onRefresh,
-  onInstall,
-  onFirewall,
-  onStartHead,
-  onJoin,
-  onLeave,
-  onStop,
-  onSetMode,
-  onTestSharedPath,
-  isAdmin = false,
-}) {
-  const info = status || {};
-  const node = info.node || {};
-  const pkg = info.package || {};
-  const workers = Array.isArray(info.workers) ? info.workers : [];
-  const roleLabel = {
-    standalone: '独立节点',
-    head: '主节点',
-    worker: '工作节点',
-  }[info.role] || info.role || '独立节点';
-
-  const statusBadge = (ok, yesText, noText) => (
-    <span style={{
-      display: 'inline-flex',
-      alignItems: 'center',
-      gap: 6,
-      padding: '6px 10px',
-      borderRadius: 999,
-      fontSize: 12,
-      fontWeight: 800,
-      background: ok ? '#dcfce7' : '#fee2e2',
-      color: ok ? '#166534' : '#991b1b',
-    }}>
-      <span style={{
-        width: 8,
-        height: 8,
-        borderRadius: '50%',
-        background: ok ? '#22c55e' : '#ef4444',
-      }} />
-      {ok ? yesText : noText}
-    </span>
-  );
-
-  const field = (label, key, type = 'text', placeholder = '') => (
-    <label style={{ display: 'grid', gap: 6, minWidth: 0, maxWidth: '100%' }}>
-      <span style={{ fontWeight: 800, color: '#24486d', fontSize: 13 }}>{label}</span>
-      <input
-        type={type}
-        value={form[key] ?? ''}
-        placeholder={placeholder}
-        onChange={(e) => setForm((prev) => ({ ...prev, [key]: e.target.value }))}
-        style={{ ...styles.input, minWidth: 0, maxWidth: '100%' }}
-      />
-    </label>
-  );
-
-  const copyText = async (value) => {
-    try {
-      await navigator.clipboard.writeText(String(value || ''));
-      alert('已复制');
-    } catch {
-      window.prompt('请复制以下内容：', String(value || ''));
-    }
-  };
-
-  return (
-    <section
-      style={{
-        minHeight: 'calc(100vh - 98px)',
-        display: 'grid',
-        gap: 16,
-        width: '100%',
-        maxWidth: '100%',
-        minWidth: 0,
-        overflowX: 'hidden',
-        boxSizing: 'border-box',
-      }}
-    >
-      <div
-        style={{
-          ...styles.card,
-          minHeight: 230,
-          padding: 0,
-          overflow: 'hidden',
-          position: 'relative',
-          backgroundImage: `linear-gradient(90deg, rgba(4,25,52,0.93), rgba(10,76,139,0.68)), url(${clusterEarthImage})`,
-          backgroundSize: 'cover',
-          backgroundPosition: 'center',
-          color: '#fff',
-          width: '100%',
-          maxWidth: '100%',
-          minWidth: 0,
-          boxSizing: 'border-box',
-        }}
-      >
-        <div style={{ padding: '28px 32px', maxWidth: 900 }}>
-          <div style={{ fontSize: 30, fontWeight: 900, letterSpacing: 1 }}>
-            Dask 分布式集群
-          </div>
-          <div style={{ marginTop: 10, lineHeight: 1.8, color: 'rgba(255,255,255,0.88)' }}>
-            将多台电脑组成 Scheduler + Worker 集群。所有安装、主节点启动、工作节点加入、
-            执行模式切换和节点状态查看均可在本页面完成。
-          </div>
-          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 18 }}>
-            {statusBadge(pkg.installed, `Dask ${pkg.distributed_version || ''} 已安装`, 'Dask 未安装')}
-            {statusBadge(info.scheduler_online, 'Scheduler 在线', 'Scheduler 未连接')}
-            {statusBadge(info.worker_count > 0, `${info.worker_count || 0} 个 Worker`, '暂无 Worker')}
-            <span style={{
-              display: 'inline-flex',
-              padding: '6px 10px',
-              borderRadius: 999,
-              fontSize: 12,
-              fontWeight: 800,
-              background: 'rgba(255,255,255,0.14)',
-            }}>
-              当前角色：{roleLabel}
-            </span>
-            <span style={{
-              display: 'inline-flex',
-              padding: '6px 10px',
-              borderRadius: 999,
-              fontSize: 12,
-              fontWeight: 800,
-              background: info.execution_mode === 'distributed' ? '#2563eb' : 'rgba(255,255,255,0.14)',
-            }}>
-              任务执行：{info.execution_mode === 'distributed' ? '分布式' : '本机'}
-            </span>
-          </div>
-        </div>
-      </div>
-
-      {message && (
-        <div style={{
-          ...styles.card,
-          padding: '12px 16px',
-          color: message.type === 'error' ? '#991b1b' : '#166534',
-          background: message.type === 'error' ? '#fff1f2' : '#f0fdf4',
-          whiteSpace: 'pre-wrap',
-        }}>
-          {message.text}
-        </div>
-      )}
-
-      <div
-        style={{
-          display: 'grid',
-          gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 500px), 1fr))',
-          gap: 16,
-          width: '100%',
-          maxWidth: '100%',
-          minWidth: 0,
-        }}
-      >
-        <div style={{ ...styles.card, padding: 18, minWidth: 0, maxWidth: '100%', width: '100%', boxSizing: 'border-box' }}>
-          <div style={{ fontSize: 20, fontWeight: 900, color: '#12385f', marginBottom: 14 }}>
-            当前节点信息
-          </div>
-          <div style={{
-            display: 'grid',
-            gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 260px), 1fr))',
-            gap: 10,
-          }}>
-            {[
-              ['主机名', node.hostname],
-              ['IP 地址', node.ip],
-              ['节点角色', roleLabel],
-              ['操作系统', node.os],
-              ['CPU 核数', node.cpu_count],
-              ['内存', `${node.memory_available_gb ?? '-'} / ${node.memory_total_gb ?? '-'} GB 可用`],
-              ['磁盘剩余', `${node.disk_free_gb ?? '-'} GB`],
-              ['Python', `${node.python_version || '-'} · ${node.python_executable || '-'}`],
-              ['项目目录', node.project_root],
-              ['Scheduler', info.scheduler_address || '-'],
-            ].map(([label, value]) => (
-              <div key={label} style={{
-                padding: '11px 12px',
-                borderRadius: 10,
-                border: '1px solid #dce8f3',
-                background: '#f8fbff',
-                minWidth: 0,
-              }}>
-                <div style={{ fontSize: 12, color: '#6a7f96', fontWeight: 700 }}>{label}</div>
-                <div style={{
-                  marginTop: 4,
-                  color: '#173b61',
-                  fontWeight: 800,
-                  overflowWrap: 'anywhere',
-                }}>
-                  {value || '-'}
-                </div>
-              </div>
-            ))}
-          </div>
-          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 16 }}>
-            <button style={styles.blueBtn} disabled={!!busy} onClick={onRefresh}>
-              刷新状态
-            </button>
-            <button style={styles.whiteBtn} disabled={!!busy} onClick={onInstall}>
-              {pkg.installed ? '重新检查/升级 Dask' : '一键安装 Dask'}
-            </button>
-            {isAdmin && (
-              <button style={styles.whiteBtn} disabled={!!busy} onClick={onFirewall}>
-                配置 Windows 防火墙
-              </button>
-            )}
-            {info.dashboard_url && (
-              <button
-                style={styles.whiteBtn}
-                onClick={() => window.open(info.dashboard_url, '_blank', 'noopener,noreferrer')}
-              >
-                打开 Dask Dashboard
-              </button>
-            )}
-          </div>
-        </div>
-
-        {isAdmin ? (
-        <div style={{ ...styles.card, padding: 18, minWidth: 0, maxWidth: '100%', width: '100%', boxSizing: 'border-box' }}>
-          <div style={{ fontSize: 20, fontWeight: 900, color: '#12385f', marginBottom: 14 }}>
-            创建主节点
-          </div>
-          <div style={{ display: 'grid', gap: 10 }}>
-            {field('主节点对外 IP（留空自动识别）', 'bind_ip', 'text', node.ip || '192.168.2.100')}
-            <div
-              style={{
-                display: 'grid',
-                gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 170px), 1fr))',
-                gap: 10,
-                minWidth: 0,
-              }}
-            >
-              {field('Scheduler 端口', 'scheduler_port', 'number')}
-              {field('Dashboard 端口', 'dashboard_port', 'number')}
-            </div>
-            <div
-              style={{
-                display: 'grid',
-                gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 170px), 1fr))',
-                gap: 10,
-                minWidth: 0,
-              }}
-            >
-              {field('本机 Worker 进程数', 'head_nworkers', 'number')}
-              {field('每个 Worker 线程数', 'head_nthreads', 'number')}
-            </div>
-            {field('每个 Worker 内存限制', 'head_memory_limit', 'text', '例如 4GB')}
-            {field('共享运行目录（推荐 UNC）', 'shared_runtime_root', 'text', '\\\\192.168.2.100\\local_web_runtime')}
-          </div>
-          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 14 }}>
-            <button style={styles.blueBtn} disabled={!!busy} onClick={onStartHead}>
-              一键创建并启动集群
-            </button>
-            {info.role === 'head' && (
-              <button style={styles.redBtn} disabled={!!busy} onClick={onStop}>
-                停止集群
-              </button>
-            )}
-          </div>
-          {info.role === 'head' && (
-            <div style={{ marginTop: 14, padding: 12, borderRadius: 10, background: '#eef6ff' }}>
-              <div style={{ fontWeight: 900, color: '#17406b' }}>子节点加入信息</div>
-              <div style={{ marginTop: 7, fontSize: 13, lineHeight: 1.7 }}>
-                主节点 IP：<b>{node.ip || '-'}</b>
-                <button style={{ ...styles.whiteBtn, padding: '4px 8px', marginLeft: 8 }} onClick={() => copyText(node.ip)}>
-                  复制
-                </button>
-                <br />
-                加入服务端口：<b>{info.api_port || 8790}</b>
-                <br />
-                加入令牌：<code style={{ overflowWrap: 'anywhere' }}>{info.join_token || '-'}</code>
-                <button style={{ ...styles.whiteBtn, padding: '4px 8px', marginLeft: 8 }} onClick={() => copyText(info.join_token)}>
-                  复制令牌
-                </button>
-              </div>
-            </div>
-          )}
-        </div>
-        ) : (
-          <div
-            style={{
-              ...styles.card,
-              padding: 18,
-              minWidth: 0,
-              maxWidth: '100%',
-              width: '100%',
-              boxSizing: 'border-box',
-            }}
-          >
-            <div style={{ fontSize: 20, fontWeight: 900, color: '#12385f', marginBottom: 10 }}>
-              集群使用说明
-            </div>
-            <div style={{ color: '#49627f', lineHeight: 1.8, fontSize: 14 }}>
-              普通用户可以查看集群状态、安装 Dask，并将当前电脑作为 Worker 加入已有集群。
-              创建主节点、停止整个集群、配置防火墙和切换全局执行模式由管理员完成。
-            </div>
-          </div>
-        )}
-      </div>
-
-      <div
-        style={{
-          display: 'grid',
-          gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 500px), 1fr))',
-          gap: 16,
-          width: '100%',
-          maxWidth: '100%',
-          minWidth: 0,
-        }}
-      >
-        <div style={{ ...styles.card, padding: 18, minWidth: 0, maxWidth: '100%', width: '100%', boxSizing: 'border-box' }}>
-          <div style={{ fontSize: 20, fontWeight: 900, color: '#12385f', marginBottom: 14 }}>
-            加入已有集群
-          </div>
-          <div style={{ display: 'grid', gap: 10 }}>
-            {field('主节点 IP', 'head_ip', 'text', '192.168.2.100')}
-            <div
-              style={{
-                display: 'grid',
-                gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 170px), 1fr))',
-                gap: 10,
-                minWidth: 0,
-              }}
-            >
-              {field('主节点加入端口', 'api_port', 'number', '默认 8790')}
-              {field('节点名称', 'worker_name', 'text', node.hostname || 'worker-01')}
-            </div>
-            {field('加入令牌', 'join_token', 'password', '主节点页面生成的令牌')}
-            <div
-              style={{
-                display: 'grid',
-                gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 170px), 1fr))',
-                gap: 10,
-                minWidth: 0,
-              }}
-            >
-              {field('Worker 进程数', 'nworkers', 'number')}
-              {field('每个 Worker 线程数', 'nthreads', 'number')}
-            </div>
-            {field('每个 Worker 内存限制', 'memory_limit', 'text', '例如 4GB')}
-          </div>
-          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 14 }}>
-            <button style={styles.blueBtn} disabled={!!busy} onClick={onJoin}>
-              一键安装并加入集群
-            </button>
-            {info.role === 'worker' && (
-              <button style={styles.redBtn} disabled={!!busy} onClick={onLeave}>
-                退出集群
-              </button>
-            )}
-          </div>
-          <div style={{ marginTop: 12, color: '#6a7f96', fontSize: 12, lineHeight: 1.7 }}>
-            子节点必须先启动本系统后端。主节点创建集群后会启动独立加入服务，
-            默认监听 <code>8790</code>；请确认主节点防火墙已开放加入端口和 <code>8786</code>。
-          </div>
-        </div>
-
-        <div style={{ ...styles.card, padding: 18, minWidth: 0, maxWidth: '100%', width: '100%', boxSizing: 'border-box' }}>
-          <div style={{ fontSize: 20, fontWeight: 900, color: '#12385f', marginBottom: 14 }}>
-            任务执行模式与共享目录
-          </div>
-          <div style={{ color: '#49627f', lineHeight: 1.75, fontSize: 13 }}>
-            Dask 只分发任务描述，不传输大型 NC/HDF/TIF 数据。所有节点必须能够访问相同的输入、
-            输出和模块路径。推荐将输入、输出和临时任务目录放在 Windows SMB 共享目录中。
-          </div>
-          <div style={{ marginTop: 12 }}>
-            {field('共享运行目录', 'shared_runtime_root', 'text', '\\\\主节点IP\\local_web_runtime')}
-          </div>
-          {isAdmin ? (
-            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 14 }}>
-              <button
-                style={info.execution_mode === 'distributed' ? styles.blueBtn : styles.whiteBtn}
-                disabled={!!busy || info.role !== 'head'}
-                onClick={() => onSetMode('distributed')}
-              >
-                启用分布式任务调度
-              </button>
-              <button
-                style={info.execution_mode === 'local' ? styles.blueBtn : styles.whiteBtn}
-                disabled={!!busy}
-                onClick={() => onSetMode('local')}
-              >
-                切换为本机运行
-              </button>
-              <button
-                style={styles.whiteBtn}
-                disabled={!!busy || !info.scheduler_online}
-                onClick={onTestSharedPath}
-              >
-                检测所有节点共享目录
-              </button>
-            </div>
-          ) : (
-            <div
-              style={{
-                marginTop: 14,
-                padding: '10px 12px',
-                borderRadius: 10,
-                background: '#eef6ff',
-                color: '#17406b',
-                fontWeight: 800,
-              }}
-            >
-              当前全局执行模式：{info.execution_mode === 'distributed' ? '分布式' : '本机'}
-            </div>
-          )}
-          {sharedPathTest && (
-            <div style={{
-              marginTop: 14,
-              padding: 12,
-              borderRadius: 10,
-              background: sharedPathTest.all_ready ? '#f0fdf4' : '#fff7ed',
-              color: sharedPathTest.all_ready ? '#166534' : '#9a3412',
-            }}>
-              <div style={{ fontWeight: 900 }}>
-                {sharedPathTest.all_ready ? '所有节点均可读写' : '部分节点无法访问共享目录'}
-              </div>
-              <pre
-                style={{
-                  marginTop: 8,
-                  maxHeight: 220,
-                  maxWidth: '100%',
-                  overflow: 'auto',
-                  whiteSpace: 'pre-wrap',
-                  overflowWrap: 'anywhere',
-                  fontSize: 12,
-                }}
-              >
-                {JSON.stringify(sharedPathTest, null, 2)}
-              </pre>
-            </div>
-          )}
-        </div>
-      </div>
-
-      <div
-        style={{
-          ...styles.card,
-          padding: 18,
-          overflow: 'hidden',
-          minWidth: 0,
-          maxWidth: '100%',
-          width: '100%',
-          boxSizing: 'border-box',
-        }}
-      >
-        <div style={{ fontSize: 20, fontWeight: 900, color: '#12385f', marginBottom: 12 }}>
-          集群节点
-        </div>
-        <div style={{ width: '100%', maxWidth: '100%', minWidth: 0, overflowX: 'auto', overflowY: 'hidden' }}>
-          <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 760 }}>
-            <thead>
-              <tr>
-                {['节点名称', '地址', '主机', '状态', '线程数', '内存限制', '已用内存', 'CPU', '执行任务'].map((x) => (
-                  <th key={x} style={thStyle}>{x}</th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {workers.length === 0 ? (
-                <tr><td style={tdStyle} colSpan={9}>暂无 Worker。请创建主节点或在其他电脑上加入集群。</td></tr>
-              ) : workers.map((worker) => (
-                <tr key={worker.address}>
-                  <td style={tdStyle}>{worker.name || '-'}</td>
-                  <td style={tdStyle}>{worker.address || '-'}</td>
-                  <td style={tdStyle}>{worker.host || '-'}</td>
-                  <td style={tdStyle}>{worker.status || 'running'}</td>
-                  <td style={tdStyle}>{worker.nthreads ?? '-'}</td>
-                  <td style={tdStyle}>{worker.memory_limit_gb ?? '-'} GB</td>
-                  <td style={tdStyle}>{worker.memory_used_gb ?? '-'} GB</td>
-                  <td style={tdStyle}>{worker.cpu_percent ?? '-'}%</td>
-                  <td style={tdStyle}>{worker.executing ?? '-'}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      <div style={{ ...styles.card, padding: 18, minWidth: 0, maxWidth: '100%', width: '100%', boxSizing: 'border-box' }}>
-        <div style={{ fontSize: 20, fontWeight: 900, color: '#12385f', marginBottom: 12 }}>
-          Dask 运行日志
-        </div>
-        <div
-          style={{
-            display: 'grid',
-            gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 420px), 1fr))',
-            gap: 12,
-            width: '100%',
-            minWidth: 0,
-          }}
-        >
-          <div>
-            <div style={{ fontWeight: 800, marginBottom: 6 }}>Scheduler</div>
-            <pre
-              style={{
-                minHeight: 180,
-                maxHeight: 320,
-                maxWidth: '100%',
-                overflow: 'auto',
-                whiteSpace: 'pre-wrap',
-                overflowWrap: 'anywhere',
-                fontSize: 12,
-              }}
-            >
-              {info.logs?.scheduler || '暂无日志'}
-            </pre>
-          </div>
-          <div>
-            <div style={{ fontWeight: 800, marginBottom: 6 }}>Worker</div>
-            <pre
-              style={{
-                minHeight: 180,
-                maxHeight: 320,
-                maxWidth: '100%',
-                overflow: 'auto',
-                whiteSpace: 'pre-wrap',
-                overflowWrap: 'anywhere',
-                fontSize: 12,
-              }}
-            >
-              {info.logs?.worker || '暂无日志'}
-            </pre>
-          </div>
-        </div>
-      </div>
-    </section>
-  );
-}
-
-
-export default function App() {
+function App() {
   const [currentUser, setCurrentUser] = useState(null);
   const [authMode, setAuthMode] = useState('login');
   const [moduleFolderPath, setModuleFolderPath] = useState('');
@@ -2947,10 +2537,6 @@ export default function App() {
   const [dataPreviewLoading, setDataPreviewLoading] = useState(false);
   const [dataPreviewScale, setDataPreviewScale] = useState(1);
   const [dataPreviewScaleInput, setDataPreviewScaleInput] = useState('100');
-
-  const [distributedStatus, setDistributedStatus] = useState(null);
-  const [distributedBusy, setDistributedBusy] = useState('');
-  const [distributedMessage, setDistributedMessage] = useState(null);
   const [htcondorStatus, setHTCondorStatus] = useState(null);
   const [htcondorBusy, setHTCondorBusy] = useState('');
   const [htcondorMessage, setHTCondorMessage] = useState(null);
@@ -2961,23 +2547,7 @@ export default function App() {
     low_port: '9700',
     high_port: '9800',
   });
-  const [distributedSharedPathTest, setDistributedSharedPathTest] = useState(null);
-  const [distributedForm, setDistributedForm] = useState({
-    bind_ip: '',
-    scheduler_port: '8786',
-    dashboard_port: '8787',
-    api_port: '8790',
-    head_nworkers: '1',
-    head_nthreads: '1',
-    head_memory_limit: '4GB',
-    shared_runtime_root: '',
-    head_ip: '',
-    join_token: '',
-    worker_name: '',
-    nworkers: '1',
-    nthreads: '1',
-    memory_limit: '4GB',
-  });
+
 
   const [activeTab, setActiveTab] = useState(() => getSavedActiveTab() || 'module_mgmt');
   const [activeModuleByTool, setActiveModuleByTool] = useState({});
@@ -3052,7 +2622,7 @@ export default function App() {
   const navItems = useMemo(() => {
     const arr = [];
 
-    // 顶部导航固定顺序：模块管理 → 云反演 → 气溶胶反演 → 任务管理 → 数据管理 → 用户管理。
+    // 顶部导航固定顺序：模块管理 → 云反演 → 气溶胶反演 → 分布式 → 任务管理 → 数据管理 → 用户管理。
     if (isAdmin) {
       arr.push({ key: 'module_mgmt', label: '模块管理' });
     }
@@ -3071,15 +2641,16 @@ export default function App() {
       })
       .forEach((t) => arr.push({ key: `tool:${t.key}`, label: t.label }));
 
+    if (isAdmin) {
+      arr.push({ key: 'htcondor', label: '分布式' });
+    }
+
     arr.push({ key: 'tasks', label: '任务管理' });
     arr.push({ key: 'data_mgmt', label: '数据管理' });
 
     if (isAdmin) {
-      arr.push({ key: 'htcondor', label: 'HTCondor' });
       arr.push({ key: 'user_mgmt', label: '用户管理' });
     }
-    arr.push({ key: 'distributed', label: '分布式' });
-
     return arr;
   }, [isAdmin, visibleToolbars]);
 
@@ -3120,38 +2691,6 @@ export default function App() {
     };
     init();
   }, []);
-
-  useEffect(() => {
-    if (!currentUser || activeTab !== 'distributed') return undefined;
-
-    let cancelled = false;
-    const refresh = async () => {
-      try {
-        const data = await getDistributedStatus();
-        if (!cancelled) {
-          setDistributedStatus(data);
-          if (data?.shared_runtime_root) {
-            setDistributedForm((prev) => (
-              prev.shared_runtime_root
-                ? prev
-                : { ...prev, shared_runtime_root: data.shared_runtime_root }
-            ));
-          }
-        }
-      } catch (e) {
-        if (!cancelled) {
-          setDistributedMessage({ type: 'error', text: e?.message || '读取分布式状态失败' });
-        }
-      }
-    };
-
-    refresh();
-    const timer = window.setInterval(refresh, 3000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, [currentUser, activeTab]);
 
   useEffect(() => {
     if (!currentUser || activeTab !== 'htcondor') return undefined;
@@ -3786,158 +3325,6 @@ async function installModuleFolder() {
     setDataFiles(Array.isArray(list) ? list : []);
   }
 
-  async function refreshDistributedStatus(silent = false) {
-    try {
-      const data = await getDistributedStatus();
-      setDistributedStatus(data);
-      if (data?.shared_runtime_root) {
-        setDistributedForm((prev) => (
-          prev.shared_runtime_root
-            ? prev
-            : { ...prev, shared_runtime_root: data.shared_runtime_root }
-        ));
-      }
-      return data;
-    } catch (e) {
-      if (!silent) {
-        setDistributedMessage({ type: 'error', text: e?.message || '读取分布式状态失败' });
-      }
-      throw e;
-    }
-  }
-
-  async function runDistributedAction(actionName, callback) {
-    if (distributedBusy) return;
-    setDistributedBusy(actionName);
-    setDistributedMessage(null);
-    try {
-      const data = await callback();
-      if (data?.node || data?.role) {
-        setDistributedStatus(data);
-      } else {
-        await refreshDistributedStatus(true);
-      }
-      setDistributedMessage({
-        type: 'success',
-        text: data?.message || `${actionName}完成`,
-      });
-      return data;
-    } catch (e) {
-      setDistributedMessage({
-        type: 'error',
-        text: e?.message || `${actionName}失败`,
-      });
-      return null;
-    } finally {
-      setDistributedBusy('');
-    }
-  }
-
-  async function handleDaskInstall() {
-    return runDistributedAction('安装 Dask', () => installDaskRuntime({ upgrade: true }));
-  }
-
-  async function handleDaskFirewall() {
-    return runDistributedAction('配置防火墙', () => openDaskFirewall({
-      api_port: Number(distributedForm.api_port || 8790),
-      scheduler_port: Number(distributedForm.scheduler_port || 8786),
-      dashboard_port: Number(distributedForm.dashboard_port || 8787),
-    }));
-  }
-
-  async function handleDaskStartHead() {
-    const sharedRoot = String(distributedForm.shared_runtime_root || '').trim();
-    if (!sharedRoot) {
-      setDistributedMessage({
-        type: 'error',
-        text: '创建可执行分布式集群前必须填写所有节点都可访问的共享运行目录，例如 \\\\192.168.2.138\\local_web_runtime。',
-      });
-      return null;
-    }
-
-    const started = await runDistributedAction('创建集群', () => startDaskHead({
-      bind_ip: distributedForm.bind_ip || '',
-      scheduler_port: Number(distributedForm.scheduler_port || 8786),
-      dashboard_port: Number(distributedForm.dashboard_port || 8787),
-      api_port: Number(distributedForm.api_port || 8790),
-      worker_name: distributedForm.worker_name || '',
-      nworkers: Number(distributedForm.head_nworkers || 1),
-      nthreads: Number(distributedForm.head_nthreads || 1),
-      memory_limit: distributedForm.head_memory_limit || '4GB',
-      shared_runtime_root: sharedRoot,
-      auto_install: true,
-    }));
-
-    if (!started) return null;
-
-    const probe = await runDistributedAction(
-      '检测共享目录',
-      () => testDaskSharedPath(sharedRoot),
-    );
-    if (!probe?.all_ready) {
-      setDistributedSharedPathTest(probe || null);
-      setDistributedMessage({
-        type: 'error',
-        text: '集群已创建，但部分 Worker 无法读写共享目录，因此尚未启用分布式任务调度。',
-      });
-      return started;
-    }
-
-    setDistributedSharedPathTest(probe);
-    await runDistributedAction(
-      '启用分布式任务调度',
-      () => setDistributedExecutionMode('distributed', sharedRoot),
-    );
-    return started;
-  }
-
-  async function handleDaskJoin() {
-    if (!String(distributedForm.head_ip || '').trim()) {
-      setDistributedMessage({ type: 'error', text: '请输入主节点 IP' });
-      return;
-    }
-    if (!String(distributedForm.join_token || '').trim()) {
-      setDistributedMessage({ type: 'error', text: '请输入主节点加入令牌' });
-      return;
-    }
-    return runDistributedAction('加入集群', () => joinDaskCluster({
-      head_ip: distributedForm.head_ip,
-      api_port: Number(distributedForm.api_port || 8790),
-      join_token: distributedForm.join_token,
-      worker_name: distributedForm.worker_name || '',
-      nworkers: Number(distributedForm.nworkers || 1),
-      nthreads: Number(distributedForm.nthreads || 1),
-      memory_limit: distributedForm.memory_limit || '4GB',
-      auto_install: true,
-    }));
-  }
-
-  async function handleDaskLeave() {
-    if (!window.confirm('确定让当前节点退出集群吗？')) return;
-    return runDistributedAction('退出集群', () => leaveDaskCluster());
-  }
-
-  async function handleDaskStop() {
-    if (!window.confirm('确定停止主节点 Scheduler 和本机 Worker 吗？')) return;
-    return runDistributedAction('停止集群', () => stopDaskCluster());
-  }
-
-  async function handleDaskSetMode(mode) {
-    return runDistributedAction(
-      mode === 'distributed' ? '启用分布式任务调度' : '切换本机运行',
-      () => setDistributedExecutionMode(mode, distributedForm.shared_runtime_root || ''),
-    );
-  }
-
-  async function handleDaskTestSharedPath() {
-    setDistributedSharedPathTest(null);
-    const data = await runDistributedAction(
-      '检测共享目录',
-      () => testDaskSharedPath(distributedForm.shared_runtime_root || ''),
-    );
-    if (data) setDistributedSharedPathTest(data);
-  }
-
   async function refreshHTCondorStatus(silent = false) {
     try {
       const data = await getHTCondorStatus();
@@ -4011,6 +3398,10 @@ async function installModuleFolder() {
   async function handleHTCondorLeavePool() {
     if (!window.confirm('确定退出 HTCondor 集群吗？系统会重启 Condor 服务。')) return null;
     return runHTCondorAction('退出 HTCondor 集群', () => leaveHTCondorPool());
+  }
+
+  async function handleHTCondorSaveWeights(payload) {
+    return runHTCondorAction('保存节点任务权重', () => saveHTCondorNodeWeights(payload));
   }
 
 function getCenteredTaskWindowPosition(offset = 0) {
@@ -6375,26 +5766,7 @@ function renderTaskManagementPage() {
             onCreateParent={handleHTCondorCreateParent}
             onJoinParent={handleHTCondorJoinParent}
             onLeavePool={handleHTCondorLeavePool}
-          />
-        )}
-        {activeTab === 'distributed' && (
-          <DistributedPage
-            status={distributedStatus}
-            form={distributedForm}
-            setForm={setDistributedForm}
-            busy={distributedBusy}
-            message={distributedMessage}
-            sharedPathTest={distributedSharedPathTest}
-            onRefresh={() => refreshDistributedStatus(false)}
-            onInstall={handleDaskInstall}
-            onFirewall={handleDaskFirewall}
-            onStartHead={handleDaskStartHead}
-            onJoin={handleDaskJoin}
-            onLeave={handleDaskLeave}
-            onStop={handleDaskStop}
-            onSetMode={handleDaskSetMode}
-            onTestSharedPath={handleDaskTestSharedPath}
-            isAdmin={isAdmin}
+            onSaveWeights={handleHTCondorSaveWeights}
           />
         )}
       </div>
@@ -6678,3 +6050,4 @@ const taskTableDangerBtnStyle = {
   fontSize: 13,
   borderRadius: 8,
 };
+export default App;
