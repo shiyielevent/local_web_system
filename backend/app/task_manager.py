@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+import re
 
 
 def now_iso() -> str:
@@ -286,7 +287,23 @@ class TaskManager:
                     f"[HTCONDOR-WARN] {label or child_id} 未发现传回输出目录：{source_dir}",
                 )
                 continue
+            # 每次 HTCondor 子任务回收前，先清空本次 part 输出目录，
+            # 避免历史测试结果残留导致文件数量看起来变多。
+            # 注意：只清理带 part_name 的子目录，不能直接清空用户选择的输出根目录。
+            if part_name:
+                try:
+                    if target_dir.exists() and target_dir.is_dir():
+                        shutil.rmtree(target_dir, ignore_errors=True)
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                except Exception as exc:
+                    self.append_log(
+                        parent_id,
+                        f"[HTCONDOR-WARN] 清空历史 part 输出目录失败：{target_dir}，原因：{type(exc).__name__}: {exc}"
+                    )
+            else:
+                target_dir.mkdir(parents=True, exist_ok=True)
 
+            file_count, byte_count = self._copy_tree_contents(source_dir, target_dir)
             file_count, byte_count = self._copy_tree_contents(source_dir, target_dir)
             if file_count <= 0:
                 self.append_log(
@@ -403,26 +420,88 @@ class TaskManager:
         return result
 
     def _split_items_by_machine_weight(self, items: List[Any], machines: List[str]) -> List[List[Any]]:
-        """按节点权重把输入项分配到各机器。
+        """按节点权重直接计算每台机器应分配的输入数量。
 
-        返回值长度仍然等于 machines 长度，因此每台机器仍只生成一个 HTCondor 子任务。
-        高权重机器会在这个子任务里拿到更多输入文件，但不会因此同时启动多个 EXE。
+        计算方式：
+        - total = 输入文件总数
+        - weight_sum = 所有节点权重之和
+        - 节点基础分配数 = floor(total * 当前节点权重 / weight_sum)
+        - 因 floor 产生的剩余文件，按小数余数从大到小补齐，保证不丢文件。
+
+        这与旧的 weighted_indices 循环分发不同。旧方式按权重循环散列文件，
+        不利于准确排查每个节点实际拿到多少文件。这里改成确定性的数量切分。
         """
         machines = [str(x).strip() for x in machines if str(x).strip()]
         chunks: List[List[Any]] = [[] for _ in machines]
         if not items or not machines:
             return chunks
 
-        weights = self._htcondor_machine_weights(machines)
-        weighted_indices: List[int] = []
-        for idx, machine in enumerate(machines):
-            weighted_indices.extend([idx] * self._clamp_htcondor_node_weight(weights.get(machine, 1)))
-        if not weighted_indices:
-            weighted_indices = list(range(len(machines)))
+        total = len(items)
+        weights_map = self._htcondor_machine_weights(machines)
+        weights = [
+            self._clamp_htcondor_node_weight(weights_map.get(machine, 1), default=1)
+            for machine in machines
+        ]
+        weight_sum = sum(weights)
+        if weight_sum <= 0:
+            weights = [1 for _ in machines]
+            weight_sum = len(weights)
 
-        for index, item in enumerate(items):
-            chunks[weighted_indices[index % len(weighted_indices)]].append(item)
+        raw_counts = [(total * weight) / weight_sum for weight in weights]
+        counts = [int(value) for value in raw_counts]
+
+        # floor 后可能少分若干个文件。按小数余数补齐，保证 sum(counts) == total。
+        remaining = total - sum(counts)
+        if remaining > 0:
+            order = sorted(
+                range(len(machines)),
+                key=lambda i: (raw_counts[i] - counts[i], weights[i]),
+                reverse=True,
+            )
+            for offset in range(remaining):
+                counts[order[offset % len(order)]] += 1
+
+        # 极端情况下如果因为异常多分了，也从末尾节点回收。正常不会触发。
+        overflow = sum(counts) - total
+        if overflow > 0:
+            for i in range(len(counts) - 1, -1, -1):
+                if overflow <= 0:
+                    break
+                take = min(counts[i], overflow)
+                counts[i] -= take
+                overflow -= take
+
+        cursor = 0
+        for index, count in enumerate(counts):
+            if count <= 0:
+                continue
+            end = min(cursor + count, total)
+            chunks[index] = list(items[cursor:end])
+            cursor = end
+
+        # 如果仍有尾部文件没有分配，补到最后一个非空节点；保证没有输入丢失。
+        if cursor < total:
+            target = next((i for i in range(len(chunks) - 1, -1, -1) if chunks[i]), len(chunks) - 1)
+            chunks[target].extend(items[cursor:])
+
         return chunks
+
+    def _htcondor_entries_distribution_text(self, entries: List[Dict[str, Any]]) -> str:
+        """把 HTCondor 子任务的实际文件分配数量整理成日志文本。"""
+        rows: List[str] = []
+        for entry in entries or []:
+            spec = entry.get("spec") if isinstance(entry, dict) else {}
+            spec = spec if isinstance(spec, dict) else {}
+            inputs = spec.get("inputs") if isinstance(spec.get("inputs"), dict) else {}
+            machine = str(inputs.get("machine") or spec.get("target_machine") or "").strip()
+            if not machine:
+                continue
+            weight = inputs.get("node_weight", "")
+            part_count = inputs.get("part_count", "")
+            if part_count == "":
+                continue
+            rows.append(f"{machine}=权重{weight}, {part_count}个文件")
+        return "；".join(rows)
 
     def _find_json_config_arg(self, command: List[str]) -> tuple[int, Path] | tuple[None, None]:
         """从命令中找最后一个 json 配置文件参数。"""
@@ -687,8 +766,7 @@ class TaskManager:
         if len(files) < 2:
             return []
 
-        # 按节点任务权重分配文件。每台机器仍只生成一个 HTCondor 子任务，
-        # 高权重机器会拿到更多输入文件，但不会因此同时启动多个 EXE。
+        # 按公式 文件总数 * 节点权重 / 权重总和 计算每台机器的文件数。
         chunks = self._split_items_by_machine_weight(files, machines)
 
         output_defs = self._module_output_defs(module_item, split_key=split_key)
@@ -1112,7 +1190,10 @@ class TaskManager:
             if entries:
                 self.append_log(task_id, f"[HTCONDOR] 检测到 {len(machines)} 个可用执行节点：{', '.join(machines)}")
                 weight_text = ', '.join([f"{m}={self._htcondor_machine_weights(machines).get(m, 1)}" for m in machines])
-                self.append_log(task_id, f"[HTCONDOR] 节点任务权重：{weight_text}。权重只控制输入文件数量分配，不代表同一节点同时启动多个 EXE。")
+                self.append_log(task_id, f"[HTCONDOR] 节点任务权重：{weight_text}。系统按 文件总数 * 节点权重 / 权重总和 计算各节点文件数。")
+                distribution_text = self._htcondor_entries_distribution_text(entries)
+                if distribution_text:
+                    self.append_log(task_id, f"[HTCONDOR] 实际文件分配：{distribution_text}")
                 self.append_log(task_id, f"[HTCONDOR] 已将本次任务自动拆分为 {len(entries)} 个子任务，并指定到不同节点执行。")
                 self.update_task(
                     task_id,
