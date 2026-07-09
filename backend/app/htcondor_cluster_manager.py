@@ -1619,7 +1619,37 @@ else {
             "echo [HTCONDOR] target_machine=" + str(target_machine or ""),
             "echo [HTCONDOR] date=%DATE% %TIME%",
         ]
+        # 共享目录模式下，HTCondor 子任务运行在独立会话中，
+        # 不能直接继承用户在 PowerShell 中执行 net use 得到的凭据。
+        # 所以在 run_job.cmd 启动 EXE 前，先主动登录父节点共享目录。
+        try:
+            shared_cfg = self.shared_io_config()
+        except Exception:
+            shared_cfg = {}
 
+        share_unc = str(shared_cfg.get("unc_root") or "").strip()
+        share_user = str(os.environ.get("LOCAL_WEB_HTCONDOR_SHARE_USER", "")).strip()
+        share_password = str(os.environ.get("LOCAL_WEB_HTCONDOR_SHARE_PASSWORD", "")).strip()
+
+        if shared_cfg.get("enabled") and share_unc and share_user and share_password:
+            # 这里把 % 转成 %% ，避免 Windows bat 误解析。
+            safe_unc = share_unc.replace("%", "%%")
+            safe_user = share_user.replace("%", "%%")
+            safe_password = share_password.replace("%", "%%")
+
+            lines.extend([
+                "echo [HTCONDOR] connect shared directory",
+                f'net use "{safe_unc}" /delete /y >nul 2>nul',
+                f'net use "{safe_unc}" "{safe_password}" /user:"{safe_user}" /persistent:no',
+                "if errorlevel 1 (",
+                "  echo [HTCONDOR-ERROR] failed to connect shared directory",
+                "  exit /b 1326",
+                ")",
+            ])
+        elif shared_cfg.get("enabled") and share_unc:
+            lines.extend([
+                "echo [HTCONDOR-WARN] shared directory enabled but no share credential configured",
+            ])
         for key, value in (env or {}).items():
             key = str(key).strip()
             if not key or any(ch in key for ch in " =&|"):
