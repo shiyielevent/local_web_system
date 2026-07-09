@@ -195,6 +195,13 @@ class HTCondorClusterManager:
         # 给常见执行账号和局域网测试账号足够的读写权限。
         # 注意：共享权限和 NTFS 权限是两套权限，都要放行。
         grant_targets = ["Users", "Everyone"]
+        computer_name = os.environ.get("COMPUTERNAME", "").strip()
+        if computer_name:
+            grant_targets.append(f"{computer_name}\\LocalWebCondor")
+        share_user = os.environ.get("LOCAL_WEB_HTCONDOR_SHARE_USER", "").strip()
+        if share_user and share_user not in grant_targets:
+            grant_targets.append(share_user)
+
         for target in grant_targets:
             result = self._run(["icacls.exe", str(root), "/grant", f"{target}:(OI)(CI)M", "/T", "/C"], timeout=60)
             commands.append({"command": f"icacls {root} /grant {target}", **result})
@@ -1410,12 +1417,19 @@ else {
 
         这里不让用户手动修权限。平台生成的 config.json、输出目录、运行目录，
         都由系统在提交作业前自动放开给本机 Users 组和 LocalWebCondor。
+
+        注意：UNC 共享路径（例如 \\192.168.2.140\H8Data）不能在这里做 icacls。
+        共享目录的权限必须由父节点本地目录的 NTFS 权限和 Windows 共享权限控制。
         """
         if os.name != "nt":
             return
 
+        raw_path_text = str(path or "").strip().strip('"')
+        if raw_path_text.startswith("\\\\"):
+            return
+
         try:
-            path = Path(path)
+            path = Path(raw_path_text)
         except Exception:
             return
 
@@ -1484,6 +1498,8 @@ else {
         seen: set[str] = set()
         for p in paths:
             key = str(p).lower()
+            if key.startswith("\\\\"):
+                continue
             if key in seen:
                 continue
             seen.add(key)
@@ -1539,6 +1555,15 @@ else {
         config_arg_index = None
         config_copy = job_path / "localweb_config.json"
         rewrite_script = job_path / "rewrite_config.ps1"
+
+        # 共享目录模式下，HTCondor 不再传输大型 input/output/cm_files 目录。
+        # 子节点直接通过 UNC 读取父节点共享目录，作业只传输 run_job.cmd、localweb_config.json、result.txt。
+        try:
+            shared_cfg = self.shared_io_config()
+        except Exception:
+            shared_cfg = {}
+        shared_io_enabled = bool(shared_cfg.get("enabled") and str(shared_cfg.get("unc_root") or "").strip())
+
         for idx in range(len(safe_command) - 1, -1, -1):
             try:
                 p = Path(safe_command[idx].strip().strip('"'))
@@ -1565,8 +1590,11 @@ else {
                         )
                         transfer_files.append("rewrite_config.ps1")
 
-                        # 把 part_config.json 同目录下的子目录一起作为输入文件传输。
-                        # 这些目录通常是按节点拆出来的 input、output、cm_files 等。
+                        # 非共享目录模式：把 part_config.json 同目录下的 input/output/cm_files 等目录传给执行节点。
+                        # 共享目录模式：禁止传输这些大目录，子节点通过 UNC 直接读取/写入共享目录。
+                        if shared_io_enabled:
+                            break
+
                         for child in sorted(p.parent.iterdir()):
                             if not child.is_dir():
                                 continue
@@ -1619,30 +1647,68 @@ else {
             "echo [HTCONDOR] target_machine=" + str(target_machine or ""),
             "echo [HTCONDOR] date=%DATE% %TIME%",
         ]
-        # 共享目录模式下，HTCondor 子任务运行在独立会话中，
-        # 不能直接继承用户在 PowerShell 中执行 net use 得到的凭据。
-        # 所以在 run_job.cmd 启动 EXE 前，先主动登录父节点共享目录。
-        try:
-            shared_cfg = self.shared_io_config()
-        except Exception:
-            shared_cfg = {}
-
+        # 共享目录模式下，HTCondor 子任务运行在独立会话中。
+        # 先尝试写入凭据并连接共享目录；如果 net use 失败，再直接测试 UNC 可访问性。
+        # 这样可兼容两类场景：
+        # 1）执行账号需要 localwebshare 凭据才能访问父节点共享目录；
+        # 2）执行账号本身已具备共享目录权限，net use 失败但 UNC 仍可直接访问。
         share_unc = str(shared_cfg.get("unc_root") or "").strip()
         share_user = str(os.environ.get("LOCAL_WEB_HTCONDOR_SHARE_USER", "")).strip()
         share_password = str(os.environ.get("LOCAL_WEB_HTCONDOR_SHARE_PASSWORD", "")).strip()
 
-        if shared_cfg.get("enabled") and share_unc and share_user and share_password:
-            # 这里把 % 转成 %% ，避免 Windows bat 误解析。
+        if shared_cfg.get("enabled") and share_unc:
             safe_unc = share_unc.replace("%", "%%")
             safe_user = share_user.replace("%", "%%")
             safe_password = share_password.replace("%", "%%")
 
+            share_host = ""
+            try:
+                share_host = share_unc.strip("\\").split("\\")[0]
+            except Exception:
+                share_host = ""
+            safe_host = share_host.replace("%", "%%")
+
             lines.extend([
                 "echo [HTCONDOR] connect shared directory",
-                f'net use "{safe_unc}" /delete /y >nul 2>nul',
-                f'net use "{safe_unc}" /user:"{safe_user}" "{safe_password}" /persistent:no',
+                "echo [HTCONDOR] job user:",
+                "whoami",
+                "echo [HTCONDOR] share_unc=" + safe_unc,
+                "echo [HTCONDOR] current net use before connect:",
+                "net use",
+            ])
+
+            if share_user and share_password:
+                lines.extend([
+                    f'net use "{safe_unc}" /delete /y >nul 2>nul',
+                    f'cmdkey /delete:{safe_host} >nul 2>nul',
+                    f'cmdkey /add:{safe_host} /user:"{safe_user}" /pass:"{safe_password}"',
+                    "if errorlevel 1 (",
+                    "  echo [HTCONDOR-WARN] failed to store shared credential, will test direct UNC access",
+                    ")",
+                    f'net use "{safe_unc}" /persistent:no',
+                    "if errorlevel 1 (",
+                    "  echo [HTCONDOR-WARN] net use shared directory failed, will test direct UNC access",
+                    "  echo [HTCONDOR] net use after failed connect:",
+                    "  net use",
+                    "  echo [HTCONDOR] cmdkey list:",
+                    "  cmdkey /list",
+                    ")",
+                ])
+            else:
+                lines.extend([
+                    "echo [HTCONDOR-WARN] shared directory enabled but no share credential configured",
+                ])
+
+            lines.extend([
+                f'dir "{safe_unc}" >nul 2>nul',
                 "if errorlevel 1 (",
-                "  echo [HTCONDOR-ERROR] failed to connect shared directory",
+                "  echo [HTCONDOR-ERROR] shared directory is not accessible in this HTCondor job session",
+                "  echo [HTCONDOR] job user:",
+                "  whoami",
+                "  echo [HTCONDOR] net use:",
+                "  net use",
+                "  echo [HTCONDOR] cmdkey list:",
+                "  cmdkey /list",
                 "  (",
                 "    echo return_code=1326",
                 "    echo computer=%COMPUTERNAME%",
@@ -1650,10 +1716,7 @@ else {
                 "  ) > \"%LOCAL_WEB_JOB_DIR%\\result.txt\"",
                 "  exit /b 1326",
                 ")",
-            ])
-        elif shared_cfg.get("enabled") and share_unc:
-            lines.extend([
-                "echo [HTCONDOR-WARN] shared directory enabled but no share credential configured",
+                "echo [HTCONDOR] shared directory accessible",
             ])
         for key, value in (env or {}).items():
             key = str(key).strip()
@@ -1704,6 +1767,17 @@ else {
             request_memory_mb = 8192
         request_memory_mb = max(1024, request_memory_mb)
 
+        # 共享目录模式优先让作业按提交用户 LocalWebCondor 运行。
+        # 当前系统提交 condor_submit 时已经切换到了 LocalWebCondor，
+        # 因此 run_as_owner=true 可避免 HTCondor 默认 slot 账号无法访问 SMB 共享的问题。
+        run_as_owner_env = str(os.environ.get("LOCAL_WEB_HTCONDOR_RUN_AS_OWNER", "")).strip().lower()
+        if run_as_owner_env in {"1", "true", "yes", "on"}:
+            run_as_owner_value = "true"
+        elif run_as_owner_env in {"0", "false", "no", "off"}:
+            run_as_owner_value = "false"
+        else:
+            run_as_owner_value = "true" if shared_io_enabled else "false"
+
         sub_text = f"""universe = vanilla
 executable = C:/Windows/System32/cmd.exe
 arguments = /D /C run_job.cmd
@@ -1721,7 +1795,7 @@ log = event.log
 request_cpus = 1
 request_memory = {request_memory_mb}MB
 request_disk = 1024MB
-run_as_owner = false
+run_as_owner = {run_as_owner_value}
 queue 1
 """
         sub_file.write_text(sub_text, encoding="ascii", errors="ignore")
