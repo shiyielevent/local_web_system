@@ -75,6 +75,8 @@ class TaskManager:
         self.child_launch_cpu_threshold = float(os.environ.get("LOCAL_WEB_CHILD_START_CPU_THRESHOLD", "99.5"))
         self.child_launch_memory_threshold = float(os.environ.get("LOCAL_WEB_CHILD_START_MEMORY_THRESHOLD", "99.5"))
         self.child_launch_min_memory_gb = float(os.environ.get("LOCAL_WEB_CHILD_START_MIN_MEMORY_GB", "0.2"))
+        self.child_launch_cold_start_memory_threshold = float(os.environ.get("LOCAL_WEB_CHILD_COLD_START_MEMORY_THRESHOLD", "99.8"))
+        self.child_launch_cold_start_min_memory_gb = float(os.environ.get("LOCAL_WEB_CHILD_COLD_START_MIN_MEMORY_GB", "0.6"))
         self.child_launch_disk_threshold = float(os.environ.get("LOCAL_WEB_CHILD_START_DISK_THRESHOLD", "99.8"))
         self.child_launch_min_disk_free_gb = float(os.environ.get("LOCAL_WEB_CHILD_START_MIN_DISK_FREE_GB", "0.2"))
         self.child_launch_wait_seconds = float(os.environ.get("LOCAL_WEB_CHILD_START_WAIT_SECONDS", "1"))
@@ -2192,7 +2194,7 @@ class TaskManager:
             except Exception:
                 return {"percent": None, "free_gb": None}
 
-    def _runtime_pressure_reason(self) -> str:
+    def _runtime_pressure_reason(self, allow_cold_start: bool = False) -> str:
         """返回是否应该暂停启动新的子进程。
 
         轻量化策略：
@@ -2204,6 +2206,8 @@ class TaskManager:
         if active_processes >= self.max_process_slots:
             return f"平台已启动 {active_processes}/{self.max_process_slots} 个模块进程，等待已有进程完成"
 
+        cold_start = bool(allow_cold_start and active_processes == 0)
+
         if not self.adaptive_child_start_enabled:
             cpu = self._system_cpu_percent()
             if cpu is not None and cpu >= self.child_launch_cpu_threshold:
@@ -2212,10 +2216,20 @@ class TaskManager:
         mem = self._virtual_memory_snapshot()
         mem_percent = mem.get("percent")
         mem_available = mem.get("available_gb")
-        if mem_percent is not None and mem_percent >= self.child_launch_memory_threshold:
-            return f"内存使用率 {mem_percent:.1f}% 已超过暂停启动阈值 {self.child_launch_memory_threshold:.0f}%"
-        if mem_available is not None and mem_available <= self.child_launch_min_memory_gb:
-            return f"可用内存仅 {mem_available:.1f}GB，低于最低阈值 {self.child_launch_min_memory_gb:.1f}GB"
+        memory_threshold = (
+            self.child_launch_cold_start_memory_threshold
+            if cold_start
+            else self.child_launch_memory_threshold
+        )
+        min_memory_gb = (
+            self.child_launch_cold_start_min_memory_gb
+            if cold_start
+            else self.child_launch_min_memory_gb
+        )
+        if mem_percent is not None and mem_percent >= memory_threshold:
+            return f"内存使用率 {mem_percent:.1f}% 已超过暂停启动阈值 {memory_threshold:.0f}%"
+        if mem_available is not None and mem_available <= min_memory_gb:
+            return f"可用内存仅 {mem_available:.1f}GB，低于最低阈值 {min_memory_gb:.1f}GB"
 
         disk = self._disk_usage_snapshot()
         disk_percent = disk.get("percent")
@@ -2227,7 +2241,7 @@ class TaskManager:
 
         return ""
 
-    def _wait_until_safe_to_start_child(self, parent_id: str, label: str):
+    def _wait_until_safe_to_start_child(self, parent_id: str, label: str, allow_cold_start: bool = False):
         """父并行任务运行期间，系统压力过高时不再启动新子进程，等压力下降再继续。
 
         需要连续两次采样都安全才放行，避免刚启动几个进程时 CPU 还没来得及升高，
@@ -2235,7 +2249,7 @@ class TaskManager:
         """
         safe_samples = 0
         while parent_id not in self.cancel_flags:
-            reason = self._runtime_pressure_reason()
+            reason = self._runtime_pressure_reason(allow_cold_start=allow_cold_start)
             if not reason:
                 safe_samples += 1
                 if safe_samples >= 2:
@@ -2954,7 +2968,8 @@ class TaskManager:
                     if paused_by_pressure and running:
                         break
 
-                    reason = self._runtime_pressure_reason()
+                    allow_cold_start = len(running) == 0
+                    reason = self._runtime_pressure_reason(allow_cold_start=allow_cold_start)
                     if reason:
                         paused_by_pressure = True
                         now = time.time()
@@ -2968,13 +2983,21 @@ class TaskManager:
                         break
 
                     with start_gate:
-                        self._wait_until_safe_to_start_child(parent_id, str(label))
+                        self._wait_until_safe_to_start_child(
+                            parent_id,
+                            str(label),
+                            allow_cold_start=allow_cold_start,
+                        )
                         if parent_id in self.cancel_flags:
                             break
                         if self.adaptive_child_start_enabled and learned_interval is not None:
                             if not self._sleep_before_adaptive_child_launch(parent_id, str(label), learned_interval, last_child_launch_at):
                                 break
-                            self._wait_until_safe_to_start_child(parent_id, str(label))
+                            self._wait_until_safe_to_start_child(
+                                parent_id,
+                                str(label),
+                                allow_cold_start=allow_cold_start,
+                            )
                             if parent_id in self.cancel_flags:
                                 break
 
@@ -3396,7 +3419,8 @@ class TaskManager:
                     if paused_by_pressure and running:
                         break
 
-                    reason = self._runtime_pressure_reason()
+                    allow_cold_start = len(running) == 0
+                    reason = self._runtime_pressure_reason(allow_cold_start=allow_cold_start)
                     if reason:
                         paused_by_pressure = True
                         now = time.time()
@@ -3410,13 +3434,21 @@ class TaskManager:
                         break
 
                     with start_gate:
-                        self._wait_until_safe_to_start_child(parent_id, str(label))
+                        self._wait_until_safe_to_start_child(
+                            parent_id,
+                            str(label),
+                            allow_cold_start=allow_cold_start,
+                        )
                         if parent_id in self.cancel_flags:
                             break
                         if self.adaptive_child_start_enabled and learned_interval is not None:
                             if not self._sleep_before_adaptive_child_launch(parent_id, str(label), learned_interval, last_child_launch_at):
                                 break
-                            self._wait_until_safe_to_start_child(parent_id, str(label))
+                            self._wait_until_safe_to_start_child(
+                                parent_id,
+                                str(label),
+                                allow_cold_start=allow_cold_start,
+                            )
                             if parent_id in self.cancel_flags:
                                 break
 

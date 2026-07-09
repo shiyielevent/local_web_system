@@ -1551,7 +1551,13 @@ function Set-BackendRuntimeEnvironment {
         "88"
     Set-DefaultProcessEnvironment `
         "LOCAL_WEB_CHILD_START_MIN_MEMORY_GB" `
-        "3"
+        "0.8"
+    Set-DefaultProcessEnvironment `
+        "LOCAL_WEB_CHILD_COLD_START_MIN_MEMORY_GB" `
+        "0.6"
+    Set-DefaultProcessEnvironment `
+        "LOCAL_WEB_CHILD_COLD_START_MEMORY_THRESHOLD" `
+        "99.8"
     Set-DefaultProcessEnvironment `
         "LOCAL_WEB_CHILD_START_MIN_DISK_FREE_GB" `
         "10"
