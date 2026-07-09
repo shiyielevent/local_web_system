@@ -75,8 +75,6 @@ class TaskManager:
         self.child_launch_cpu_threshold = float(os.environ.get("LOCAL_WEB_CHILD_START_CPU_THRESHOLD", "99.5"))
         self.child_launch_memory_threshold = float(os.environ.get("LOCAL_WEB_CHILD_START_MEMORY_THRESHOLD", "99.5"))
         self.child_launch_min_memory_gb = float(os.environ.get("LOCAL_WEB_CHILD_START_MIN_MEMORY_GB", "0.2"))
-        self.child_launch_cold_start_memory_threshold = float(os.environ.get("LOCAL_WEB_CHILD_COLD_START_MEMORY_THRESHOLD", "99.8"))
-        self.child_launch_cold_start_min_memory_gb = float(os.environ.get("LOCAL_WEB_CHILD_COLD_START_MIN_MEMORY_GB", "0.6"))
         self.child_launch_disk_threshold = float(os.environ.get("LOCAL_WEB_CHILD_START_DISK_THRESHOLD", "99.8"))
         self.child_launch_min_disk_free_gb = float(os.environ.get("LOCAL_WEB_CHILD_START_MIN_DISK_FREE_GB", "0.2"))
         self.child_launch_wait_seconds = float(os.environ.get("LOCAL_WEB_CHILD_START_WAIT_SECONDS", "1"))
@@ -931,7 +929,7 @@ class TaskManager:
                 continue
 
             part_name = f"part_{index + 1}_{machine}"
-            part_dir = split_root / part_name
+            part_dir = (shared_root if shared_io else split_root) / part_name
             part_dir.mkdir(parents=True, exist_ok=True)
 
             # 目录名直接使用模块字段 key，便于排查。
@@ -946,15 +944,27 @@ class TaskManager:
             part_config = copy.deepcopy(config_data)
             output_mappings: List[Dict[str, Any]] = []
 
-            # 子节点运行时真实路径由 htcondor_cluster_manager.py 中的
-            # __LOCAL_WEB_JOB_DIR__ 占位符替换得到。
-            part_config[split_key] = f"__LOCAL_WEB_JOB_DIR__/{split_key}"
+            shared_input_unc = self._path_to_shared_unc(part_input_dir) if shared_io else ""
+            if shared_io and shared_input_unc:
+                # 共享目录模式：配置文件直接写 UNC 路径，子节点通过网络共享读取父节点目录。
+                # 因为不再使用 __LOCAL_WEB_JOB_DIR__，htcondor_cluster_manager.py 不会传输 input/output 大目录。
+                part_config[split_key] = shared_input_unc
+            else:
+                # 文件传输模式：子节点运行时真实路径由 htcondor_cluster_manager.py 中的
+                # __LOCAL_WEB_JOB_DIR__ 占位符替换得到。
+                part_config[split_key] = f"__LOCAL_WEB_JOB_DIR__/{split_key}"
 
             for out_def in output_defs:
                 out_key = str(out_def.get("key") or "").strip()
                 if not out_key or out_key not in part_config:
                     continue
                 original_out_path = str(config_data.get(out_key) or '').strip()
+                if shared_io and shared_input_unc and original_out_path:
+                    _, out_unc = self._make_shared_part_output_path(original_out_path, part_name)
+                    if out_unc:
+                        part_config[out_key] = out_unc
+                        continue
+
                 out_dir = part_dir / out_key
                 out_dir.mkdir(parents=True, exist_ok=True)
                 part_config[out_key] = f"__LOCAL_WEB_JOB_DIR__/{out_key}"
@@ -975,6 +985,12 @@ class TaskManager:
                 aux_source = Path(str(config_data.get(aux_key) or ""))
                 if not aux_source.is_dir():
                     continue
+                if shared_io and shared_input_unc:
+                    aux_unc = self._path_to_shared_unc(aux_source)
+                    if aux_unc:
+                        part_config[aux_key] = aux_unc
+                        continue
+
                 aux_dir = part_dir / aux_key
                 aux_dir.mkdir(parents=True, exist_ok=True)
                 aux_patterns = self._module_file_patterns(module_item, aux_def)
@@ -986,7 +1002,8 @@ class TaskManager:
                     aux_files = [p for p in sorted(aux_source.iterdir()) if p.is_file()]
                 for source in aux_files:
                     self._link_or_copy_file(source, aux_dir / source.name)
-                part_config[aux_key] = f"__LOCAL_WEB_JOB_DIR__/{aux_key}"
+                aux_unc = self._path_to_shared_unc(aux_dir) if shared_io and shared_input_unc else ""
+                part_config[aux_key] = aux_unc or f"__LOCAL_WEB_JOB_DIR__/{aux_key}"
 
             # 每个子任务只处理一部分文件，内部并行数按节点数拆开。
             # 这样可以避免两台机器同时各开很多进程，把电脑拖死。
@@ -1024,9 +1041,11 @@ class TaskManager:
                         "part_count": len(chunks[index]),
                         "file_patterns": self._module_file_patterns(module_item, split_input),
                         "output_mappings": output_mappings,
+                        "shared_io": bool(shared_io and shared_input_unc),
+                        "shared_input_dir_unc": shared_input_unc,
                         "link_modes": sorted(set(used_modes)),
                     },
-                    "cleanup_root": str(split_root),
+                    "cleanup_root": str(shared_root if shared_io else split_root),
                 }
             })
 
@@ -1203,8 +1222,15 @@ class TaskManager:
                 part_dir.mkdir(parents=True, exist_ok=True)
 
                 part_config = copy.deepcopy(config_data)
-                self._set_by_path(part_config, list_path, chunks[index])
-                self._rewrite_output_paths_for_part(part_config, part_name)
+                shared_io = self._htcondor_shared_io_enabled()
+                chunk_values = chunks[index]
+                if shared_io:
+                    chunk_values = self._map_path_like_values_to_shared_unc(chunk_values)
+                self._set_by_path(part_config, list_path, chunk_values)
+                if shared_io:
+                    self._rewrite_output_paths_for_part_shared(part_config, part_name)
+                else:
+                    self._rewrite_output_paths_for_part(part_config, part_name)
 
                 part_config_path = part_dir / "config.json"
                 part_config_path.write_text(
@@ -1227,6 +1253,7 @@ class TaskManager:
                             "node_weight": self._htcondor_machine_weights(machines).get(machine, 1),
                             "part_config": str(part_config_path),
                             "part_count": len(chunks[index]),
+                            "shared_io": bool(self._htcondor_shared_io_enabled()),
                         },
                     }
                 })
@@ -1255,7 +1282,8 @@ class TaskManager:
                 if not chunks[index]:
                     continue
                 part_name = f"part_{index + 1}_{machine}"
-                part_dir = split_root / part_name
+                shared_io = self._htcondor_shared_io_enabled()
+                part_dir = (self._shared_task_root(parent_id) if shared_io else split_root) / part_name
                 part_input_dir = part_dir / "input"
                 part_input_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1266,8 +1294,12 @@ class TaskManager:
                 link_modes.extend(used_modes)
 
                 part_config = copy.deepcopy(config_data)
-                self._set_by_path(part_config, dir_path, str(part_input_dir))
-                self._rewrite_output_paths_for_part(part_config, part_name)
+                shared_input_unc = self._path_to_shared_unc(part_input_dir) if shared_io else ""
+                self._set_by_path(part_config, dir_path, shared_input_unc or str(part_input_dir))
+                if shared_io and shared_input_unc:
+                    self._rewrite_output_paths_for_part_shared(part_config, part_name)
+                else:
+                    self._rewrite_output_paths_for_part(part_config, part_name)
 
                 part_config_path = part_dir / "config.json"
                 part_config_path.write_text(
@@ -1291,9 +1323,11 @@ class TaskManager:
                             "part_config": str(part_config_path),
                             "part_input_dir": str(part_input_dir),
                             "part_count": len(chunks[index]),
+                            "shared_io": bool(shared_io and shared_input_unc),
+                            "shared_input_dir_unc": shared_input_unc,
                             "link_modes": sorted(set(used_modes)),
                         },
-                        "cleanup_root": str(split_root),
+                        "cleanup_root": str(self._shared_task_root(parent_id) if shared_io else split_root),
                         "link_modes": sorted(set(link_modes)),
                     }
                 })
@@ -1496,7 +1530,20 @@ class TaskManager:
         else:
             self.append_log(parent_id, "[HTCONDOR] 未启用远程 EXE 线程限制，优先保证节点计算性能。")
         self.append_log(parent_id, "[HTCONDOR] 系统会为每个子任务写入 target_machine，尽量让不同节点同时运行。")
-        self.append_log(parent_id, "[HTCONDOR] 系统会为拆分任务传输子任务 config.json 和对应输入子目录；输出目录按子任务隔离。")
+        shared_count = 0
+        for entry in entries:
+            spec = entry.get("spec") if isinstance(entry, dict) else {}
+            inputs = spec.get("inputs") if isinstance(spec.get("inputs"), dict) else {}
+            if inputs.get("shared_io"):
+                shared_count += 1
+        if shared_count:
+            cfg = self._htcondor_shared_io_config()
+            self.append_log(
+                parent_id,
+                f"[HTCONDOR] 共享目录模式已启用：子节点通过 {cfg.get('unc_root')} 直接读取输入并写回输出；HTCondor 只传输 cmd/config/result 小文件。"
+            )
+        else:
+            self.append_log(parent_id, "[HTCONDOR] 文件传输模式：系统会为拆分任务传输子任务 config.json 和对应输入子目录；输出目录按子任务隔离。")
 
         done_count = 0
         failures = 0
@@ -1644,13 +1691,21 @@ class TaskManager:
                             result = future.result()
                             status = self._apply_htcondor_result(child_id, result)
                             if status == "success":
-                                self._collect_htcondor_transferred_outputs(
-                                    parent_id=parent_id,
-                                    child_id=child_id,
-                                    spec=meta.get("spec") or {},
-                                    result=result,
-                                    label=label,
-                                )
+                                spec_for_collect = meta.get("spec") or {}
+                                inputs_for_collect = spec_for_collect.get("inputs") if isinstance(spec_for_collect.get("inputs"), dict) else {}
+                                if inputs_for_collect.get("shared_io"):
+                                    self.append_log(
+                                        parent_id,
+                                        f"[HTCONDOR] {label} 使用共享目录模式，输出已直接写入父节点共享目录，跳过 HTCondor 输出回收。"
+                                    )
+                                else:
+                                    self._collect_htcondor_transferred_outputs(
+                                        parent_id=parent_id,
+                                        child_id=child_id,
+                                        spec=spec_for_collect,
+                                        result=result,
+                                        label=label,
+                                    )
 
                             # 输出已经回收到用户目录后，立即删除 job_dir 里的 file/cm_files/outpath 等大副本。
                             # 即使子任务失败，也只保留日志文件，避免失败任务长期占用大量磁盘。
@@ -2194,7 +2249,7 @@ class TaskManager:
             except Exception:
                 return {"percent": None, "free_gb": None}
 
-    def _runtime_pressure_reason(self, allow_cold_start: bool = False) -> str:
+    def _runtime_pressure_reason(self) -> str:
         """返回是否应该暂停启动新的子进程。
 
         轻量化策略：
@@ -2206,8 +2261,6 @@ class TaskManager:
         if active_processes >= self.max_process_slots:
             return f"平台已启动 {active_processes}/{self.max_process_slots} 个模块进程，等待已有进程完成"
 
-        cold_start = bool(allow_cold_start and active_processes == 0)
-
         if not self.adaptive_child_start_enabled:
             cpu = self._system_cpu_percent()
             if cpu is not None and cpu >= self.child_launch_cpu_threshold:
@@ -2216,20 +2269,10 @@ class TaskManager:
         mem = self._virtual_memory_snapshot()
         mem_percent = mem.get("percent")
         mem_available = mem.get("available_gb")
-        memory_threshold = (
-            self.child_launch_cold_start_memory_threshold
-            if cold_start
-            else self.child_launch_memory_threshold
-        )
-        min_memory_gb = (
-            self.child_launch_cold_start_min_memory_gb
-            if cold_start
-            else self.child_launch_min_memory_gb
-        )
-        if mem_percent is not None and mem_percent >= memory_threshold:
-            return f"内存使用率 {mem_percent:.1f}% 已超过暂停启动阈值 {memory_threshold:.0f}%"
-        if mem_available is not None and mem_available <= min_memory_gb:
-            return f"可用内存仅 {mem_available:.1f}GB，低于最低阈值 {min_memory_gb:.1f}GB"
+        if mem_percent is not None and mem_percent >= self.child_launch_memory_threshold:
+            return f"内存使用率 {mem_percent:.1f}% 已超过暂停启动阈值 {self.child_launch_memory_threshold:.0f}%"
+        if mem_available is not None and mem_available <= self.child_launch_min_memory_gb:
+            return f"可用内存仅 {mem_available:.1f}GB，低于最低阈值 {self.child_launch_min_memory_gb:.1f}GB"
 
         disk = self._disk_usage_snapshot()
         disk_percent = disk.get("percent")
@@ -2241,7 +2284,7 @@ class TaskManager:
 
         return ""
 
-    def _wait_until_safe_to_start_child(self, parent_id: str, label: str, allow_cold_start: bool = False):
+    def _wait_until_safe_to_start_child(self, parent_id: str, label: str):
         """父并行任务运行期间，系统压力过高时不再启动新子进程，等压力下降再继续。
 
         需要连续两次采样都安全才放行，避免刚启动几个进程时 CPU 还没来得及升高，
@@ -2249,7 +2292,7 @@ class TaskManager:
         """
         safe_samples = 0
         while parent_id not in self.cancel_flags:
-            reason = self._runtime_pressure_reason(allow_cold_start=allow_cold_start)
+            reason = self._runtime_pressure_reason()
             if not reason:
                 safe_samples += 1
                 if safe_samples >= 2:
@@ -2968,8 +3011,7 @@ class TaskManager:
                     if paused_by_pressure and running:
                         break
 
-                    allow_cold_start = len(running) == 0
-                    reason = self._runtime_pressure_reason(allow_cold_start=allow_cold_start)
+                    reason = self._runtime_pressure_reason()
                     if reason:
                         paused_by_pressure = True
                         now = time.time()
@@ -2983,21 +3025,13 @@ class TaskManager:
                         break
 
                     with start_gate:
-                        self._wait_until_safe_to_start_child(
-                            parent_id,
-                            str(label),
-                            allow_cold_start=allow_cold_start,
-                        )
+                        self._wait_until_safe_to_start_child(parent_id, str(label))
                         if parent_id in self.cancel_flags:
                             break
                         if self.adaptive_child_start_enabled and learned_interval is not None:
                             if not self._sleep_before_adaptive_child_launch(parent_id, str(label), learned_interval, last_child_launch_at):
                                 break
-                            self._wait_until_safe_to_start_child(
-                                parent_id,
-                                str(label),
-                                allow_cold_start=allow_cold_start,
-                            )
+                            self._wait_until_safe_to_start_child(parent_id, str(label))
                             if parent_id in self.cancel_flags:
                                 break
 
@@ -3419,8 +3453,7 @@ class TaskManager:
                     if paused_by_pressure and running:
                         break
 
-                    allow_cold_start = len(running) == 0
-                    reason = self._runtime_pressure_reason(allow_cold_start=allow_cold_start)
+                    reason = self._runtime_pressure_reason()
                     if reason:
                         paused_by_pressure = True
                         now = time.time()
@@ -3434,21 +3467,13 @@ class TaskManager:
                         break
 
                     with start_gate:
-                        self._wait_until_safe_to_start_child(
-                            parent_id,
-                            str(label),
-                            allow_cold_start=allow_cold_start,
-                        )
+                        self._wait_until_safe_to_start_child(parent_id, str(label))
                         if parent_id in self.cancel_flags:
                             break
                         if self.adaptive_child_start_enabled and learned_interval is not None:
                             if not self._sleep_before_adaptive_child_launch(parent_id, str(label), learned_interval, last_child_launch_at):
                                 break
-                            self._wait_until_safe_to_start_child(
-                                parent_id,
-                                str(label),
-                                allow_cold_start=allow_cold_start,
-                            )
+                            self._wait_until_safe_to_start_child(parent_id, str(label))
                             if parent_id in self.cancel_flags:
                                 break
 
