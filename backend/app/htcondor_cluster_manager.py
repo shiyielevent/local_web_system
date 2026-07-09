@@ -123,28 +123,108 @@ class HTCondorClusterManager:
     # =========================
     # HTCondor 共享目录模式配置
     # =========================
-    def shared_io_config(self) -> Dict[str, Any]:
-        """读取共享目录模式配置。
 
-        共享目录模式的目标：
-        - 大型输入文件不再通过 HTCondor 传输到执行节点；
-        - 子节点直接通过 UNC 路径读取父节点共享目录；
-        - 输出也直接写入父节点共享目录；
-        - HTCondor 只传输 run_job.cmd、localweb_config.json、result.txt 等小文件。
-        """
+    def _normalize_shared_io_items(self) -> List[Dict[str, Any]]:
+        """把历史单共享配置和新版多共享配置统一为 shares 列表。"""
         raw = self.state.get("shared_io_config") or {}
         if not isinstance(raw, dict):
             raw = {}
+        items: List[Dict[str, Any]] = []
+
+        def add_item(item: Dict[str, Any]):
+            if not isinstance(item, dict):
+                return
+            local_root = str(item.get("local_root") or "").strip()
+            unc_root = str(item.get("unc_root") or "").strip()
+            share_name = str(item.get("share_name") or "").strip()
+            if not share_name:
+                share_name = (unc_root.rstrip("\\/").split("\\")[-1] if unc_root else "LocalWebData") or "LocalWebData"
+            enabled = bool(item.get("enabled", True)) and bool(unc_root or local_root)
+            clean = {
+                "enabled": enabled,
+                "local_root": local_root,
+                "unc_root": unc_root,
+                "share_name": share_name,
+                "role": str(item.get("role") or raw.get("role") or "").strip(),
+                "parent_ip": str(item.get("parent_ip") or raw.get("parent_ip") or "").strip(),
+                "connect_ok": bool(item.get("connect_ok", raw.get("connect_ok", enabled))),
+                "connect_message": str(item.get("connect_message") or raw.get("connect_message") or "").strip(),
+                "updated_at": str(item.get("updated_at") or raw.get("updated_at") or "").strip(),
+            }
+            key = (clean["unc_root"] or clean["local_root"] or clean["share_name"]).lower()
+            if not key:
+                return
+            for idx, old in enumerate(items):
+                old_key = str(old.get("unc_root") or old.get("local_root") or old.get("share_name") or "").lower()
+                if old_key == key:
+                    items[idx] = {**old, **clean}
+                    return
+            items.append(clean)
+
+        raw_shares = raw.get("shares")
+        if isinstance(raw_shares, list):
+            for item in raw_shares:
+                add_item(item)
+        if raw.get("unc_root") or raw.get("local_root"):
+            add_item(raw)
+        return items
+
+    def _primary_shared_io_item(self, items: List[Dict[str, Any]] | None = None) -> Dict[str, Any]:
+        items = items if items is not None else self._normalize_shared_io_items()
+        if not items:
+            return {}
+        raw = self.state.get("shared_io_config") or {}
+        primary_unc = str(raw.get("primary_unc_root") or raw.get("unc_root") or "").strip().lower()
+        if primary_unc:
+            for item in items:
+                if str(item.get("unc_root") or "").strip().lower() == primary_unc:
+                    return item
+        return next((x for x in items if x.get("enabled")), items[0])
+
+    def _save_shared_io_items(self, items: List[Dict[str, Any]], primary_unc_root: str = ""):
+        primary_unc_root = str(primary_unc_root or "").strip()
+        primary = None
+        if primary_unc_root:
+            for item in items:
+                if str(item.get("unc_root") or "").strip().lower() == primary_unc_root.lower():
+                    primary = item
+                    break
+        if primary is None and items:
+            primary = next((x for x in items if x.get("enabled")), items[0])
+        primary = primary or {}
+        self.state["shared_io_config"] = {
+            "enabled": any(bool(x.get("enabled")) for x in items),
+            "local_root": str(primary.get("local_root") or ""),
+            "unc_root": str(primary.get("unc_root") or ""),
+            "share_name": str(primary.get("share_name") or "LocalWebData"),
+            "role": str(primary.get("role") or ""),
+            "parent_ip": str(primary.get("parent_ip") or ""),
+            "connect_ok": bool(primary.get("connect_ok")),
+            "connect_message": str(primary.get("connect_message") or ""),
+            "primary_unc_root": str(primary.get("unc_root") or primary_unc_root or ""),
+            "shares": items,
+            "updated_at": now_iso(),
+        }
+        self._save_state()
+
+    def shared_io_config(self) -> Dict[str, Any]:
+        """读取共享目录模式配置。新版支持多个共享目录，并兼容旧版单共享字段。"""
+        items = self._normalize_shared_io_items()
+        primary = self._primary_shared_io_item(items)
+        enabled = any(bool(item.get("enabled")) for item in items)
         return {
-            "enabled": bool(raw.get("enabled")),
-            "local_root": str(raw.get("local_root") or "").strip(),
-            "unc_root": str(raw.get("unc_root") or "").strip(),
-            "share_name": str(raw.get("share_name") or "LocalWebData").strip() or "LocalWebData",
-            "role": str(raw.get("role") or "").strip(),
-            "parent_ip": str(raw.get("parent_ip") or "").strip(),
-            "connect_ok": bool(raw.get("connect_ok")),
-            "connect_message": str(raw.get("connect_message") or "").strip(),
-            "updated_at": str(raw.get("updated_at") or ""),
+            "enabled": bool(enabled),
+            "local_root": str(primary.get("local_root") or "").strip(),
+            "unc_root": str(primary.get("unc_root") or "").strip(),
+            "share_name": str(primary.get("share_name") or "LocalWebData").strip() or "LocalWebData",
+            "role": str(primary.get("role") or "").strip(),
+            "parent_ip": str(primary.get("parent_ip") or "").strip(),
+            "connect_ok": bool(primary.get("connect_ok")),
+            "connect_message": str(primary.get("connect_message") or "").strip(),
+            "shares": items,
+            "share_count": len(items),
+            "primary_unc_root": str(primary.get("unc_root") or "").strip(),
+            "updated_at": str((self.state.get("shared_io_config") or {}).get("updated_at") or ""),
         }
 
     def set_shared_io_config(
@@ -154,34 +234,63 @@ class HTCondorClusterManager:
         unc_root: str = "",
         share_name: str = "LocalWebData",
     ) -> Dict[str, Any]:
+        """保存共享目录配置。启用时采用追加/更新方式，允许多个共享目录同时存在。"""
         local_root = str(local_root or "").strip()
         unc_root = str(unc_root or "").strip()
         share_name = str(share_name or "LocalWebData").strip() or "LocalWebData"
 
-        if enabled:
-            if not local_root:
-                raise HTCondorClusterError("启用共享目录模式时必须填写父节点本地目录，例如 D:/H8/data。")
-            if not unc_root:
-                host = socket.gethostname()
-                unc_root = f"\\\\{host}\\{share_name}"
+        if not enabled:
+            items = self._normalize_shared_io_items()
+            for item in items:
+                item["enabled"] = False
+                item["connect_ok"] = False
+            self._save_shared_io_items(items)
+            data = self.shared_io_config()
+            data["message"] = "共享目录模式已关闭"
+            return data
 
-        self.state["shared_io_config"] = {
-            "enabled": bool(enabled),
+        if not local_root:
+            raise HTCondorClusterError("启用共享目录模式时必须填写父节点本地目录，例如 D:/H8/data。")
+        if not unc_root:
+            host = socket.gethostname()
+            unc_root = f"\\\\{host}\\{share_name}"
+
+        items = self._normalize_shared_io_items()
+        new_item = {
+            "enabled": True,
             "local_root": local_root,
             "unc_root": unc_root,
             "share_name": share_name,
+            "role": str((self.state.get("shared_io_config") or {}).get("role") or "parent"),
+            "parent_ip": str((self.state.get("shared_io_config") or {}).get("parent_ip") or ""),
+            "connect_ok": True,
+            "connect_message": "共享目录已添加",
             "updated_at": now_iso(),
         }
-        self._save_state()
+        key = (unc_root or local_root or share_name).lower()
+        replaced = False
+        for idx, item in enumerate(items):
+            old_key = str(item.get("unc_root") or item.get("local_root") or item.get("share_name") or "").lower()
+            if old_key == key or str(item.get("share_name") or "").lower() == share_name.lower():
+                items[idx] = {**item, **new_item}
+                replaced = True
+                break
+        if not replaced:
+            items.append(new_item)
+        self._save_shared_io_items(items, primary_unc_root=unc_root)
         data = self.shared_io_config()
-        data["message"] = "共享目录模式已启用" if enabled else "共享目录模式已关闭"
+        data["message"] = "共享目录已添加"
         return data
 
     def prepare_local_share(self, local_root: str, share_name: str = "LocalWebData", unc_host: str = "") -> Dict[str, Any]:
         """在父节点本机创建 Windows 共享目录。
 
-        需要管理员权限。这里尽量自动完成：创建目录、设置 NTFS 权限、创建 net share。
-        子节点必须能访问返回的 UNC 路径，后续任务才可以启用共享目录模式。
+        这一版改为：普通后端进程不直接执行 icacls/net share，而是生成一个
+        PowerShell 管理员脚本，并通过 UAC 只请求一次管理员权限完成：
+        1. 创建本地目录；
+        2. 设置 NTFS 权限；
+        3. 创建/重建 Windows 共享；
+        4. 写回 shared_io_config。
         """
         if os.name != "nt":
             raise HTCondorClusterError("共享目录自动配置当前只支持 Windows。")
@@ -191,46 +300,193 @@ class HTCondorClusterManager:
         if not local_root:
             raise HTCondorClusterError("本地共享目录不能为空，例如 D:/H8/data。")
 
+        # 共享名不能包含反斜杠、斜杠、冒号等特殊字符，避免 net share 直接打印帮助信息。
+        safe_share_name = re.sub(r"[^0-9A-Za-z_.\-]+", "_", share_name).strip("._-")
+        if not safe_share_name:
+            safe_share_name = "LocalWebData"
+        share_name = safe_share_name
+
+        host = str(unc_host or self.state.get("bind_ip") or "").strip()
+        if not host:
+            local_ips = self._local_ipv4_list()
+            host = next((ip for ip in local_ips if ip.startswith("192.168.")), "") or (local_ips[0] if local_ips else socket.gethostname())
+        unc_root = f"\\\\{host}\\{share_name}"
+
         root = Path(local_root)
-        root.mkdir(parents=True, exist_ok=True)
+        # 共享目录只应该指向数据目录，不能直接共享系统项目目录。
+        # 用户误选 D:/local_web_module_system 时，icacls 递归扫描 node_modules/runtime 等目录会非常慢，
+        # 管理员 PowerShell 窗口看起来会一直空白卡住；同时也不安全。
+        try:
+            resolved_root = root.resolve()
+            resolved_project = self.project_root.resolve()
+            resolved_base = self.base_dir.resolve()
+            if resolved_root in {resolved_project, resolved_base}:
+                raise HTCondorClusterError(
+                    "共享目录不能选择系统项目目录。请改成数据目录，例如 D:/H8/data。"
+                )
+        except HTCondorClusterError:
+            raise
+        except Exception:
+            pass
 
-        commands: List[Dict[str, Any]] = []
+        result_path = self.runtime_dir / "cluster_admin" / "prepare_share_result.json"
+        share_user = str(os.environ.get("LOCAL_WEB_HTCONDOR_SHARE_USER", "")).strip()
 
-        # 给常见执行账号和局域网测试账号足够的读写权限。
-        # 注意：共享权限和 NTFS 权限是两套权限，都要放行。
-        grant_targets = ["Users", "Everyone"]
-        computer_name = os.environ.get("COMPUTERNAME", "").strip()
-        if computer_name:
-            grant_targets.append(f"{computer_name}\\LocalWebCondor")
-        share_user = os.environ.get("LOCAL_WEB_HTCONDOR_SHARE_USER", "").strip()
-        if share_user and share_user not in grant_targets:
-            grant_targets.append(share_user)
+        script_text = f"""
+$ErrorActionPreference = 'Stop'
+$resultPath = {self._ps_quote(str(result_path))}
+$localRoot = {self._ps_quote(str(root))}
+$shareName = {self._ps_quote(share_name)}
+$uncRoot = {self._ps_quote(unc_root)}
+$shareUser = {self._ps_quote(share_user)}
+$commands = New-Object System.Collections.ArrayList
 
-        for target in grant_targets:
-            result = self._run(["icacls.exe", str(root), "/grant", f"{target}:(OI)(CI)M", "/T", "/C"], timeout=60)
-            commands.append({"command": f"icacls {root} /grant {target}", **result})
+function Add-CommandResult([string]$command, [bool]$ok, [string]$stdout, [string]$stderr, [int]$returncode) {{
+    [void]$commands.Add([ordered]@{{
+        command = $command
+        ok = $ok
+        stdout = $stdout
+        stderr = $stderr
+        returncode = $returncode
+    }})
+}}
 
-        # net share 已存在时会失败，这里先删除再创建，避免旧路径残留。
-        delete_result = self._run(["net.exe", "share", share_name, "/delete", "/y"], timeout=30)
-        commands.append({"command": f"net share {share_name} /delete", **delete_result})
+function Run-External([string]$file, [string[]]$argsList, [bool]$ignoreFail = $false) {{
+    $cmdText = $file + ' ' + ($argsList -join ' ')
+    try {{
+        $output = & $file @argsList 2>&1
+        $code = if ($null -eq $LASTEXITCODE) {{ 0 }} else {{ [int]$LASTEXITCODE }}
+        $text = (($output | Out-String).Trim())
+        $ok = ($code -eq 0)
+        Add-CommandResult $cmdText $ok $text '' $code
+        if ((-not $ok) -and (-not $ignoreFail)) {{
+            throw ($cmdText + ' failed: ' + $text)
+        }}
+        return @{{ ok = $ok; stdout = $text; returncode = $code }}
+    }} catch {{
+        $msg = $_.Exception.Message
+        Add-CommandResult $cmdText $false '' $msg -1
+        if (-not $ignoreFail) {{ throw }}
+        return @{{ ok = $false; stderr = $msg; returncode = -1 }}
+    }}
+}}
 
-        create_result = self._run(["net.exe", "share", f"{share_name}={str(root)}", "/GRANT:Everyone,FULL"], timeout=60)
-        commands.append({"command": f"net share {share_name}={root}", **create_result})
-        if not create_result.get("ok"):
+function Resolve-AccountName([string]$sidText, [string]$fallback) {{
+    try {{
+        $sid = New-Object System.Security.Principal.SecurityIdentifier($sidText)
+        return $sid.Translate([System.Security.Principal.NTAccount]).Value
+    }} catch {{
+        return $fallback
+    }}
+}}
+
+try {{
+    New-Item -ItemType Directory -Force -Path $localRoot | Out-Null
+    Add-CommandResult ('New-Item -ItemType Directory -Force -Path ' + $localRoot) $true 'ok' '' 0
+
+    # NTFS 权限优先用 SID，避免中文 Windows 上 Everyone/Users 名称本地化导致失败。
+    Run-External 'icacls.exe' @($localRoot, '/grant', '*S-1-1-0:(OI)(CI)M', '/C') $true | Out-Null
+    Run-External 'icacls.exe' @($localRoot, '/grant', '*S-1-5-32-545:(OI)(CI)M', '/C') $true | Out-Null
+
+    $computerName = $env:COMPUTERNAME
+    if ($computerName) {{
+        Run-External 'icacls.exe' @($localRoot, '/grant', ($computerName + '\\LocalWebCondor:(OI)(CI)M'), '/C') $true | Out-Null
+    }}
+    if ($shareUser) {{
+        Run-External 'icacls.exe' @($localRoot, '/grant', ($shareUser + ':(OI)(CI)M'), '/C') $true | Out-Null
+    }}
+
+    # 已有同名共享时先删除。失败通常表示不存在，可以忽略。
+    Run-External 'net.exe' @('share', $shareName, '/delete', '/y') $true | Out-Null
+
+    $everyoneName = Resolve-AccountName 'S-1-1-0' 'Everyone'
+    $usersName = Resolve-AccountName 'S-1-5-32-545' 'Users'
+    $created = $false
+
+    # 优先用 net share。这里使用本机本地化后的 Everyone/Users 名称，避免语法帮助页问题。
+    $r1 = Run-External 'net.exe' @('share', ($shareName + '=' + $localRoot), ('/GRANT:' + $everyoneName + ',FULL')) $true
+    if ($r1.ok) {{ $created = $true }}
+
+    if (-not $created) {{
+        $r2 = Run-External 'net.exe' @('share', ($shareName + '=' + $localRoot), ('/GRANT:' + $usersName + ',FULL')) $true
+        if ($r2.ok) {{ $created = $true }}
+    }}
+
+    # net share 在部分中文系统/账号名场景可能只打印帮助；失败时改用 PowerShell SMB cmdlet。
+    if (-not $created) {{
+        try {{
+            if (Get-Command New-SmbShare -ErrorAction SilentlyContinue) {{
+                $old = Get-SmbShare -Name $shareName -ErrorAction SilentlyContinue
+                if ($null -ne $old) {{ Remove-SmbShare -Name $shareName -Force -ErrorAction SilentlyContinue }}
+                New-SmbShare -Name $shareName -Path $localRoot -FullAccess $everyoneName -CachingMode None -ErrorAction Stop | Out-Null
+                Add-CommandResult ('New-SmbShare -Name ' + $shareName + ' -Path ' + $localRoot) $true 'ok' '' 0
+                $created = $true
+            }}
+        }} catch {{
+            Add-CommandResult ('New-SmbShare -Name ' + $shareName + ' -Path ' + $localRoot) $false '' $_.Exception.Message -1
+        }}
+    }}
+
+    # 最后兜底创建共享；如果共享创建成功但权限较保守，NTFS 权限仍然保证读写基础。
+    if (-not $created) {{
+        $r3 = Run-External 'net.exe' @('share', ($shareName + '=' + $localRoot)) $true
+        if ($r3.ok) {{ $created = $true }}
+    }}
+
+    if (-not $created) {{
+        throw 'Windows 共享目录创建失败：net share 和 New-SmbShare 均未成功。请检查是否同意了 UAC 管理员授权，以及共享名/路径是否合法。'
+    }}
+
+    # 尽量开启文件和打印机共享防火墙规则；不同系统语言下 group 名可能不同，失败不影响主流程。
+    Run-External 'netsh.exe' @('advfirewall', 'firewall', 'set', 'rule', 'group=File and Printer Sharing', 'new', 'enable=Yes') $true | Out-Null
+
+    $verify = Run-External 'net.exe' @('share', $shareName) $true
+    if (-not $verify.ok) {{ throw '共享创建后校验失败：net share ' + $shareName }}
+
+    $result = [ordered]@{{
+        success = $true
+        ok = $true
+        message = '管理员授权完成，Windows 共享目录已创建。'
+        local_root = $localRoot
+        share_name = $shareName
+        unc_root = $uncRoot
+        commands = $commands
+    }}
+}} catch {{
+    $result = [ordered]@{{
+        success = $false
+        ok = $false
+        message = $_.Exception.Message
+        local_root = $localRoot
+        share_name = $shareName
+        unc_root = $uncRoot
+        commands = $commands
+    }}
+}}
+
+$result | ConvertTo-Json -Depth 8 | Set-Content -Path $resultPath -Encoding UTF8
+"""
+
+        admin_result = self._run_elevated_ps("prepare_share", script_text, timeout=240)
+        commands = admin_result.get("commands") if isinstance(admin_result.get("commands"), list) else []
+        if not bool(admin_result.get("success") or admin_result.get("ok")):
+            detail = admin_result.get("message") or admin_result.get("launcher_stderr") or admin_result.get("launcher_stdout") or "未知错误"
             raise HTCondorClusterError(
-                "创建 Windows 共享目录失败。请确认系统以管理员权限启动。"
-                f"输出：{create_result.get('stdout') or create_result.get('stderr') or create_result.get('error')}"
+                "创建 Windows 共享目录失败。系统已经尝试弹出一次管理员权限窗口；"
+                "如果没有看到 UAC，请确认浏览器后方是否有授权窗口。"
+                f"输出：{detail}"
             )
 
-        # 父节点创建共享目录时，优先使用前端传入的绑定 IP 生成 UNC。
-        # 这样子节点加入集群时可以直接访问 \\父节点IP\共享名，避免局域网内主机名解析失败。
-        host = str(unc_host or self.state.get("bind_ip") or socket.gethostname()).strip()
-        unc_root = f"\\\\{host}\\{share_name}"
-        config = self.set_shared_io_config(True, local_root=str(root), unc_root=unc_root, share_name=share_name)
-        self.state["shared_io_config"]["role"] = "parent"
-        self.state["shared_io_config"]["connect_ok"] = True
-        self.state["shared_io_config"]["connect_message"] = "父节点共享目录已创建"
-        self._save_state()
+        unc_root = str(admin_result.get("unc_root") or unc_root).strip()
+        self.set_shared_io_config(True, local_root=str(root), unc_root=unc_root, share_name=share_name)
+        items = self._normalize_shared_io_items()
+        for item in items:
+            if str(item.get("unc_root") or "").strip().lower() == unc_root.lower():
+                item["role"] = "parent"
+                item["connect_ok"] = True
+                item["connect_message"] = "父节点共享目录已创建，已通过一次 UAC 管理员授权完成。"
+                item["updated_at"] = now_iso()
+        self._save_shared_io_items(items, primary_unc_root=unc_root)
         config = self.shared_io_config()
         config["commands"] = commands
         config["message"] = f"已创建共享目录：{unc_root} -> {root}"
@@ -291,7 +547,8 @@ class HTCondorClusterManager:
             ok = False
             message = f"子节点自动连接共享目录失败：{type(exc).__name__}: {exc}"
 
-        self.state["shared_io_config"] = {
+        items = self._normalize_shared_io_items()
+        new_item = {
             "enabled": bool(ok),
             "local_root": "",
             "unc_root": unc_root,
@@ -302,7 +559,16 @@ class HTCondorClusterManager:
             "connect_message": message,
             "updated_at": now_iso(),
         }
-        self._save_state()
+        key = unc_root.lower()
+        replaced = False
+        for idx, item in enumerate(items):
+            if str(item.get("unc_root") or "").strip().lower() == key:
+                items[idx] = {**item, **new_item}
+                replaced = True
+                break
+        if not replaced:
+            items.append(new_item)
+        self._save_shared_io_items(items, primary_unc_root=unc_root)
         return {
             "ok": bool(ok),
             "enabled": bool(ok),
@@ -696,7 +962,7 @@ class HTCondorClusterManager:
         launcher_text = f"""
 $ErrorActionPreference = 'Stop'
 $target = {self._ps_quote(str(script_path))}
-Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',$target) -Verb RunAs -Wait
+Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-NonInteractive','-File',$target) -Verb RunAs -WindowStyle Minimized -Wait
 """
         launcher_path.write_text(launcher_text, encoding="utf-8-sig")
 

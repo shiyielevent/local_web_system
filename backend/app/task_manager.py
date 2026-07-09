@@ -124,24 +124,46 @@ class TaskManager:
     # HTCondor 共享目录模式
     # =========================
     def _htcondor_shared_io_config(self) -> Dict[str, Any]:
-        """读取共享目录模式配置。优先读 HTCondorClusterManager.state，兼容环境变量。"""
+        """读取共享目录模式配置。支持新版多共享目录，兼容旧版单共享字段。"""
         manager = self.htcondor_manager
         state = getattr(manager, "state", {}) if manager is not None else {}
         cfg = (state or {}).get("shared_io_config") or {}
         if not isinstance(cfg, dict):
             cfg = {}
-
         env_enabled = str(os.environ.get("LOCAL_WEB_HTCONDOR_SHARED_IO", "")).strip().lower()
-        enabled = bool(cfg.get("enabled")) or env_enabled in {"1", "true", "yes", "on"}
-        local_root = str(cfg.get("local_root") or os.environ.get("LOCAL_WEB_HTCONDOR_SHARE_LOCAL_ROOT", "")).strip()
-        unc_root = str(cfg.get("unc_root") or os.environ.get("LOCAL_WEB_HTCONDOR_SHARE_UNC_ROOT", "")).strip()
-        share_name = str(cfg.get("share_name") or os.environ.get("LOCAL_WEB_HTCONDOR_SHARE_NAME", "LocalWebData")).strip() or "LocalWebData"
-        return {
-            "enabled": bool(enabled and local_root and unc_root),
-            "local_root": local_root,
-            "unc_root": unc_root,
-            "share_name": share_name,
-        }
+        enabled_by_env = env_enabled in {"1", "true", "yes", "on"}
+        shares: List[Dict[str, Any]] = []
+
+        def add_share(item: Dict[str, Any]):
+            if not isinstance(item, dict):
+                return
+            local_root = str(item.get("local_root") or "").strip()
+            unc_root = str(item.get("unc_root") or "").strip()
+            share_name = str(item.get("share_name") or "").strip() or "LocalWebData"
+            if not (local_root and unc_root):
+                return
+            clean = {"enabled": bool(item.get("enabled", True)), "local_root": local_root, "unc_root": unc_root, "share_name": share_name}
+            key = (local_root.lower(), unc_root.lower())
+            for old in shares:
+                if (str(old.get("local_root") or "").lower(), str(old.get("unc_root") or "").lower()) == key:
+                    old.update(clean)
+                    return
+            shares.append(clean)
+
+        raw_shares = cfg.get("shares")
+        if isinstance(raw_shares, list):
+            for item in raw_shares:
+                add_share(item)
+        if cfg.get("local_root") and cfg.get("unc_root"):
+            add_share(cfg)
+        env_local_root = str(os.environ.get("LOCAL_WEB_HTCONDOR_SHARE_LOCAL_ROOT", "")).strip()
+        env_unc_root = str(os.environ.get("LOCAL_WEB_HTCONDOR_SHARE_UNC_ROOT", "")).strip()
+        env_share_name = str(os.environ.get("LOCAL_WEB_HTCONDOR_SHARE_NAME", "LocalWebData")).strip() or "LocalWebData"
+        if env_local_root and env_unc_root:
+            add_share({"enabled": True, "local_root": env_local_root, "unc_root": env_unc_root, "share_name": env_share_name})
+        primary = next((x for x in shares if x.get("enabled")), shares[0] if shares else {})
+        enabled = bool((cfg.get("enabled") or enabled_by_env) and shares) or any(bool(x.get("enabled")) for x in shares)
+        return {"enabled": bool(enabled), "local_root": str(primary.get("local_root") or ""), "unc_root": str(primary.get("unc_root") or ""), "share_name": str(primary.get("share_name") or "LocalWebData"), "shares": shares}
 
     def _htcondor_shared_io_enabled(self) -> bool:
         return bool(self._htcondor_shared_io_config().get("enabled"))
@@ -150,34 +172,37 @@ class TaskManager:
         return str(path).replace("/", "\\").rstrip("\\")
 
     def _path_to_shared_unc(self, path: Path | str) -> str:
-        """把父节点本地路径转换成 UNC 路径。不能转换时返回空字符串。"""
+        """把父节点本地路径转换成对应 UNC 路径。多共享目录时按最长本地根路径匹配。"""
         cfg = self._htcondor_shared_io_config()
         if not cfg.get("enabled"):
             return ""
-
         text = str(path or "").strip()
         if not text:
             return ""
-        # 已经是 UNC 路径时直接返回。
-        if text.startswith("\\\\"):
+        if text.startswith("\\"):
             return text
-
-        local_root_text = str(cfg.get("local_root") or "").strip()
-        unc_root = str(cfg.get("unc_root") or "").strip().rstrip("\\/")
-        if not local_root_text or not unc_root:
+        shares = cfg.get("shares") if isinstance(cfg.get("shares"), list) else []
+        if not shares:
+            shares = [cfg]
+        matches: List[tuple[int, str]] = []
+        for item in shares:
+            local_root_text = str(item.get("local_root") or "").strip()
+            unc_root = str(item.get("unc_root") or "").strip().rstrip("\\/")
+            if not local_root_text or not unc_root:
+                continue
+            try:
+                p = Path(text).resolve()
+                root = Path(local_root_text).resolve()
+                rel = p.relative_to(root)
+            except Exception:
+                continue
+            rel_text = str(rel).replace("/", "\\")
+            mapped = unc_root if rel_text in {".", ""} else unc_root + "\\" + rel_text
+            matches.append((len(str(root)), mapped))
+        if not matches:
             return ""
-
-        try:
-            p = Path(text).resolve()
-            root = Path(local_root_text).resolve()
-            rel = p.relative_to(root)
-        except Exception:
-            return ""
-
-        rel_text = str(rel).replace("/", "\\")
-        if rel_text in {".", ""}:
-            return unc_root
-        return unc_root + "\\" + rel_text
+        matches.sort(key=lambda x: x[0], reverse=True)
+        return matches[0][1]
 
     def _shared_task_root(self, parent_id: str) -> Path:
         cfg = self._htcondor_shared_io_config()
