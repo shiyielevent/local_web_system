@@ -42,3 +42,4 @@ Thumbs.db
 backend/.pyi_tmp/
 
 diff_with_github.txt
+/backend/app/main_逐行解释版.py
