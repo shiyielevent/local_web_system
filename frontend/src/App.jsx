@@ -52,6 +52,8 @@ import {
   joinHTCondorParent,
   leaveHTCondorPool,
   saveHTCondorNodeWeights,
+  prepareHTCondorSharedIO,
+  testHTCondorSharedIO,
 } from './api';
 
 import clusterEarthImage from './assets/earth.jpg';
@@ -1995,6 +1997,8 @@ function HTCondorPage({
   onJoinParent,
   onLeavePool,
   onSaveWeights,
+  onPrepareShare,
+  onTestShare,
 }) {
   const info = status || {};
   const install = info.install_result || {};
@@ -2020,6 +2024,13 @@ function HTCondorPage({
       : '未组建');
   const nodeCount = uniqueMachines.length || nodeItems.length || 0;
   const parentAddress = info.parent_ip || info.bind_ip || '-';
+  const sharedIo = info.shared_io || {};
+  const sharedEnabled = !!sharedIo.enabled;
+  const sharedUnc = sharedIo.unc_root || '';
+  const sharedRole = sharedIo.role || '';
+  const autoChildUnc = clusterForm.parent_ip && clusterForm.shared_share_name
+    ? `\\${clusterForm.parent_ip}\${clusterForm.shared_share_name}`
+    : '';
 
   const versionOutput = String(installedRuntime.version_output || '');
   const versionLine = versionOutput.split('\n').find((line) => line.includes('CondorVersion')) || '';
@@ -2238,6 +2249,7 @@ function HTCondorPage({
             {okBadge(info.service_running, 'Condor 服务运行中', 'Condor 服务未运行')}
             {okBadge(ping.ok, 'WRITE 权限通过', 'WRITE 权限失败')}
             {okBadge(info.enabled, 'HTCondor 执行已启用', '当前未启用 HTCondor')}
+            {okBadge(sharedEnabled, '共享目录已启用', '共享目录未启用')}
           </div>
         </div>
       </div>
@@ -2443,6 +2455,48 @@ function HTCondorPage({
             </div>
           </div>
 
+          <div style={{
+            marginTop: 14,
+            padding: '12px 14px',
+            borderRadius: 14,
+            background: '#ffffff',
+            border: '1px solid #dce8f3',
+          }}>
+            <div style={{ fontSize: 16, fontWeight: 900, color: '#12385f' }}>共享目录</div>
+            <div style={{ marginTop: 4, fontSize: 12, color: '#64748b', lineHeight: 1.55 }}>
+              父节点创建集群后点击“添加共享目录”；子节点加入集群时会自动连接 \父节点IP\共享名。
+            </div>
+            <div style={{ display: 'grid', gap: 10, marginTop: 10 }}>
+              <label>
+                <div style={labelStyle}>父节点本地共享目录</div>
+                <input
+                  style={styles.input}
+                  value={clusterForm.shared_local_root || ''}
+                  placeholder="例如 D:\H8\data"
+                  onChange={(e) => setClusterForm({ ...clusterForm, shared_local_root: e.target.value })}
+                />
+              </label>
+              <label>
+                <div style={labelStyle}>共享名</div>
+                <input
+                  style={styles.input}
+                  value={clusterForm.shared_share_name || ''}
+                  placeholder="例如 H8Data"
+                  onChange={(e) => setClusterForm({ ...clusterForm, shared_share_name: e.target.value })}
+                />
+              </label>
+            </div>
+            <div style={{ marginTop: 10, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              <button style={styles.blueBtn} disabled={!!busy} onClick={onPrepareShare}>添加共享目录</button>
+              <button style={styles.whiteBtn} disabled={!!busy} onClick={onTestShare}>测试共享目录</button>
+            </div>
+            <div style={{ marginTop: 10, fontSize: 12, color: '#475569', lineHeight: 1.55, overflowWrap: 'anywhere' }}>
+              <div><strong>当前共享：</strong>{sharedEnabled ? '已启用' : '未启用'}{sharedRole ? ` / ${sharedRole}` : ''}</div>
+              <div><strong>UNC：</strong>{sharedUnc || autoChildUnc || '-'}</div>
+              {sharedIo.connect_message && <div><strong>连接结果：</strong>{sharedIo.connect_message}</div>}
+            </div>
+          </div>
+
           <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 16 }}>
             <button style={styles.blueBtn} disabled={!!busy} onClick={onCreateParent}>启动集群</button>
             <button style={styles.whiteBtn} disabled={!!busy} onClick={onJoinParent}>加入集群</button>
@@ -2470,6 +2524,7 @@ function HTCondorPage({
             <div>父节点：{clusterForm.parent_ip || '-'}</div>
             <div>本机绑定：{clusterForm.bind_ip || localIps[0] || '-'}</div>
             <div>端口范围：{clusterForm.low_port || 9700} - {clusterForm.high_port || 9800}</div>
+            <div>共享目录：{sharedUnc || autoChildUnc || '-'}</div>
           </div>
 
           <div style={{
@@ -2484,8 +2539,9 @@ function HTCondorPage({
           }}>
             <div style={{ fontWeight: 900, color: '#17406b', marginBottom: 6 }}>操作说明</div>
             <div>1. 父节点点击“启动集群”。</div>
-            <div>2. 子节点填写父节点 IP 后点击“加入集群”。</div>
-            <div>3. 父节点刷新状态，在执行节点列表中确认子节点机器名。</div>
+            <div>2. 父节点填写共享目录后点击“添加共享目录”。</div>
+            <div>3. 子节点填写父节点 IP 后点击“加入集群”，系统会自动连接共享目录。</div>
+            <div>4. 父节点刷新状态，在执行节点列表中确认子节点机器名。</div>
           </div>
         </div>
 
@@ -2546,6 +2602,10 @@ function App() {
     child_ip: '',
     low_port: '9700',
     high_port: '9800',
+    shared_local_root: 'D:\H8\data',
+    shared_share_name: 'H8Data',
+    shared_unc_root: '',
+    auto_shared_io: true,
   });
 
 
@@ -3337,6 +3397,10 @@ async function installModuleFolder() {
           child_ip: old.child_ip || data.bind_ip || (Array.isArray(data.local_ips) ? (data.local_ips[0] || '') : ''),
           low_port: String(data.low_port || old.low_port || '9700'),
           high_port: String(data.high_port || old.high_port || '9800'),
+          shared_local_root: old.shared_local_root || data.shared_io?.local_root || 'D:\H8\data',
+          shared_share_name: old.shared_share_name || data.shared_io?.share_name || 'H8Data',
+          shared_unc_root: data.shared_io?.unc_root || old.shared_unc_root || '',
+          auto_shared_io: old.auto_shared_io !== false,
         }));
       }
       return data;
@@ -3385,14 +3449,37 @@ async function installModuleFolder() {
     return runHTCondorAction('创建 HTCondor 父节点', () => createHTCondorParent(payload));
   }
 
-  async function handleHTCondorJoinParent() {
+  async function handleHTCondorPrepareShare() {
+    const bindIp = htcondorClusterForm.bind_ip || htcondorStatus?.bind_ip || (Array.isArray(htcondorStatus?.local_ips) ? (htcondorStatus.local_ips[0] || '') : '');
     const payload = {
-      parent_ip: htcondorClusterForm.parent_ip || '',
+      local_root: htcondorClusterForm.shared_local_root || '',
+      share_name: htcondorClusterForm.shared_share_name || 'H8Data',
+      unc_host: bindIp,
+    };
+    const data = await runHTCondorAction('添加 HTCondor 共享目录', () => prepareHTCondorSharedIO(payload));
+    if (data?.unc_root) {
+      setHTCondorClusterForm((old) => ({ ...old, shared_unc_root: data.unc_root, shared_share_name: data.share_name || old.shared_share_name }));
+    }
+    return data;
+  }
+
+  async function handleHTCondorTestShare() {
+    return runHTCondorAction('测试 HTCondor 共享目录', () => testHTCondorSharedIO());
+  }
+
+  async function handleHTCondorJoinParent() {
+    const shareName = htcondorClusterForm.shared_share_name || 'H8Data';
+    const parentIp = htcondorClusterForm.parent_ip || '';
+    const payload = {
+      parent_ip: parentIp,
       child_ip: htcondorClusterForm.child_ip || htcondorClusterForm.bind_ip || '',
       low_port: Number(htcondorClusterForm.low_port || 9700),
       high_port: Number(htcondorClusterForm.high_port || 9800),
+      auto_shared_io: htcondorClusterForm.auto_shared_io !== false,
+      share_name: shareName,
+      shared_unc_root: parentIp && shareName ? `\\${parentIp}\${shareName}` : '',
     };
-    return runHTCondorAction('加入 HTCondor 父节点', () => joinHTCondorParent(payload));
+    return runHTCondorAction('加入 HTCondor 父节点并自动连接共享目录', () => joinHTCondorParent(payload));
   }
 
   async function handleHTCondorLeavePool() {
@@ -5767,6 +5854,8 @@ function renderTaskManagementPage() {
             onJoinParent={handleHTCondorJoinParent}
             onLeavePool={handleHTCondorLeavePool}
             onSaveWeights={handleHTCondorSaveWeights}
+            onPrepareShare={handleHTCondorPrepareShare}
+            onTestShare={handleHTCondorTestShare}
           />
         )}
       </div>

@@ -178,6 +178,10 @@ class HTCondorJoinParentRequest(BaseModel):
     child_ip: str = ""
     low_port: int = 9700
     high_port: int = 9800
+    # 子节点加入父节点后，自动连接父节点共享目录。
+    auto_shared_io: bool = True
+    share_name: str = "LocalWebData"
+    shared_unc_root: str = ""
 
 
 class HTCondorSharedIORequest(BaseModel):
@@ -190,6 +194,8 @@ class HTCondorSharedIORequest(BaseModel):
 class HTCondorPrepareShareRequest(BaseModel):
     local_root: str = ""
     share_name: str = "LocalWebData"
+    # 用于生成子节点可访问的 UNC，通常填父节点绑定 IP。为空时后端使用本机名。
+    unc_host: str = ""
 
 
 class HTCondorNodeWeightsRequest(BaseModel):
@@ -402,6 +408,7 @@ def api_htcondor_prepare_shared_io(
         return htcondor_cluster_manager.prepare_local_share(
             local_root=payload.local_root,
             share_name=payload.share_name,
+            unc_host=payload.unc_host,
         )
     except HTCondorClusterError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
@@ -447,6 +454,9 @@ def api_htcondor_join_parent(
             child_ip=payload.child_ip,
             low_port=payload.low_port,
             high_port=payload.high_port,
+            auto_shared_io=payload.auto_shared_io,
+            share_name=payload.share_name,
+            shared_unc_root=payload.shared_unc_root,
         )
     except HTCondorClusterError as exc:
         raise HTTPException(status_code=500, detail=str(exc))

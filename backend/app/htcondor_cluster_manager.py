@@ -140,6 +140,10 @@ class HTCondorClusterManager:
             "local_root": str(raw.get("local_root") or "").strip(),
             "unc_root": str(raw.get("unc_root") or "").strip(),
             "share_name": str(raw.get("share_name") or "LocalWebData").strip() or "LocalWebData",
+            "role": str(raw.get("role") or "").strip(),
+            "parent_ip": str(raw.get("parent_ip") or "").strip(),
+            "connect_ok": bool(raw.get("connect_ok")),
+            "connect_message": str(raw.get("connect_message") or "").strip(),
             "updated_at": str(raw.get("updated_at") or ""),
         }
 
@@ -173,7 +177,7 @@ class HTCondorClusterManager:
         data["message"] = "共享目录模式已启用" if enabled else "共享目录模式已关闭"
         return data
 
-    def prepare_local_share(self, local_root: str, share_name: str = "LocalWebData") -> Dict[str, Any]:
+    def prepare_local_share(self, local_root: str, share_name: str = "LocalWebData", unc_host: str = "") -> Dict[str, Any]:
         """在父节点本机创建 Windows 共享目录。
 
         需要管理员权限。这里尽量自动完成：创建目录、设置 NTFS 权限、创建 net share。
@@ -218,12 +222,97 @@ class HTCondorClusterManager:
                 f"输出：{create_result.get('stdout') or create_result.get('stderr') or create_result.get('error')}"
             )
 
-        host = socket.gethostname()
+        # 父节点创建共享目录时，优先使用前端传入的绑定 IP 生成 UNC。
+        # 这样子节点加入集群时可以直接访问 \\父节点IP\共享名，避免局域网内主机名解析失败。
+        host = str(unc_host or self.state.get("bind_ip") or socket.gethostname()).strip()
         unc_root = f"\\\\{host}\\{share_name}"
         config = self.set_shared_io_config(True, local_root=str(root), unc_root=unc_root, share_name=share_name)
+        self.state["shared_io_config"]["role"] = "parent"
+        self.state["shared_io_config"]["connect_ok"] = True
+        self.state["shared_io_config"]["connect_message"] = "父节点共享目录已创建"
+        self._save_state()
+        config = self.shared_io_config()
         config["commands"] = commands
         config["message"] = f"已创建共享目录：{unc_root} -> {root}"
         return config
+
+    def connect_parent_shared_io(self, parent_ip: str, share_name: str = "LocalWebData", unc_root: str = "") -> Dict[str, Any]:
+        """子节点加入集群后自动连接父节点共享目录。
+
+        父节点通过 prepare_local_share 创建共享目录；子节点加入集群时调用此函数，
+        自动执行 cmdkey/net use，并做一次读写测试。这样不需要用户再手动执行 net use。
+        """
+        if os.name != "nt":
+            raise HTCondorClusterError("共享目录自动连接当前只支持 Windows。")
+
+        parent_ip = str(parent_ip or "").strip()
+        share_name = str(share_name or "LocalWebData").strip() or "LocalWebData"
+        unc_root = str(unc_root or "").strip()
+        if not unc_root:
+            if not parent_ip:
+                raise HTCondorClusterError("自动连接共享目录需要父节点 IP。")
+            unc_root = f"\\\\{parent_ip}\\{share_name}"
+
+        user = str(os.environ.get("LOCAL_WEB_HTCONDOR_SHARE_USER", "")).strip()
+        password = str(os.environ.get("LOCAL_WEB_HTCONDOR_SHARE_PASSWORD", "")).strip()
+        server = parent_ip or unc_root.strip("\\").split("\\")[0]
+        commands: List[Dict[str, Any]] = []
+
+        commands.append({"command": f"net use {unc_root} /delete", **self._run(["net.exe", "use", unc_root, "/delete", "/y"], timeout=30)})
+        if server:
+            commands.append({"command": f"cmdkey /delete:{server}", **self._run(["cmdkey.exe", f"/delete:{server}"], timeout=30)})
+
+        if user and password and server:
+            commands.append({"command": f"cmdkey /add:{server}", **self._run(["cmdkey.exe", f"/add:{server}", f"/user:{user}", f"/pass:{password}"], timeout=30)})
+
+        if user and password:
+            use_cmd = ["net.exe", "use", unc_root, f"/user:{user}", password, "/persistent:no"]
+        else:
+            use_cmd = ["net.exe", "use", unc_root, "/persistent:no"]
+        commands.append({"command": f"net use {unc_root}", **self._run(use_cmd, timeout=45)})
+
+        ok = False
+        message = ""
+        test_path = ""
+        try:
+            test_dir = Path(unc_root) / "_localweb_share_test"
+            test_dir.mkdir(parents=True, exist_ok=True)
+            test_file = test_dir / f"child_{socket.gethostname()}_{int(time.time())}.txt"
+            test_file.write_text("ok", encoding="utf-8")
+            text = test_file.read_text(encoding="utf-8")
+            try:
+                test_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+            ok = text == "ok"
+            test_path = str(test_file)
+            message = "子节点已自动连接父节点共享目录并通过读写测试" if ok else "子节点共享目录读写测试异常"
+        except Exception as exc:
+            ok = False
+            message = f"子节点自动连接共享目录失败：{type(exc).__name__}: {exc}"
+
+        self.state["shared_io_config"] = {
+            "enabled": bool(ok),
+            "local_root": "",
+            "unc_root": unc_root,
+            "share_name": share_name,
+            "role": "child",
+            "parent_ip": parent_ip,
+            "connect_ok": bool(ok),
+            "connect_message": message,
+            "updated_at": now_iso(),
+        }
+        self._save_state()
+        return {
+            "ok": bool(ok),
+            "enabled": bool(ok),
+            "unc_root": unc_root,
+            "share_name": share_name,
+            "parent_ip": parent_ip,
+            "message": message,
+            "test_path": test_path,
+            "commands": commands,
+        }
 
     def test_shared_io(self) -> Dict[str, Any]:
         """在当前机器上测试共享目录是否可读写。
@@ -412,6 +501,7 @@ class HTCondorClusterManager:
             "high_port": int(self.state.get("high_port") or 9800),
             "state_file": str(self.state_file),
             "runtime_dir": str(self.runtime_dir),
+            "shared_io": self.shared_io_config(),
             "install_result": install_result,
             "runtime": runtime,
             "service_running": service_ok,
@@ -1003,7 +1093,16 @@ finally {{
         data["message"] = result.get("message") or ("父节点创建完成" if result.get("success") else "父节点创建失败")
         return data
 
-    def join_parent_node(self, parent_ip: str, child_ip: str = "", low_port: int = 9700, high_port: int = 9800) -> Dict[str, Any]:
+    def join_parent_node(
+        self,
+        parent_ip: str,
+        child_ip: str = "",
+        low_port: int = 9700,
+        high_port: int = 9800,
+        auto_shared_io: bool = True,
+        share_name: str = "LocalWebData",
+        shared_unc_root: str = "",
+    ) -> Dict[str, Any]:
         parent_ip = str(parent_ip or "").strip()
         if not parent_ip:
             raise HTCondorClusterError("请填写父节点 IP。")
@@ -1036,6 +1135,24 @@ finally {{
                     "常见原因是父节点安全配置没有放行 ALLOW_ADVERTISE_STARTD，"
                     "或父节点 Condor 服务还没有完成重载。"
                 )
+
+            # 子节点加入集群后，自动连接父节点共享目录。
+            # 连接失败不回滚 HTCondor 加入动作，但会把失败原因返回到前端。
+            if auto_shared_io:
+                try:
+                    shared_result = self.connect_parent_shared_io(
+                        parent_ip=parent_ip,
+                        share_name=share_name,
+                        unc_root=shared_unc_root,
+                    )
+                    result["shared_io"] = shared_result
+                    if shared_result.get("ok"):
+                        result["message"] = (result.get("message") or "子节点已加入父节点") + "；共享目录已自动连接。"
+                    else:
+                        result["message"] = (result.get("message") or "子节点已加入父节点") + f"；但共享目录自动连接失败：{shared_result.get('message')}"
+                except Exception as exc:
+                    result["shared_io"] = {"ok": False, "message": f"{type(exc).__name__}: {exc}"}
+                    result["message"] = (result.get("message") or "子节点已加入父节点") + f"；但共享目录自动连接失败：{type(exc).__name__}: {exc}"
         data = self.status()
         data["action_result"] = result
         data["message"] = result.get("message") or ("已加入父节点" if result.get("success") else "加入父节点失败")
