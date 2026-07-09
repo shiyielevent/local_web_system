@@ -1762,21 +1762,24 @@ else {
         transfer_output_line = f"transfer_output_files = {transfer_output_files}\n" if transfer_output_files else ""
 
         try:
-            request_memory_mb = int(os.environ.get("LOCAL_WEB_HTCONDOR_REQUEST_MEMORY_MB", "8192") or "8192")
+            request_memory_mb = int(os.environ.get("LOCAL_WEB_HTCONDOR_REQUEST_MEMORY_MB", "16384") or "16384")
         except Exception:
-            request_memory_mb = 8192
+            request_memory_mb = 16384
+        # 尽量接近手工直接运行 EXE 的资源环境。默认从 8192MB 提高到 16384MB，
+        # 避免 HTCondor 资源声明过低影响 sklearn/joblib/numpy 这类内存型任务。
+        # 如子节点物理内存较小，可用 LOCAL_WEB_HTCONDOR_REQUEST_MEMORY_MB 覆盖。
         request_memory_mb = max(1024, request_memory_mb)
 
-        # 共享目录模式优先让作业按提交用户 LocalWebCondor 运行。
-        # 当前系统提交 condor_submit 时已经切换到了 LocalWebCondor，
-        # 因此 run_as_owner=true 可避免 HTCondor 默认 slot 账号无法访问 SMB 共享的问题。
+        # Windows 版 HTCondor 中 run_as_owner=true 需要 CREDD_HOST/condor_credd 支持。
+        # 当前一键集群未配置 CREDD_HOST，因此共享目录模式也不能默认启用 run_as_owner，
+        # 否则 condor_submit 会直接失败：run_as_owner requires a valid CREDD_HOST configuration macro。
+        # 共享目录访问改由 run_job.cmd 内部的 cmdkey + net use 完成；
+        # 只有用户明确配置好 CREDD 后，才允许用环境变量 LOCAL_WEB_HTCONDOR_RUN_AS_OWNER=1 开启。
         run_as_owner_env = str(os.environ.get("LOCAL_WEB_HTCONDOR_RUN_AS_OWNER", "")).strip().lower()
         if run_as_owner_env in {"1", "true", "yes", "on"}:
             run_as_owner_value = "true"
-        elif run_as_owner_env in {"0", "false", "no", "off"}:
-            run_as_owner_value = "false"
         else:
-            run_as_owner_value = "true" if shared_io_enabled else "false"
+            run_as_owner_value = "false"
 
         sub_text = f"""universe = vanilla
 executable = C:/Windows/System32/cmd.exe
