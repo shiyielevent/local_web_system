@@ -28,7 +28,7 @@ from .htcondor_cluster_manager import HTCondorClusterError, HTCondorClusterManag
 def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 BASE_DIR = Path(__file__).resolve().parent.parent
-PROJECT_ROOT = BASE_DIR.parent
+PROJECT_ROOT = BASE_DIR.parent #root
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 MODULES_FILE = DATA_DIR / "modules.json"
@@ -163,12 +163,6 @@ class PythonModuleConfigRequest(BaseModel):
     path: str
 
 
-
-
-
-
-
-
 class HTCondorExecutionModeRequest(BaseModel):
     mode: str = "local"
 
@@ -184,6 +178,18 @@ class HTCondorJoinParentRequest(BaseModel):
     child_ip: str = ""
     low_port: int = 9700
     high_port: int = 9800
+
+
+class HTCondorSharedIORequest(BaseModel):
+    enabled: bool = False
+    local_root: str = ""
+    unc_root: str = ""
+    share_name: str = "LocalWebData"
+
+
+class HTCondorPrepareShareRequest(BaseModel):
+    local_root: str = ""
+    share_name: str = "LocalWebData"
 
 
 class HTCondorNodeWeightsRequest(BaseModel):
@@ -332,7 +338,7 @@ def api_htcondor_save_node_weights(
 
     data = htcondor_cluster_manager.status()
     summary = _htcondor_node_weight_summary(data)
-    summary["message"] = "节点任务权重已保存，后续 HTCondor 任务将按该权重分配输入文件。"
+    summary["message"] = "节点任务权重已保存，后续 HTCondor 任务将按该权重分配输入文件"
     return summary
 
 
@@ -361,6 +367,50 @@ def api_htcondor_smoke_test(authorization: str | None = Header(default=None)):
 def api_htcondor_logs(authorization: str | None = Header(default=None)):
     require_admin(authorization)
     return htcondor_cluster_manager.tail_logs()
+
+
+@app.get("/api/htcondor/shared-io")
+def api_htcondor_shared_io(authorization: str | None = Header(default=None)):
+    require_admin(authorization)
+    return htcondor_cluster_manager.shared_io_config()
+
+
+@app.post("/api/htcondor/shared-io")
+def api_htcondor_save_shared_io(
+    payload: HTCondorSharedIORequest,
+    authorization: str | None = Header(default=None),
+):
+    require_admin(authorization)
+    try:
+        return htcondor_cluster_manager.set_shared_io_config(
+            enabled=payload.enabled,
+            local_root=payload.local_root,
+            unc_root=payload.unc_root,
+            share_name=payload.share_name,
+        )
+    except HTCondorClusterError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/htcondor/shared-io/prepare")
+def api_htcondor_prepare_shared_io(
+    payload: HTCondorPrepareShareRequest,
+    authorization: str | None = Header(default=None),
+):
+    require_admin(authorization)
+    try:
+        return htcondor_cluster_manager.prepare_local_share(
+            local_root=payload.local_root,
+            share_name=payload.share_name,
+        )
+    except HTCondorClusterError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/htcondor/shared-io/test")
+def api_htcondor_test_shared_io(authorization: str | None = Header(default=None)):
+    require_admin(authorization)
+    return htcondor_cluster_manager.test_shared_io()
 
 
 @app.get("/api/htcondor/nodes")
@@ -519,7 +569,7 @@ def add_chinese_path_errors_to_report(report: dict, value: Any, prefix: str = "�
     return bool(items)
 
 
-def to_project_relative_path(path: Path) -> str:
+def to_project_relative_path(path: Path) -> str:#change_path
     """
     项目内部路径保存为相对于项目根目录的路径。
     例如：

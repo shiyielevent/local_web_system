@@ -119,6 +119,117 @@ class TaskManager:
         """注入 HTCondor 管理器。"""
         self.htcondor_manager = htcondor_manager
 
+
+    # =========================
+    # HTCondor 共享目录模式
+    # =========================
+    def _htcondor_shared_io_config(self) -> Dict[str, Any]:
+        """读取共享目录模式配置。优先读 HTCondorClusterManager.state，兼容环境变量。"""
+        manager = self.htcondor_manager
+        state = getattr(manager, "state", {}) if manager is not None else {}
+        cfg = (state or {}).get("shared_io_config") or {}
+        if not isinstance(cfg, dict):
+            cfg = {}
+
+        env_enabled = str(os.environ.get("LOCAL_WEB_HTCONDOR_SHARED_IO", "")).strip().lower()
+        enabled = bool(cfg.get("enabled")) or env_enabled in {"1", "true", "yes", "on"}
+        local_root = str(cfg.get("local_root") or os.environ.get("LOCAL_WEB_HTCONDOR_SHARE_LOCAL_ROOT", "")).strip()
+        unc_root = str(cfg.get("unc_root") or os.environ.get("LOCAL_WEB_HTCONDOR_SHARE_UNC_ROOT", "")).strip()
+        share_name = str(cfg.get("share_name") or os.environ.get("LOCAL_WEB_HTCONDOR_SHARE_NAME", "LocalWebData")).strip() or "LocalWebData"
+        return {
+            "enabled": bool(enabled and local_root and unc_root),
+            "local_root": local_root,
+            "unc_root": unc_root,
+            "share_name": share_name,
+        }
+
+    def _htcondor_shared_io_enabled(self) -> bool:
+        return bool(self._htcondor_shared_io_config().get("enabled"))
+
+    def _normalize_path_text(self, path: Path | str) -> str:
+        return str(path).replace("/", "\\").rstrip("\\")
+
+    def _path_to_shared_unc(self, path: Path | str) -> str:
+        """把父节点本地路径转换成 UNC 路径。不能转换时返回空字符串。"""
+        cfg = self._htcondor_shared_io_config()
+        if not cfg.get("enabled"):
+            return ""
+
+        text = str(path or "").strip()
+        if not text:
+            return ""
+        # 已经是 UNC 路径时直接返回。
+        if text.startswith("\\\\"):
+            return text
+
+        local_root_text = str(cfg.get("local_root") or "").strip()
+        unc_root = str(cfg.get("unc_root") or "").strip().rstrip("\\/")
+        if not local_root_text or not unc_root:
+            return ""
+
+        try:
+            p = Path(text).resolve()
+            root = Path(local_root_text).resolve()
+            rel = p.relative_to(root)
+        except Exception:
+            return ""
+
+        rel_text = str(rel).replace("/", "\\")
+        if rel_text in {".", ""}:
+            return unc_root
+        return unc_root + "\\" + rel_text
+
+    def _shared_task_root(self, parent_id: str) -> Path:
+        cfg = self._htcondor_shared_io_config()
+        local_root = Path(str(cfg.get("local_root") or ""))
+        return local_root / "_localweb_htcondor_shared" / str(parent_id)
+
+    def _make_shared_part_output_path(self, original_path: str, part_name: str) -> tuple[Path, str]:
+        """生成父节点本地 part 输出路径及对应 UNC 路径。"""
+        old_path = Path(str(original_path or ""))
+        if old_path.suffix:
+            local_path = old_path.with_name(f"{old_path.stem}_{part_name}{old_path.suffix}")
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            local_path = old_path / part_name
+            local_path.mkdir(parents=True, exist_ok=True)
+        unc = self._path_to_shared_unc(local_path)
+        return local_path, unc
+
+    def _rewrite_output_paths_for_part_shared(self, data: Any, part_name: str):
+        """共享目录模式下，把输出目录改成父节点共享 UNC 路径。"""
+        output_words = ["output", "out_dir", "outpath", "result", "save_dir", "target_dir"]
+
+        def walk(obj: Any, key_name: str = ""):
+            if isinstance(obj, dict):
+                for key, value in list(obj.items()):
+                    low_key = str(key).lower()
+                    if isinstance(value, str) and any(word in low_key for word in output_words):
+                        try:
+                            _, unc = self._make_shared_part_output_path(value, part_name)
+                            if unc:
+                                obj[key] = unc
+                                continue
+                        except Exception:
+                            pass
+                    walk(value, str(key))
+            elif isinstance(obj, list):
+                for item in obj:
+                    walk(item, key_name)
+
+        walk(data)
+
+    def _map_path_like_values_to_shared_unc(self, value: Any) -> Any:
+        """递归把配置里的父节点本地路径改成 UNC 路径。"""
+        if isinstance(value, dict):
+            return {k: self._map_path_like_values_to_shared_unc(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self._map_path_like_values_to_shared_unc(v) for v in value]
+        if isinstance(value, str):
+            unc = self._path_to_shared_unc(value)
+            return unc or value
+        return value
+
     def _make_htcondor_safe_env(self, env: Dict[str, str] | None = None) -> Dict[str, str]:
         """为 HTCondor 远程 EXE 注入可选环境变量。
 
@@ -807,6 +918,10 @@ class TaskManager:
 
         output_defs = self._module_output_defs(module_item, split_key=split_key)
         aux_input_defs = self._module_aux_input_defs(module_item, split_key=split_key)
+        shared_io = self._htcondor_shared_io_enabled()
+        shared_root = self._shared_task_root(parent_id) if shared_io else split_root
+        if shared_io:
+            shared_root.mkdir(parents=True, exist_ok=True)
 
         entries: List[Dict[str, Any]] = []
         for index, machine in enumerate(machines):
@@ -814,7 +929,7 @@ class TaskManager:
                 continue
 
             part_name = f"part_{index + 1}_{machine}"
-            part_dir = split_root / part_name
+            part_dir = (shared_root if shared_io else split_root) / part_name
             part_dir.mkdir(parents=True, exist_ok=True)
 
             # 目录名直接使用模块字段 key，便于排查。
@@ -829,15 +944,27 @@ class TaskManager:
             part_config = copy.deepcopy(config_data)
             output_mappings: List[Dict[str, Any]] = []
 
-            # 子节点运行时真实路径由 htcondor_cluster_manager.py 中的
-            # __LOCAL_WEB_JOB_DIR__ 占位符替换得到。
-            part_config[split_key] = f"__LOCAL_WEB_JOB_DIR__/{split_key}"
+            shared_input_unc = self._path_to_shared_unc(part_input_dir) if shared_io else ""
+            if shared_io and shared_input_unc:
+                # 共享目录模式：配置文件直接写 UNC 路径，子节点通过网络共享读取父节点目录。
+                # 因为不再使用 __LOCAL_WEB_JOB_DIR__，htcondor_cluster_manager.py 不会传输 input/output 大目录。
+                part_config[split_key] = shared_input_unc
+            else:
+                # 文件传输模式：子节点运行时真实路径由 htcondor_cluster_manager.py 中的
+                # __LOCAL_WEB_JOB_DIR__ 占位符替换得到。
+                part_config[split_key] = f"__LOCAL_WEB_JOB_DIR__/{split_key}"
 
             for out_def in output_defs:
                 out_key = str(out_def.get("key") or "").strip()
                 if not out_key or out_key not in part_config:
                     continue
                 original_out_path = str(config_data.get(out_key) or '').strip()
+                if shared_io and shared_input_unc and original_out_path:
+                    _, out_unc = self._make_shared_part_output_path(original_out_path, part_name)
+                    if out_unc:
+                        part_config[out_key] = out_unc
+                        continue
+
                 out_dir = part_dir / out_key
                 out_dir.mkdir(parents=True, exist_ok=True)
                 part_config[out_key] = f"__LOCAL_WEB_JOB_DIR__/{out_key}"
@@ -858,6 +985,12 @@ class TaskManager:
                 aux_source = Path(str(config_data.get(aux_key) or ""))
                 if not aux_source.is_dir():
                     continue
+                if shared_io and shared_input_unc:
+                    aux_unc = self._path_to_shared_unc(aux_source)
+                    if aux_unc:
+                        part_config[aux_key] = aux_unc
+                        continue
+
                 aux_dir = part_dir / aux_key
                 aux_dir.mkdir(parents=True, exist_ok=True)
                 aux_patterns = self._module_file_patterns(module_item, aux_def)
@@ -869,7 +1002,8 @@ class TaskManager:
                     aux_files = [p for p in sorted(aux_source.iterdir()) if p.is_file()]
                 for source in aux_files:
                     self._link_or_copy_file(source, aux_dir / source.name)
-                part_config[aux_key] = f"__LOCAL_WEB_JOB_DIR__/{aux_key}"
+                aux_unc = self._path_to_shared_unc(aux_dir) if shared_io and shared_input_unc else ""
+                part_config[aux_key] = aux_unc or f"__LOCAL_WEB_JOB_DIR__/{aux_key}"
 
             # 每个子任务只处理一部分文件，内部并行数按节点数拆开。
             # 这样可以避免两台机器同时各开很多进程，把电脑拖死。
@@ -907,9 +1041,11 @@ class TaskManager:
                         "part_count": len(chunks[index]),
                         "file_patterns": self._module_file_patterns(module_item, split_input),
                         "output_mappings": output_mappings,
+                        "shared_io": bool(shared_io and shared_input_unc),
+                        "shared_input_dir_unc": shared_input_unc,
                         "link_modes": sorted(set(used_modes)),
                     },
-                    "cleanup_root": str(split_root),
+                    "cleanup_root": str(shared_root if shared_io else split_root),
                 }
             })
 
@@ -1086,8 +1222,15 @@ class TaskManager:
                 part_dir.mkdir(parents=True, exist_ok=True)
 
                 part_config = copy.deepcopy(config_data)
-                self._set_by_path(part_config, list_path, chunks[index])
-                self._rewrite_output_paths_for_part(part_config, part_name)
+                shared_io = self._htcondor_shared_io_enabled()
+                chunk_values = chunks[index]
+                if shared_io:
+                    chunk_values = self._map_path_like_values_to_shared_unc(chunk_values)
+                self._set_by_path(part_config, list_path, chunk_values)
+                if shared_io:
+                    self._rewrite_output_paths_for_part_shared(part_config, part_name)
+                else:
+                    self._rewrite_output_paths_for_part(part_config, part_name)
 
                 part_config_path = part_dir / "config.json"
                 part_config_path.write_text(
@@ -1110,6 +1253,7 @@ class TaskManager:
                             "node_weight": self._htcondor_machine_weights(machines).get(machine, 1),
                             "part_config": str(part_config_path),
                             "part_count": len(chunks[index]),
+                            "shared_io": bool(self._htcondor_shared_io_enabled()),
                         },
                     }
                 })
@@ -1138,7 +1282,8 @@ class TaskManager:
                 if not chunks[index]:
                     continue
                 part_name = f"part_{index + 1}_{machine}"
-                part_dir = split_root / part_name
+                shared_io = self._htcondor_shared_io_enabled()
+                part_dir = (self._shared_task_root(parent_id) if shared_io else split_root) / part_name
                 part_input_dir = part_dir / "input"
                 part_input_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1149,8 +1294,12 @@ class TaskManager:
                 link_modes.extend(used_modes)
 
                 part_config = copy.deepcopy(config_data)
-                self._set_by_path(part_config, dir_path, str(part_input_dir))
-                self._rewrite_output_paths_for_part(part_config, part_name)
+                shared_input_unc = self._path_to_shared_unc(part_input_dir) if shared_io else ""
+                self._set_by_path(part_config, dir_path, shared_input_unc or str(part_input_dir))
+                if shared_io and shared_input_unc:
+                    self._rewrite_output_paths_for_part_shared(part_config, part_name)
+                else:
+                    self._rewrite_output_paths_for_part(part_config, part_name)
 
                 part_config_path = part_dir / "config.json"
                 part_config_path.write_text(
@@ -1174,9 +1323,11 @@ class TaskManager:
                             "part_config": str(part_config_path),
                             "part_input_dir": str(part_input_dir),
                             "part_count": len(chunks[index]),
+                            "shared_io": bool(shared_io and shared_input_unc),
+                            "shared_input_dir_unc": shared_input_unc,
                             "link_modes": sorted(set(used_modes)),
                         },
-                        "cleanup_root": str(split_root),
+                        "cleanup_root": str(self._shared_task_root(parent_id) if shared_io else split_root),
                         "link_modes": sorted(set(link_modes)),
                     }
                 })
@@ -1379,7 +1530,20 @@ class TaskManager:
         else:
             self.append_log(parent_id, "[HTCONDOR] 未启用远程 EXE 线程限制，优先保证节点计算性能。")
         self.append_log(parent_id, "[HTCONDOR] 系统会为每个子任务写入 target_machine，尽量让不同节点同时运行。")
-        self.append_log(parent_id, "[HTCONDOR] 系统会为拆分任务传输子任务 config.json 和对应输入子目录；输出目录按子任务隔离。")
+        shared_count = 0
+        for entry in entries:
+            spec = entry.get("spec") if isinstance(entry, dict) else {}
+            inputs = spec.get("inputs") if isinstance(spec.get("inputs"), dict) else {}
+            if inputs.get("shared_io"):
+                shared_count += 1
+        if shared_count:
+            cfg = self._htcondor_shared_io_config()
+            self.append_log(
+                parent_id,
+                f"[HTCONDOR] 共享目录模式已启用：子节点通过 {cfg.get('unc_root')} 直接读取输入并写回输出；HTCondor 只传输 cmd/config/result 小文件。"
+            )
+        else:
+            self.append_log(parent_id, "[HTCONDOR] 文件传输模式：系统会为拆分任务传输子任务 config.json 和对应输入子目录；输出目录按子任务隔离。")
 
         done_count = 0
         failures = 0
@@ -1527,13 +1691,21 @@ class TaskManager:
                             result = future.result()
                             status = self._apply_htcondor_result(child_id, result)
                             if status == "success":
-                                self._collect_htcondor_transferred_outputs(
-                                    parent_id=parent_id,
-                                    child_id=child_id,
-                                    spec=meta.get("spec") or {},
-                                    result=result,
-                                    label=label,
-                                )
+                                spec_for_collect = meta.get("spec") or {}
+                                inputs_for_collect = spec_for_collect.get("inputs") if isinstance(spec_for_collect.get("inputs"), dict) else {}
+                                if inputs_for_collect.get("shared_io"):
+                                    self.append_log(
+                                        parent_id,
+                                        f"[HTCONDOR] {label} 使用共享目录模式，输出已直接写入父节点共享目录，跳过 HTCondor 输出回收。"
+                                    )
+                                else:
+                                    self._collect_htcondor_transferred_outputs(
+                                        parent_id=parent_id,
+                                        child_id=child_id,
+                                        spec=spec_for_collect,
+                                        result=result,
+                                        label=label,
+                                    )
 
                             # 输出已经回收到用户目录后，立即删除 job_dir 里的 file/cm_files/outpath 等大副本。
                             # 即使子任务失败，也只保留日志文件，避免失败任务长期占用大量磁盘。

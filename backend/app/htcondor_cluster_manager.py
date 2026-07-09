@@ -119,6 +119,141 @@ class HTCondorClusterManager:
         self.state["updated_at"] = now_iso()
         self._write_json(self.state_file, self.state)
 
+
+    # =========================
+    # HTCondor 共享目录模式配置
+    # =========================
+    def shared_io_config(self) -> Dict[str, Any]:
+        """读取共享目录模式配置。
+
+        共享目录模式的目标：
+        - 大型输入文件不再通过 HTCondor 传输到执行节点；
+        - 子节点直接通过 UNC 路径读取父节点共享目录；
+        - 输出也直接写入父节点共享目录；
+        - HTCondor 只传输 run_job.cmd、localweb_config.json、result.txt 等小文件。
+        """
+        raw = self.state.get("shared_io_config") or {}
+        if not isinstance(raw, dict):
+            raw = {}
+        return {
+            "enabled": bool(raw.get("enabled")),
+            "local_root": str(raw.get("local_root") or "").strip(),
+            "unc_root": str(raw.get("unc_root") or "").strip(),
+            "share_name": str(raw.get("share_name") or "LocalWebData").strip() or "LocalWebData",
+            "updated_at": str(raw.get("updated_at") or ""),
+        }
+
+    def set_shared_io_config(
+        self,
+        enabled: bool,
+        local_root: str = "",
+        unc_root: str = "",
+        share_name: str = "LocalWebData",
+    ) -> Dict[str, Any]:
+        local_root = str(local_root or "").strip()
+        unc_root = str(unc_root or "").strip()
+        share_name = str(share_name or "LocalWebData").strip() or "LocalWebData"
+
+        if enabled:
+            if not local_root:
+                raise HTCondorClusterError("启用共享目录模式时必须填写父节点本地目录，例如 D:/H8/data。")
+            if not unc_root:
+                host = socket.gethostname()
+                unc_root = f"\\\\{host}\\{share_name}"
+
+        self.state["shared_io_config"] = {
+            "enabled": bool(enabled),
+            "local_root": local_root,
+            "unc_root": unc_root,
+            "share_name": share_name,
+            "updated_at": now_iso(),
+        }
+        self._save_state()
+        data = self.shared_io_config()
+        data["message"] = "共享目录模式已启用" if enabled else "共享目录模式已关闭"
+        return data
+
+    def prepare_local_share(self, local_root: str, share_name: str = "LocalWebData") -> Dict[str, Any]:
+        """在父节点本机创建 Windows 共享目录。
+
+        需要管理员权限。这里尽量自动完成：创建目录、设置 NTFS 权限、创建 net share。
+        子节点必须能访问返回的 UNC 路径，后续任务才可以启用共享目录模式。
+        """
+        if os.name != "nt":
+            raise HTCondorClusterError("共享目录自动配置当前只支持 Windows。")
+
+        local_root = str(local_root or "").strip()
+        share_name = str(share_name or "LocalWebData").strip() or "LocalWebData"
+        if not local_root:
+            raise HTCondorClusterError("本地共享目录不能为空，例如 D:/H8/data。")
+
+        root = Path(local_root)
+        root.mkdir(parents=True, exist_ok=True)
+
+        commands: List[Dict[str, Any]] = []
+
+        # 给常见执行账号和局域网测试账号足够的读写权限。
+        # 注意：共享权限和 NTFS 权限是两套权限，都要放行。
+        grant_targets = ["Users", "Everyone"]
+        for target in grant_targets:
+            result = self._run(["icacls.exe", str(root), "/grant", f"{target}:(OI)(CI)M", "/T", "/C"], timeout=60)
+            commands.append({"command": f"icacls {root} /grant {target}", **result})
+
+        # net share 已存在时会失败，这里先删除再创建，避免旧路径残留。
+        delete_result = self._run(["net.exe", "share", share_name, "/delete", "/y"], timeout=30)
+        commands.append({"command": f"net share {share_name} /delete", **delete_result})
+
+        create_result = self._run(["net.exe", "share", f"{share_name}={str(root)}", "/GRANT:Everyone,FULL"], timeout=60)
+        commands.append({"command": f"net share {share_name}={root}", **create_result})
+        if not create_result.get("ok"):
+            raise HTCondorClusterError(
+                "创建 Windows 共享目录失败。请确认系统以管理员权限启动。"
+                f"输出：{create_result.get('stdout') or create_result.get('stderr') or create_result.get('error')}"
+            )
+
+        host = socket.gethostname()
+        unc_root = f"\\\\{host}\\{share_name}"
+        config = self.set_shared_io_config(True, local_root=str(root), unc_root=unc_root, share_name=share_name)
+        config["commands"] = commands
+        config["message"] = f"已创建共享目录：{unc_root} -> {root}"
+        return config
+
+    def test_shared_io(self) -> Dict[str, Any]:
+        """在当前机器上测试共享目录是否可读写。
+
+        父节点测试通过只代表父节点本机可访问。子节点仍需能访问同一个 UNC 路径。
+        """
+        cfg = self.shared_io_config()
+        if not cfg.get("enabled"):
+            return {"ok": False, "message": "共享目录模式未启用", "config": cfg}
+        unc_root = str(cfg.get("unc_root") or "").strip()
+        if not unc_root:
+            return {"ok": False, "message": "共享 UNC 路径为空", "config": cfg}
+
+        test_dir = Path(unc_root) / "_localweb_share_test"
+        test_file = test_dir / f"test_{int(time.time())}.txt"
+        try:
+            test_dir.mkdir(parents=True, exist_ok=True)
+            test_file.write_text("ok", encoding="utf-8")
+            text = test_file.read_text(encoding="utf-8")
+            try:
+                test_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return {
+                "ok": text == "ok",
+                "message": "共享目录读写测试通过" if text == "ok" else "共享目录读写测试异常",
+                "config": cfg,
+                "test_path": str(test_file),
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "message": f"共享目录读写测试失败：{type(exc).__name__}: {exc}",
+                "config": cfg,
+                "test_path": str(test_file),
+            }
+
     def _condor_bin(self) -> Path:
         runtime = get_htcondor_runtime_status()
         bin_dir = str((runtime.get("installed_runtime") or {}).get("bin_dir") or "").strip()
