@@ -1640,9 +1640,14 @@ else {
             lines.extend([
                 "echo [HTCONDOR] connect shared directory",
                 f'net use "{safe_unc}" /delete /y >nul 2>nul',
-                f'net use "{safe_unc}" "{safe_password}" /user:"{safe_user}" /persistent:no',
+                f'net use "{safe_unc}" /user:"{safe_user}" "{safe_password}" /persistent:no',
                 "if errorlevel 1 (",
                 "  echo [HTCONDOR-ERROR] failed to connect shared directory",
+                "  (",
+                "    echo return_code=1326",
+                "    echo computer=%COMPUTERNAME%",
+                "    echo ended_at=%DATE% %TIME%",
+                "  ) > \"%LOCAL_WEB_JOB_DIR%\\result.txt\"",
                 "  exit /b 1326",
                 ")",
             ])
