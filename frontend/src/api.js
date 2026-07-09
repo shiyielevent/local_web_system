@@ -566,6 +566,31 @@ export async function getHTCondorNodes() {
   return request('/api/htcondor/nodes');
 }
 
+export async function getHTCondorSharedIO() {
+  return request('/api/htcondor/shared-io');
+}
+
+export async function saveHTCondorSharedIO(payload = {}) {
+  return request('/api/htcondor/shared-io', {
+    method: 'POST',
+    body: JSON.stringify(payload || {}),
+  });
+}
+
+export async function prepareHTCondorSharedIO(payload = {}) {
+  return request('/api/htcondor/shared-io/prepare', {
+    method: 'POST',
+    body: JSON.stringify(payload || {}),
+  });
+}
+
+export async function testHTCondorSharedIO() {
+  return request('/api/htcondor/shared-io/test', {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+}
+
 export async function createHTCondorParent(payload = {}) {
   return request('/api/htcondor/create-parent', {
     method: 'POST',
