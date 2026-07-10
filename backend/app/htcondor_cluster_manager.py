@@ -2235,7 +2235,12 @@ else {
         transfer_output_line = f"transfer_output_files = {transfer_output_files}\n" if transfer_output_files else ""
 
         try:
-            request_memory_mb = int(os.environ.get("LOCAL_WEB_HTCONDOR_REQUEST_MEMORY_MB", "16384") or "16384")
+            request_memory_raw = (
+                (env or {}).get("LOCAL_WEB_HTCONDOR_REQUEST_MEMORY_MB")
+                or os.environ.get("LOCAL_WEB_HTCONDOR_REQUEST_MEMORY_MB", "16384")
+                or "16384"
+            )
+            request_memory_mb = int(request_memory_raw)
         except Exception:
             request_memory_mb = 16384
         # 尽量接近手工直接运行 EXE 的资源环境。默认从 8192MB 提高到 16384MB，

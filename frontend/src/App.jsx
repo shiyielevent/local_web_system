@@ -638,6 +638,71 @@ function isActiveTaskStatus(status) {
   return ['queued', 'running'].includes(normalizeTaskStatus(status));
 }
 
+function getTaskLogText(taskOrLogs) {
+  const pieces = [];
+
+  if (Array.isArray(taskOrLogs)) {
+    pieces.push(...taskOrLogs.map((x) => String(x || '')));
+  } else if (taskOrLogs && typeof taskOrLogs === 'object') {
+    const task = taskOrLogs;
+    ['message', 'error', 'stderr', 'stdout', 'detail', 'status_message'].forEach((key) => {
+      if (task[key]) pieces.push(String(task[key]));
+    });
+    if (Array.isArray(task.logs)) {
+      pieces.push(...task.logs.map((x) => String(x || '')));
+    } else if (task.logs) {
+      pieces.push(String(task.logs));
+    }
+    if (Array.isArray(task.children)) {
+      task.children.forEach((child) => {
+        if (Array.isArray(child?.logs)) pieces.push(...child.logs.map((x) => String(x || '')));
+        else if (child?.logs) pieces.push(String(child.logs));
+      });
+    }
+  } else if (taskOrLogs != null) {
+    pieces.push(String(taskOrLogs));
+  }
+
+  return pieces.join('\n');
+}
+
+function isMemoryFailureText(text) {
+  const raw = String(text || '');
+  const lower = raw.toLowerCase();
+  return (
+    lower.includes('memoryerror') ||
+    lower.includes('arraymemoryerror') ||
+    lower.includes('unable to allocate') ||
+    lower.includes('failed to allocate') ||
+    lower.includes('cannot allocate memory') ||
+    lower.includes('bad allocation') ||
+    lower.includes('out of memory') ||
+    lower.includes('not enough memory') ||
+    lower.includes('memory allocation') ||
+    raw.includes('内存不足') ||
+    raw.includes('内存不够') ||
+    raw.includes('内存溢出') ||
+    raw.includes('无法分配内存') ||
+    raw.includes('申请内存失败')
+  );
+}
+
+function isMemoryFailureTask(task) {
+  if (!task) return false;
+  return isMemoryFailureText(getTaskLogText(task));
+}
+
+function getMemoryFailureExcerpt(task, maxLines = 10) {
+  const lines = getTaskLogText(task)
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const important = lines.filter((line) => isMemoryFailureText(line) || /traceback|stderr|exception|failed/i.test(line));
+  const selected = important.length ? important.slice(-maxLines) : lines.slice(-maxLines);
+  return selected.join('\n');
+}
+
 function RunningDots({ active }) {
   const [dots, setDots] = useState('');
   useEffect(() => {
@@ -870,6 +935,18 @@ function getTaskProgressInfo(task, taskLogs, elapsedTextOverride = '') {
   }
 
   if (status === 'failed' || status === 'error' || status === 'timeout') {
+    if (isMemoryFailureText(getTaskLogText(logs))) {
+      return {
+        percent: 100,
+        label: '任务因内存不足失败',
+        detail: elapsedText
+          ? `总耗时：${elapsedText}；系统检测到 MemoryError / Unable to allocate，请清理内存后重新运行`
+          : '系统检测到 MemoryError / Unable to allocate，请清理内存后重新运行',
+        mode: 'failed_memory',
+        color: '#d64545',
+      };
+    }
+
     return {
       percent: 100,
       label: '任务运行失败',
@@ -1197,6 +1274,24 @@ function TaskWindow({ win, onMin, onClose, onFront, onMove, onStop }) {
           </div>
         </div>
 
+        {isMemoryFailureTask(task) && (
+          <div
+            style={{
+              marginTop: 12,
+              padding: 12,
+              borderRadius: 12,
+              background: 'rgba(220,38,38,0.07)',
+              border: '1px solid rgba(220,38,38,0.22)',
+              color: '#991b1b',
+              lineHeight: 1.65,
+              fontSize: 13,
+            }}
+          >
+            <div style={{ fontWeight: 900, marginBottom: 4 }}>检测到内存不足</div>
+            <div>该任务日志中出现 MemoryError / Unable to allocate。请先清理父节点或子节点内存，再重新运行任务。</div>
+          </div>
+        )}
+
         <div style={{ marginTop: 12, fontSize: 14, lineHeight: 1.7 }}>
           <div><strong>任务ID：</strong>{task?.id || '-'}</div>
           <div><strong>模块：</strong>{task?.module_name || '-'}</div>
@@ -1245,6 +1340,139 @@ function TaskWindow({ win, onMin, onClose, onFront, onMove, onStop }) {
             </button>
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+function MemoryWarningWindow({ win, onClose, onFront, onMove }) {
+  const dragRef = useRef(null);
+
+  function onMouseDown(e) {
+    if (e.button !== 0) return;
+    onFront();
+    dragRef.current = {
+      x: e.clientX,
+      y: e.clientY,
+      left: win.left,
+      top: win.top,
+    };
+
+    function onMoveDoc(ev) {
+      if (!dragRef.current) return;
+      const dx = ev.clientX - dragRef.current.x;
+      const dy = ev.clientY - dragRef.current.y;
+      onMove(dragRef.current.left + dx, dragRef.current.top + dy);
+    }
+
+    function onUpDoc() {
+      dragRef.current = null;
+      document.removeEventListener('mousemove', onMoveDoc);
+      document.removeEventListener('mouseup', onUpDoc);
+    }
+
+    document.addEventListener('mousemove', onMoveDoc);
+    document.addEventListener('mouseup', onUpDoc);
+  }
+
+  return (
+    <div
+      style={{
+        position: 'fixed',
+        left: win.left,
+        top: win.top,
+        width: 420,
+        zIndex: win.zIndex,
+        borderRadius: 14,
+        overflow: 'hidden',
+        boxShadow: '0 18px 46px rgba(5,25,55,0.28)',
+        background: 'rgba(245,250,255,0.98)',
+        border: '1px solid rgba(255,255,255,0.35)',
+      }}
+    >
+      <div
+        onMouseDown={onMouseDown}
+        style={{
+          cursor: 'move',
+          background: 'linear-gradient(135deg,#0d4f92 0%,#1565c0 50%,#2c8ae8 100%)',
+          color: '#fff',
+          padding: '10px 14px',
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+        }}
+      >
+        <div style={{ fontWeight: 900 }}>内存不足提醒</div>
+        <button style={{ ...styles.topBtn, padding: '6px 10px' }} onClick={onClose}>
+          关闭
+        </button>
+      </div>
+
+      <div style={{ padding: 16 }}>
+        <div
+          style={{
+            padding: 12,
+            borderRadius: 12,
+            background: 'rgba(220,38,38,0.07)',
+            border: '1px solid rgba(220,38,38,0.22)',
+            color: '#991b1b',
+            lineHeight: 1.65,
+          }}
+        >
+          <div style={{ fontSize: 18, fontWeight: 900, marginBottom: 6 }}>检测到任务因内存不足失败</div>
+          <div>系统在任务日志中识别到 MemoryError / Unable to allocate。请先清理父节点或子节点内存后再重新运行。</div>
+        </div>
+
+        <div style={{ marginTop: 12, fontSize: 14, lineHeight: 1.7, color: '#173353' }}>
+          <div><strong>任务：</strong>{win.moduleName || '-'}</div>
+          <div><strong>任务ID：</strong>{win.taskId || '-'}</div>
+        </div>
+
+        <div
+          style={{
+            marginTop: 12,
+            padding: 12,
+            borderRadius: 12,
+            background: '#f7fbff',
+            border: '1px solid #d7e6f7',
+            color: '#334155',
+            lineHeight: 1.7,
+            fontSize: 13,
+          }}
+        >
+          <div style={{ fontWeight: 900, color: '#12385f', marginBottom: 6 }}>建议处理</div>
+          <div>1. 关闭子节点上的浏览器、VSCode、Anaconda、残留 python.exe 等大内存程序。</div>
+          <div>2. 确认可用物理内存至少 6GB，最好 8GB 以上。</div>
+          <div>3. 如仍失败，重启对应节点后再运行；必要时把远程 EXE 线程限制设为 1。</div>
+        </div>
+
+        {win.excerpt && (
+          <div style={{ marginTop: 12 }}>
+            <div style={{ fontWeight: 800, marginBottom: 8, color: '#173353' }}>识别到的日志片段</div>
+            <div
+              style={{
+                background: '#0a1730',
+                color: '#dfe9ff',
+                borderRadius: 12,
+                padding: 12,
+                maxHeight: 150,
+                overflow: 'auto',
+                fontSize: 12,
+                whiteSpace: 'pre-wrap',
+                fontFamily: 'Consolas, "Microsoft YaHei UI", monospace',
+                lineHeight: 1.45,
+              }}
+            >
+              {win.excerpt}
+            </div>
+          </div>
+        )}
+
+        <div style={{ marginTop: 12, display: 'flex', justifyContent: 'flex-end' }}>
+          <button style={styles.blueBtn} onClick={onClose}>
+            我知道了
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -2203,18 +2431,23 @@ function HTCondorPage({
   const weightRows = Array.isArray(weightPlan.items) ? weightPlan.items : [];
   const [weightMode, setWeightMode] = useState(weightPlan.mode || 'weighted');
   const [nodeWeightsDraft, setNodeWeightsDraft] = useState({});
+  const [nodeProcessSlotsDraft, setNodeProcessSlotsDraft] = useState({});
 
   useEffect(() => {
     const nextWeights = {};
+    const nextProcessSlots = {};
     weightRows.forEach((item) => {
       const machine = String(item.machine || '').trim();
       if (!machine) return;
       const value = Number.parseInt(String(item.weight || item.suggested_weight || 1), 10) || 1;
+      const slotValue = Number.parseInt(String(item.process_slots || item.suggested_process_slots || 1), 10) || 1;
       nextWeights[machine] = Math.max(1, Math.min(8, value));
+      nextProcessSlots[machine] = Math.max(1, Math.min(8, slotValue));
     });
     setNodeWeightsDraft(nextWeights);
+    setNodeProcessSlotsDraft(nextProcessSlots);
     setWeightMode(weightPlan.mode || 'weighted');
-  }, [JSON.stringify(weightRows.map((item) => [item.machine, item.weight, item.suggested_weight])), weightPlan.mode]);
+  }, [JSON.stringify(weightRows.map((item) => [item.machine, item.weight, item.suggested_weight, item.process_slots, item.suggested_process_slots])), weightPlan.mode]);
 
   const setDraftWeight = (machine, value) => {
     const n = Number.parseInt(String(value || '1'), 10) || 1;
@@ -2224,24 +2457,40 @@ function HTCondorPage({
     }));
   };
 
+  const setDraftProcessSlot = (machine, value) => {
+    const n = Number.parseInt(String(value || '1'), 10) || 1;
+    setNodeProcessSlotsDraft((old) => ({
+      ...old,
+      [machine]: Math.max(1, Math.min(8, n)),
+    }));
+  };
+
   const resetWeightsToSuggested = () => {
     const nextWeights = {};
+    const nextProcessSlots = {};
     weightRows.forEach((item) => {
       const machine = String(item.machine || '').trim();
       if (!machine) return;
       nextWeights[machine] = Math.max(1, Math.min(8, Number.parseInt(String(item.suggested_weight || 1), 10) || 1));
+      nextProcessSlots[machine] = Math.max(1, Math.min(8, Number.parseInt(String(item.suggested_process_slots || 1), 10) || 1));
     });
     setNodeWeightsDraft(nextWeights);
+    setNodeProcessSlotsDraft(nextProcessSlots);
     setWeightMode('weighted');
   };
 
   const saveWeights = () => {
     if (typeof onSaveWeights === 'function') {
-      onSaveWeights({ mode: weightMode, weights: nodeWeightsDraft });
+      onSaveWeights({
+        mode: weightMode,
+        weights: nodeWeightsDraft,
+        process_slots: nodeProcessSlotsDraft,
+      });
     }
   };
 
   const weightOptions = Array.from({ length: 8 }, (_, idx) => idx + 1);
+  const processSlotOptions = Array.from({ length: 8 }, (_, idx) => idx + 1);
 
   return (
     <section style={{ display: 'grid', gap: 16, minHeight: 'calc(100vh - 98px)' }}>
@@ -2333,9 +2582,9 @@ function HTCondorPage({
           }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
               <div>
-                <div style={{ fontSize: 16, fontWeight: 900, color: '#12385f' }}>节点信息与任务权重</div>
+                <div style={{ fontSize: 16, fontWeight: 900, color: '#12385f' }}>节点信息、任务权重与进程槽</div>
                 <div style={{ marginTop: 4, fontSize: 12, color: '#64748b', lineHeight: 1.45 }}>
-                  默认按 CPU/内存生成建议权重；管理员可手动调整。权重只影响输入文件数量分配。
+                  权重控制输入文件数量分配；进程槽控制同一节点同时运行的 EXE 数量。
                 </div>
               </div>
               <select
@@ -2353,6 +2602,7 @@ function HTCondorPage({
                 {weightRows.map((node) => {
                   const machine = String(node.machine || '').trim();
                   const draftValue = nodeWeightsDraft[machine] || node.weight || node.suggested_weight || 1;
+                  const draftProcessSlot = nodeProcessSlotsDraft[machine] || node.process_slots || node.suggested_process_slots || 1;
                   const memGb = node.memory ? (Number(node.memory) / 1024).toFixed(1) : '-';
                   const isCurrent = machine && machine === info.machine;
                   return (
@@ -2360,7 +2610,7 @@ function HTCondorPage({
                       key={machine || node.name}
                       style={{
                         display: 'grid',
-                        gridTemplateColumns: 'minmax(0, 1.2fr) 0.8fr 0.75fr 94px',
+                        gridTemplateColumns: 'minmax(0, 1.15fr) 0.72fr 0.78fr 92px 92px',
                         gap: 8,
                         alignItems: 'center',
                         padding: '9px 10px',
@@ -2382,28 +2632,44 @@ function HTCondorPage({
                         <div>内存：{memGb}GB</div>
                       </div>
                       <div style={{ fontSize: 12, color: '#475569', lineHeight: 1.45 }}>
-                        <div>建议：<strong style={{ color: '#17406b' }}>{node.suggested_weight || 1}</strong></div>
+                        <div>权重建议：<strong style={{ color: '#17406b' }}>{node.suggested_weight || 1}</strong></div>
+                        <div>槽建议：<strong style={{ color: '#17406b' }}>{node.suggested_process_slots || 1}</strong></div>
                         <div>来源：{node.source === 'manual' ? '手动' : (node.source === 'equal' ? '平均' : '建议')}</div>
                       </div>
-                      <select
-                        style={{ ...styles.input, minHeight: 36, padding: '0 8px', fontSize: 13 }}
-                        value={draftValue}
-                        disabled={weightMode === 'equal'}
-                        onChange={(e) => setDraftWeight(machine, e.target.value)}
-                      >
-                        {weightOptions.map((value) => (
-                          <option key={value} value={value}>{value}</option>
-                        ))}
-                      </select>
+                      <div>
+                        <div style={{ fontSize: 11, fontWeight: 900, color: '#64748b', marginBottom: 4 }}>权重</div>
+                        <select
+                          style={{ ...styles.input, minHeight: 36, padding: '0 8px', fontSize: 13 }}
+                          value={draftValue}
+                          disabled={weightMode === 'equal'}
+                          onChange={(e) => setDraftWeight(machine, e.target.value)}
+                        >
+                          {weightOptions.map((value) => (
+                            <option key={value} value={value}>{value}</option>
+                          ))}
+                        </select>
+                      </div>
+                      <div>
+                        <div style={{ fontSize: 11, fontWeight: 900, color: '#64748b', marginBottom: 4 }}>进程槽</div>
+                        <select
+                          style={{ ...styles.input, minHeight: 36, padding: '0 8px', fontSize: 13 }}
+                          value={draftProcessSlot}
+                          onChange={(e) => setDraftProcessSlot(machine, e.target.value)}
+                        >
+                          {processSlotOptions.map((value) => (
+                            <option key={value} value={value}>{value}</option>
+                          ))}
+                        </select>
+                      </div>
                     </div>
                   );
                 })}
                 <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end', marginTop: 2 }}>
                   <button style={{ ...styles.whiteBtn, padding: '8px 12px' }} disabled={!!busy} onClick={resetWeightsToSuggested}>
-                    恢复建议权重
+                    恢复建议权重/槽
                   </button>
                   <button style={{ ...styles.blueBtn, padding: '8px 12px' }} disabled={!!busy} onClick={saveWeights}>
-                    保存权重
+                    保存权重与进程槽
                   </button>
                 </div>
               </div>
@@ -2643,8 +2909,10 @@ function App() {
 
   const [windows, setWindows] = useState([]);
   const [taskTrayMinimized, setTaskTrayMinimized] = useState(false);
+  const [memoryWarningWindow, setMemoryWarningWindow] = useState(null);
   const zRef = useRef(2000);
   const pollTimerRef = useRef(null);
+  const memoryWarningSeenRef = useRef(new Set());
 
   const isAdmin = currentUser?.role === 'admin';
   const minimizedTaskCount = windows.filter((w) => w.minimized).length;
@@ -2877,6 +3145,7 @@ useEffect(() => {
 
             try {
               const detail = await getTask(w.taskId);
+              showMemoryWarningForTask(detail);
 
               const oldStatus = w.task?.status;
               const newStatus = detail?.status;
@@ -3553,8 +3822,30 @@ async function installModuleFolder() {
   }
 
   async function handleHTCondorSaveWeights(payload) {
-    return runHTCondorAction('保存节点任务权重', () => saveHTCondorNodeWeights(payload));
+    return runHTCondorAction('保存节点任务权重与进程槽', () => saveHTCondorNodeWeights(payload));
   }
+
+function showMemoryWarningForTask(task) {
+  if (!isMemoryFailureTask(task)) return;
+
+  const taskId = String(task?.id || task?.task_id || 'unknown');
+  const key = `memory_warning_${taskId}`;
+  if (memoryWarningSeenRef.current.has(key)) return;
+  memoryWarningSeenRef.current.add(key);
+
+  zRef.current += 1;
+  const { left, top } = getCenteredTaskWindowPosition(36);
+  setTaskTrayMinimized(false);
+  setMemoryWarningWindow({
+    id: key,
+    taskId,
+    moduleName: task?.module_name || task?.module_id || '未知任务',
+    excerpt: getMemoryFailureExcerpt(task),
+    left,
+    top,
+    zIndex: zRef.current,
+  });
+}
 
 function getCenteredTaskWindowPosition(offset = 0) {
   const popupWidth = 420;
@@ -3567,6 +3858,7 @@ function getCenteredTaskWindowPosition(offset = 0) {
 }
 function addTaskWindow(task, title) {
   const timedTask = stampTaskTiming(null, task);
+  showMemoryWarningForTask(timedTask);
   zRef.current += 1;
   setWindows((prev) => {
     const offset = (prev.length % 4) * 24;
@@ -5941,6 +6233,18 @@ function renderTaskManagementPage() {
         />
       ))}
 
+      {memoryWarningWindow && (
+        <MemoryWarningWindow
+          win={memoryWarningWindow}
+          onClose={() => setMemoryWarningWindow(null)}
+          onFront={() => {
+            zRef.current += 1;
+            setMemoryWarningWindow((old) => (old ? { ...old, zIndex: zRef.current } : old));
+          }}
+          onMove={(left, top) => setMemoryWarningWindow((old) => (old ? { ...old, left, top } : old))}
+        />
+      )}
+
       
       {windows.some((w) => w.minimized) && (
           <TaskTrayFloatingWindow
@@ -6003,7 +6307,7 @@ function renderTaskManagementPage() {
         <SimpleOverlay
           title="当前配置的共享目录"
           onClose={() => setHTCondorShareListModal(null)}
-          width="min(760px, 96vw)"
+          width="min(820px, 96vw)"
         >
           <div style={{ color: '#173353', lineHeight: 1.7 }}>
             <div
@@ -6037,34 +6341,58 @@ function renderTaskManagementPage() {
                       boxShadow: '0 6px 16px rgba(8,34,70,0.05)',
                     }}
                   >
-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10 }}>
-                      <div style={{ fontWeight: 900, color: '#17406b' }}>共享目录 {idx + 1}：{item.share_name || '-'}</div>
-                      <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-                        <span style={{
-                          padding: '4px 9px',
-                          borderRadius: 999,
-                          background: item.enabled !== false ? '#dcfce7' : '#fee2e2',
-                          color: item.enabled !== false ? '#166534' : '#991b1b',
-                          fontSize: 12,
-                          fontWeight: 800,
-                          whiteSpace: 'nowrap',
-                        }}>
-                          {item.enabled !== false ? '已启用' : '未启用'}
-                        </span>
-                        <button
-                          style={{ ...styles.redBtn, padding: '6px 10px', borderRadius: 8, fontSize: 12 }}
-                          disabled={!!htcondorBusy}
-                          onClick={() => handleHTCondorAskDeleteShare(item, idx)}
-                        >
-                          删除
-                        </button>
+                    <div
+                      style={{
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'flex-start',
+                        gap: 12,
+                        flexWrap: 'wrap',
+                      }}
+                    >
+                      <div style={{ fontWeight: 900, color: '#17406b', minWidth: 0 }}>
+                        共享目录 {idx + 1}：{item.share_name || '-'}
                       </div>
+                      <span style={{
+                        padding: '4px 9px',
+                        borderRadius: 999,
+                        background: item.enabled !== false ? '#dcfce7' : '#fee2e2',
+                        color: item.enabled !== false ? '#166534' : '#991b1b',
+                        fontSize: 12,
+                        fontWeight: 800,
+                        whiteSpace: 'nowrap',
+                      }}>
+                        {item.enabled !== false ? '已启用' : '未启用'}
+                      </span>
                     </div>
                     <div style={{ marginTop: 8, fontSize: 13, color: '#475569', overflowWrap: 'anywhere' }}>
                       <div><strong>父节点本地目录：</strong>{item.local_root || '-'}</div>
                       <div><strong>UNC 路径：</strong>{item.unc_root || '-'}</div>
                       <div><strong>共享名：</strong>{item.share_name || '-'}</div>
                       {item.connect_message && <div><strong>连接结果：</strong>{item.connect_message}</div>}
+                    </div>
+                    <div
+                      style={{
+                        marginTop: 10,
+                        paddingTop: 10,
+                        borderTop: '1px dashed #d7e6f7',
+                        display: 'flex',
+                        justifyContent: 'flex-end',
+                      }}
+                    >
+                      <button
+                        style={{
+                          ...styles.redBtn,
+                          padding: '7px 12px',
+                          borderRadius: 8,
+                          fontSize: 12,
+                          minWidth: 108,
+                        }}
+                        disabled={!!htcondorBusy}
+                        onClick={() => handleHTCondorAskDeleteShare(item, idx)}
+                      >
+                        删除此共享目录
+                      </button>
                     </div>
                   </div>
                 ))}

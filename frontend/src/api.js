@@ -633,6 +633,7 @@ export async function saveHTCondorNodeWeights(payload = {}) {
     body: JSON.stringify({
       mode: payload.mode || 'weighted',
       weights: payload.weights || {},
+      process_slots: payload.process_slots || payload.processSlots || {},
     }),
   });
 }
