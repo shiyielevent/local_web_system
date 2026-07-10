@@ -619,7 +619,7 @@ export async function leaveHTCondorPool() {
   });
 }
 
-// HTCondor 节点权重接口：真实调用后端保存/读取权重。
+// HTCondor 节点分配比例接口：所有当前节点比例合计必须为 100%。
 // 后端接口：
 //   GET  /api/htcondor/node-weights
 //   POST /api/htcondor/node-weights
@@ -632,6 +632,7 @@ export async function saveHTCondorNodeWeights(payload = {}) {
     method: 'POST',
     body: JSON.stringify({
       mode: payload.mode || 'weighted',
+      weight_unit: 'percent',
       weights: payload.weights || {},
       process_slots: payload.process_slots || payload.processSlots || {},
     }),

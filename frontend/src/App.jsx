@@ -2433,28 +2433,113 @@ function HTCondorPage({
   const [nodeWeightsDraft, setNodeWeightsDraft] = useState({});
   const [nodeProcessSlotsDraft, setNodeProcessSlotsDraft] = useState({});
 
+  const normalizePercentDraft = (rawMap = {}) => {
+    const machines = weightRows
+      .map((item) => String(item.machine || '').trim())
+      .filter(Boolean);
+    if (!machines.length) return {};
+
+    const values = machines.map((machine) => {
+      const raw = Number(rawMap[machine]);
+      return Number.isFinite(raw) ? Math.max(0, raw) : 0;
+    });
+    let total = values.reduce((sum, value) => sum + value, 0);
+    const working = total > 0 ? values : machines.map(() => 1);
+    total = working.reduce((sum, value) => sum + value, 0);
+
+    const exact = working.map((value) => (value * 100) / total);
+    const result = exact.map((value) => Math.floor(value));
+    let remaining = 100 - result.reduce((sum, value) => sum + value, 0);
+    const order = exact
+      .map((value, index) => ({ index, remainder: value - result[index], source: working[index] }))
+      .sort((a, b) => (b.remainder - a.remainder) || (b.source - a.source) || (a.index - b.index));
+
+    for (let i = 0; i < remaining; i += 1) {
+      result[order[i % order.length].index] += 1;
+    }
+
+    return Object.fromEntries(machines.map((machine, index) => [machine, result[index]]));
+  };
+
+  const makeEqualPercentDraft = () => {
+    const raw = {};
+    weightRows.forEach((item) => {
+      const machine = String(item.machine || '').trim();
+      if (machine) raw[machine] = 1;
+    });
+    return normalizePercentDraft(raw);
+  };
+
   useEffect(() => {
-    const nextWeights = {};
+    const nextWeightsRaw = {};
     const nextProcessSlots = {};
     weightRows.forEach((item) => {
       const machine = String(item.machine || '').trim();
       if (!machine) return;
-      const value = Number.parseInt(String(item.weight || item.suggested_weight || 1), 10) || 1;
-      const slotValue = Number.parseInt(String(item.process_slots || item.suggested_process_slots || 1), 10) || 1;
-      nextWeights[machine] = Math.max(1, Math.min(8, value));
+      const rawWeight = item.weight_percent ?? item.weight ?? item.suggested_weight_percent ?? item.suggested_weight ?? 0;
+      const value = Number.parseInt(String(rawWeight), 10);
+      const slotValue = Number.parseInt(String(item.process_slots ?? item.suggested_process_slots ?? 1), 10) || 1;
+      nextWeightsRaw[machine] = Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : 0;
       nextProcessSlots[machine] = Math.max(1, Math.min(8, slotValue));
     });
-    setNodeWeightsDraft(nextWeights);
+
+    const nextMode = weightPlan.mode || 'weighted';
+    setNodeWeightsDraft(
+      nextMode === 'equal'
+        ? normalizePercentDraft(Object.fromEntries(weightRows.map((item) => [String(item.machine || '').trim(), 1])))
+        : normalizePercentDraft(nextWeightsRaw)
+    );
     setNodeProcessSlotsDraft(nextProcessSlots);
-    setWeightMode(weightPlan.mode || 'weighted');
-  }, [JSON.stringify(weightRows.map((item) => [item.machine, item.weight, item.suggested_weight, item.process_slots, item.suggested_process_slots])), weightPlan.mode]);
+    setWeightMode(nextMode);
+  }, [JSON.stringify(weightRows.map((item) => [
+    item.machine,
+    item.weight_percent,
+    item.weight,
+    item.suggested_weight_percent,
+    item.suggested_weight,
+    item.process_slots,
+    item.suggested_process_slots,
+  ])), weightPlan.mode]);
 
   const setDraftWeight = (machine, value) => {
-    const n = Number.parseInt(String(value || '1'), 10) || 1;
-    setNodeWeightsDraft((old) => ({
-      ...old,
-      [machine]: Math.max(1, Math.min(8, n)),
-    }));
+    const parsed = Number.parseInt(String(value ?? '0'), 10);
+    const nextValue = Number.isFinite(parsed) ? Math.max(0, Math.min(100, parsed)) : 0;
+
+    // 编辑任意一个节点时，自动按现有比例调整其他节点，确保合计始终为 100%。
+    setNodeWeightsDraft((old) => {
+      const machines = weightRows
+        .map((item) => String(item.machine || '').trim())
+        .filter(Boolean);
+      const others = machines.filter((name) => name !== machine);
+      if (!others.length) return { ...old, [machine]: 100 };
+
+      const remaining = 100 - nextValue;
+      const sourceValues = others.map((name) => Math.max(0, Number(old[name]) || 0));
+      let sourceTotal = sourceValues.reduce((sum, current) => sum + current, 0);
+      const working = sourceTotal > 0 ? sourceValues : others.map(() => 1);
+      sourceTotal = working.reduce((sum, current) => sum + current, 0);
+
+      const exact = working.map((current) => (current * remaining) / sourceTotal);
+      const allocated = exact.map((current) => Math.floor(current));
+      let left = remaining - allocated.reduce((sum, current) => sum + current, 0);
+      const order = exact
+        .map((current, index) => ({
+          index,
+          remainder: current - allocated[index],
+          source: working[index],
+        }))
+        .sort((a, b) => (b.remainder - a.remainder) || (b.source - a.source) || (a.index - b.index));
+
+      for (let index = 0; index < left; index += 1) {
+        allocated[order[index % order.length].index] += 1;
+      }
+
+      const next = { ...old, [machine]: nextValue };
+      others.forEach((name, index) => {
+        next[name] = allocated[index];
+      });
+      return next;
+    });
   };
 
   const setDraftProcessSlot = (machine, value) => {
@@ -2465,31 +2550,52 @@ function HTCondorPage({
     }));
   };
 
+  const changeWeightMode = (mode) => {
+    setWeightMode(mode);
+    if (mode === 'equal') {
+      setNodeWeightsDraft(makeEqualPercentDraft());
+    }
+  };
+
   const resetWeightsToSuggested = () => {
-    const nextWeights = {};
+    const nextWeightsRaw = {};
     const nextProcessSlots = {};
     weightRows.forEach((item) => {
       const machine = String(item.machine || '').trim();
       if (!machine) return;
-      nextWeights[machine] = Math.max(1, Math.min(8, Number.parseInt(String(item.suggested_weight || 1), 10) || 1));
+      const suggested = item.suggested_weight_percent ?? item.suggested_weight ?? 0;
+      nextWeightsRaw[machine] = Math.max(0, Math.min(100, Number.parseInt(String(suggested), 10) || 0));
       nextProcessSlots[machine] = Math.max(1, Math.min(8, Number.parseInt(String(item.suggested_process_slots || 1), 10) || 1));
     });
-    setNodeWeightsDraft(nextWeights);
+    setNodeWeightsDraft(normalizePercentDraft(nextWeightsRaw));
     setNodeProcessSlotsDraft(nextProcessSlots);
     setWeightMode('weighted');
   };
 
+  const activeWeightMachines = weightRows
+    .map((item) => String(item.machine || '').trim())
+    .filter(Boolean);
+  const weightTotal = activeWeightMachines.reduce(
+    (sum, machine) => sum + (Number(nodeWeightsDraft[machine]) || 0),
+    0
+  );
+  const weightsValid = weightMode === 'equal' || weightTotal === 100;
+
   const saveWeights = () => {
+    if (!weightsValid) {
+      window.alert(`所有当前节点的分配比例之和必须为 100%，当前合计为 ${weightTotal}%。`);
+      return;
+    }
     if (typeof onSaveWeights === 'function') {
       onSaveWeights({
         mode: weightMode,
-        weights: nodeWeightsDraft,
+        weight_unit: 'percent',
+        weights: weightMode === 'equal' ? makeEqualPercentDraft() : nodeWeightsDraft,
         process_slots: nodeProcessSlotsDraft,
       });
     }
   };
 
-  const weightOptions = Array.from({ length: 8 }, (_, idx) => idx + 1);
   const processSlotOptions = Array.from({ length: 8 }, (_, idx) => idx + 1);
 
   return (
@@ -2582,17 +2688,17 @@ function HTCondorPage({
           }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
               <div>
-                <div style={{ fontSize: 16, fontWeight: 900, color: '#12385f' }}>节点信息、任务权重与进程槽</div>
+                <div style={{ fontSize: 16, fontWeight: 900, color: '#12385f' }}>节点信息、任务分配比例与进程槽</div>
                 <div style={{ marginTop: 4, fontSize: 12, color: '#64748b', lineHeight: 1.45 }}>
-                  权重控制输入文件数量分配；进程槽控制同一节点同时运行的 EXE 数量。
+                  分配比例控制节点承担的预计输入工作量，所有节点合计必须为 100%；编辑任一节点时会自动调整其他节点。进程槽控制同一节点同时运行的 EXE 数量。
                 </div>
               </div>
               <select
                 style={{ ...styles.input, width: 128, minHeight: 38, fontSize: 13 }}
                 value={weightMode}
-                onChange={(e) => setWeightMode(e.target.value)}
+                onChange={(e) => changeWeightMode(e.target.value)}
               >
-                <option value="weighted">按权重</option>
+                <option value="weighted">按百分比分配</option>
                 <option value="equal">平均分配</option>
               </select>
             </div>
@@ -2601,8 +2707,8 @@ function HTCondorPage({
               <div style={{ display: 'grid', gap: 8, marginTop: 10 }}>
                 {weightRows.map((node) => {
                   const machine = String(node.machine || '').trim();
-                  const draftValue = nodeWeightsDraft[machine] || node.weight || node.suggested_weight || 1;
-                  const draftProcessSlot = nodeProcessSlotsDraft[machine] || node.process_slots || node.suggested_process_slots || 1;
+                  const draftValue = nodeWeightsDraft[machine] ?? node.weight_percent ?? node.weight ?? node.suggested_weight_percent ?? node.suggested_weight ?? 0;
+                  const draftProcessSlot = nodeProcessSlotsDraft[machine] ?? node.process_slots ?? node.suggested_process_slots ?? 1;
                   const memGb = node.memory ? (Number(node.memory) / 1024).toFixed(1) : '-';
                   const isCurrent = machine && machine === info.machine;
                   return (
@@ -2610,7 +2716,7 @@ function HTCondorPage({
                       key={machine || node.name}
                       style={{
                         display: 'grid',
-                        gridTemplateColumns: 'minmax(0, 1.15fr) 0.72fr 0.78fr 92px 92px',
+                        gridTemplateColumns: 'minmax(0, 1.12fr) 0.7fr 0.78fr 144px 92px',
                         gap: 8,
                         alignItems: 'center',
                         padding: '9px 10px',
@@ -2632,22 +2738,89 @@ function HTCondorPage({
                         <div>内存：{memGb}GB</div>
                       </div>
                       <div style={{ fontSize: 12, color: '#475569', lineHeight: 1.45 }}>
-                        <div>权重建议：<strong style={{ color: '#17406b' }}>{node.suggested_weight || 1}</strong></div>
+                        <div>比例建议：<strong style={{ color: '#17406b' }}>{node.suggested_weight_percent ?? node.suggested_weight ?? 0}%</strong></div>
                         <div>槽建议：<strong style={{ color: '#17406b' }}>{node.suggested_process_slots || 1}</strong></div>
                         <div>来源：{node.source === 'manual' ? '手动' : (node.source === 'equal' ? '平均' : '建议')}</div>
                       </div>
                       <div>
-                        <div style={{ fontSize: 11, fontWeight: 900, color: '#64748b', marginBottom: 4 }}>权重</div>
-                        <select
-                          style={{ ...styles.input, minHeight: 36, padding: '0 8px', fontSize: 13 }}
-                          value={draftValue}
-                          disabled={weightMode === 'equal'}
-                          onChange={(e) => setDraftWeight(machine, e.target.value)}
-                        >
-                          {weightOptions.map((value) => (
-                            <option key={value} value={value}>{value}</option>
-                          ))}
-                        </select>
+                        <div style={{ fontSize: 11, fontWeight: 900, color: '#64748b', marginBottom: 4 }}>分配比例</div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                          <button
+                            type="button"
+                            title="减少 1%"
+                            aria-label={`${machine} 分配比例减少 1%`}
+                            disabled={weightMode === 'equal' || Number(draftValue) <= 0}
+                            onClick={() => setDraftWeight(machine, (Number(draftValue) || 0) - 1)}
+                            style={{
+                              width: 30,
+                              minWidth: 30,
+                              height: 36,
+                              borderRadius: 8,
+                              border: '1px solid #b9cce0',
+                              background: '#ffffff',
+                              color: '#17406b',
+                              fontSize: 22,
+                              fontWeight: 900,
+                              lineHeight: 1,
+                              padding: 0,
+                              display: 'inline-flex',
+                              alignItems: 'center',
+                              justifyContent: 'center',
+                              cursor: weightMode === 'equal' || Number(draftValue) <= 0 ? 'not-allowed' : 'pointer',
+                              opacity: weightMode === 'equal' || Number(draftValue) <= 0 ? 0.45 : 1,
+                              userSelect: 'none',
+                            }}
+                          >
+                            −
+                          </button>
+                          <input
+                            type="text"
+                            inputMode="numeric"
+                            pattern="[0-9]*"
+                            style={{
+                              ...styles.input,
+                              width: 48,
+                              minWidth: 48,
+                              minHeight: 36,
+                              padding: '0 5px',
+                              fontSize: 14,
+                              fontWeight: 800,
+                              textAlign: 'center',
+                            }}
+                            value={draftValue}
+                            disabled={weightMode === 'equal'}
+                            onChange={(e) => setDraftWeight(machine, e.target.value.replace(/\D/g, ''))}
+                          />
+                          <button
+                            type="button"
+                            title="增加 1%"
+                            aria-label={`${machine} 分配比例增加 1%`}
+                            disabled={weightMode === 'equal' || Number(draftValue) >= 100}
+                            onClick={() => setDraftWeight(machine, (Number(draftValue) || 0) + 1)}
+                            style={{
+                              width: 30,
+                              minWidth: 30,
+                              height: 36,
+                              borderRadius: 8,
+                              border: '1px solid #b9cce0',
+                              background: '#ffffff',
+                              color: '#17406b',
+                              fontSize: 22,
+                              fontWeight: 900,
+                              lineHeight: 1,
+                              padding: 0,
+                              display: 'inline-flex',
+                              alignItems: 'center',
+                              justifyContent: 'center',
+                              cursor: weightMode === 'equal' || Number(draftValue) >= 100 ? 'not-allowed' : 'pointer',
+                              opacity: weightMode === 'equal' || Number(draftValue) >= 100 ? 0.45 : 1,
+                              userSelect: 'none',
+                            }}
+                          >
+                            +
+                          </button>
+                          <span style={{ fontSize: 13, fontWeight: 900, color: '#475569' }}>%</span>
+                        </div>
                       </div>
                       <div>
                         <div style={{ fontSize: 11, fontWeight: 900, color: '#64748b', marginBottom: 4 }}>进程槽</div>
@@ -2664,18 +2837,42 @@ function HTCondorPage({
                     </div>
                   );
                 })}
-                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end', marginTop: 2 }}>
-                  <button style={{ ...styles.whiteBtn, padding: '8px 12px' }} disabled={!!busy} onClick={resetWeightsToSuggested}>
-                    恢复建议权重/槽
-                  </button>
-                  <button style={{ ...styles.blueBtn, padding: '8px 12px' }} disabled={!!busy} onClick={saveWeights}>
-                    保存权重与进程槽
-                  </button>
+                <div style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  gap: 10,
+                  flexWrap: 'wrap',
+                  marginTop: 2,
+                }}>
+                  <div style={{
+                    padding: '7px 10px',
+                    borderRadius: 10,
+                    border: `1px solid ${weightsValid ? '#b7e4c7' : '#fecaca'}`,
+                    background: weightsValid ? '#f0fdf4' : '#fff1f2',
+                    color: weightsValid ? '#166534' : '#b91c1c',
+                    fontSize: 12,
+                    fontWeight: 900,
+                  }}>
+                    当前分配比例合计：{weightTotal}% {weightsValid ? '✓' : '（必须为100%）'}
+                  </div>
+                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                    <button style={{ ...styles.whiteBtn, padding: '8px 12px' }} disabled={!!busy} onClick={resetWeightsToSuggested}>
+                      恢复建议比例/槽
+                    </button>
+                    <button
+                      style={{ ...styles.blueBtn, padding: '8px 12px', opacity: weightsValid ? 1 : 0.55 }}
+                      disabled={!!busy || !weightsValid}
+                      onClick={saveWeights}
+                    >
+                      保存分配比例与进程槽
+                    </button>
+                  </div>
                 </div>
               </div>
             ) : (
               <div style={{ marginTop: 10, color: '#64748b', fontSize: 13 }}>
-                暂未发现执行节点。启动父节点或加入子节点后，这里会显示节点权重设置。
+                暂未发现执行节点。启动父节点或加入子节点后，这里会显示节点分配比例设置。
               </div>
             )}
           </div>
@@ -3822,7 +4019,7 @@ async function installModuleFolder() {
   }
 
   async function handleHTCondorSaveWeights(payload) {
-    return runHTCondorAction('保存节点任务权重与进程槽', () => saveHTCondorNodeWeights(payload));
+    return runHTCondorAction('保存节点任务分配比例与进程槽', () => saveHTCondorNodeWeights(payload));
   }
 
 function showMemoryWarningForTask(task) {

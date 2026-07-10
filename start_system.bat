@@ -7,6 +7,13 @@ REM All environment preparation is centralized in:
 REM   backend\bootstrap_env.ps1
 REM ============================================================
 
+
+REM HTCondor automatic resource planning (module performance profile + node CPU/RAM).
+REM Do not set a global thread limit by default; task_manager.py calculates it per node/job.
+if not defined LOCAL_WEB_HTCONDOR_DEFAULT_PEAK_MEMORY_MB set "LOCAL_WEB_HTCONDOR_DEFAULT_PEAK_MEMORY_MB=4096"
+if not defined LOCAL_WEB_HTCONDOR_DEFAULT_THREADS_PER_EXE set "LOCAL_WEB_HTCONDOR_DEFAULT_THREADS_PER_EXE=4"
+if not defined LOCAL_WEB_HTCONDOR_NODE_STATUS_CACHE_SECONDS set "LOCAL_WEB_HTCONDOR_NODE_STATUS_CACHE_SECONDS=2.0"
+
 set "PROJECT_ROOT=%~dp0"
 set "BOOTSTRAP_PS1=%PROJECT_ROOT%backend\bootstrap_env.ps1"
 

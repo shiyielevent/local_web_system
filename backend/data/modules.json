@@ -80,7 +80,17 @@
     "dependency_search_dirs": [],
     "resource_dirs": [],
     "_manifest_format": "executable_module_json",
-    "_param_json_path": "D:\\NEPU\\H8\\CM_CTH_2\\CTH\\dist\\CM_CTH_2\\config.json"
+    "_param_json_path": "D:\\NEPU\\H8\\CM_CTH_2\\CTH\\dist\\CM_CTH_2\\config.json",
+    "performance": {
+      "estimated_peak_memory_mb": 5200,
+      "request_memory_mb": 6144,
+      "preferred_threads": 8,
+      "min_threads_per_exe": 4,
+      "max_process_slots": 2,
+      "reserved_cpus": 4,
+      "reserved_memory_mb": 3072,
+      "memory_headroom_ratio": 1.15
+    }
   },
   {
     "id": "h8aod",

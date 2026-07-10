@@ -50,6 +50,15 @@ class HTCondorClusterManager:
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
         self.default_timeout_seconds = int(os.environ.get("LOCAL_WEB_HTCONDOR_JOB_TIMEOUT", "604800"))
+        # 作业监控轮询间隔。默认 1.5 秒，减少多个并发子任务同时每秒读取日志造成的磁盘 I/O。
+        # 如需更快刷新可设置 LOCAL_WEB_HTCONDOR_POLL_SECONDS=1；如任务很多可设为 2~3。
+        try:
+            self.job_poll_seconds = max(
+                0.5,
+                min(10.0, float(os.environ.get("LOCAL_WEB_HTCONDOR_POLL_SECONDS", "1.5") or "1.5")),
+            )
+        except Exception:
+            self.job_poll_seconds = 1.5
         self.running_jobs = {}
         self.state = self._load_state()
 
@@ -91,6 +100,62 @@ class HTCondorClusterManager:
             return text
         except Exception:
             return raw.decode(self._win_text_encoding(), errors="replace")
+
+    def _decode_text_bytes_auto(self, raw: bytes, at_start: bool = False) -> str:
+        """解码日志字节，兼容 UTF-8、UTF-16 BOM 和 Windows 本地编码。"""
+        if not raw:
+            return ""
+        try:
+            if at_start and raw.startswith(b"\xff\xfe"):
+                return raw.decode("utf-16-le", errors="replace").lstrip("\ufeff")
+            if at_start and raw.startswith(b"\xfe\xff"):
+                return raw.decode("utf-16-be", errors="replace").lstrip("\ufeff")
+            if at_start and raw.startswith(b"\xef\xbb\xbf"):
+                return raw.decode("utf-8-sig", errors="replace")
+
+            text = raw.decode("utf-8", errors="replace")
+            if "�" in text and os.name == "nt":
+                alt = raw.decode(self._win_text_encoding(), errors="replace")
+                if alt.count("�") < text.count("�"):
+                    return alt
+            return text
+        except Exception:
+            return raw.decode(self._win_text_encoding(), errors="replace")
+
+    def _read_text_delta_auto(self, path: Path, offset: int = 0) -> tuple[str, int]:
+        """只读取日志文件从 offset 之后新增的字节。
+
+        旧实现每轮都读取完整 stdout/stderr/event.log，日志越长，重复读取量越大。
+        新实现只读取新增部分；若文件被截断或重新创建，则自动从头读取。
+        """
+        try:
+            if not path.is_file():
+                return "", max(0, int(offset or 0))
+            size = int(path.stat().st_size)
+            current = max(0, int(offset or 0))
+            if size < current:
+                current = 0
+            if size == current:
+                return "", current
+            with path.open("rb") as stream:
+                stream.seek(current)
+                raw = stream.read()
+            return self._decode_text_bytes_auto(raw, at_start=(current == 0)), current + len(raw)
+        except Exception:
+            return "", max(0, int(offset or 0))
+
+    def _emit_live_piece(self, callback, job_id: str, prefix: str, piece: str):
+        """直接发送增量日志片段，避免再次按完整文本长度切片。"""
+        if callback is None or not piece:
+            return
+        try:
+            callback({
+                "type": str(prefix or "event").lower(),
+                "job_id": job_id,
+                "text": piece,
+            })
+        except Exception:
+            pass
 
     def _win_text_encoding(self) -> str:
         # Windows PowerShell 5.1 的错误输出通常是系统本地编码，
@@ -1384,7 +1449,7 @@ finally {{
         args = [self._exe("condor_status.exe")]
         if pool_ip:
             args.extend(["-pool", f"{pool_ip}:9618"])
-        args.extend(["-af", "Name", "Machine", "State", "Activity", "Cpus", "Memory"])
+        args.extend(["-af", "Name", "Machine", "State", "Activity", "Cpus", "Memory", "SlotType", "PartitionableSlot"])
         result = self._run(args, timeout=15)
         text = "\n".join(x for x in [result.get("stdout", ""), result.get("stderr", ""), result.get("error", "")] if x).strip()
         items = []
@@ -1398,6 +1463,8 @@ finally {{
                     "activity": parts[3],
                     "cpus": parts[4],
                     "memory": parts[5],
+                    "slot_type": parts[6] if len(parts) >= 7 else "",
+                    "partitionable": str(parts[7]).lower() == "true" if len(parts) >= 8 else False,
                 })
         return {"ok": bool(result.get("ok")), "text": text, "items": items}
 
@@ -1978,6 +2045,29 @@ else {
             seen.add(key)
             self._grant_one_path_for_job(p)
 
+    def _local_machine_names(self) -> set[str]:
+        """返回当前父节点可能出现在 HTCondor Machine 字段中的名字。"""
+        names: set[str] = set()
+        for value in [
+            os.environ.get("COMPUTERNAME", ""),
+            os.environ.get("HOSTNAME", ""),
+            socket.gethostname(),
+            socket.getfqdn(),
+        ]:
+            text = str(value or "").strip().lower()
+            if text:
+                names.add(text)
+                names.add(text.split(".")[0])
+        return names
+
+    def _is_local_target_machine(self, target_machine: str) -> bool:
+        """判断 HTCondor 目标节点是否就是父节点本机。"""
+        target = str(target_machine or "").strip().lower()
+        if not target:
+            return False
+        local_names = self._local_machine_names()
+        return target in local_names or target.split(".")[0] in local_names
+
     def _write_job_files(
         self,
         job_id: str,
@@ -2129,7 +2219,13 @@ else {
         share_user = str(os.environ.get("LOCAL_WEB_HTCONDOR_SHARE_USER", "")).strip()
         share_password = str(os.environ.get("LOCAL_WEB_HTCONDOR_SHARE_PASSWORD", "")).strip()
 
-        if shared_cfg.get("enabled") and share_unc:
+        local_target_machine = self._is_local_target_machine(target_machine)
+        if shared_cfg.get("enabled") and share_unc and local_target_machine:
+            lines.extend([
+                "echo [HTCONDOR] shared directory mode enabled, but target is parent/local machine; skip net use and use local paths from config.",
+            ])
+
+        if shared_cfg.get("enabled") and share_unc and not local_target_machine:
             safe_unc = share_unc.replace("%", "%%")
             safe_user = share_user.replace("%", "%%")
             safe_password = share_password.replace("%", "%%")
@@ -2198,6 +2294,12 @@ else {
             val = str(value).replace("%", "%%")
             lines.append(f"set {key}={val}")
 
+        lines.extend([
+            "echo [HTCONDOR] request_cpus=%LOCAL_WEB_HTCONDOR_REQUEST_CPUS%",
+            "echo [HTCONDOR] request_memory_mb=%LOCAL_WEB_HTCONDOR_REQUEST_MEMORY_MB%",
+            "echo [HTCONDOR] threads_per_exe=%LOCAL_WEB_HTCONDOR_THREADS_PER_EXE%",
+        ])
+
         if working_dir:
             lines.append(f"cd /d {self._batch_quote(str(working_dir))}")
             lines.append("if errorlevel 1 exit /b 100")
@@ -2233,6 +2335,16 @@ else {
                 clean_transfer_output_items.append(item)
         transfer_output_files = ", ".join(clean_transfer_output_items)
         transfer_output_line = f"transfer_output_files = {transfer_output_files}\n" if transfer_output_files else ""
+
+        try:
+            request_cpus_raw = (
+                (env or {}).get("LOCAL_WEB_HTCONDOR_REQUEST_CPUS")
+                or os.environ.get("LOCAL_WEB_HTCONDOR_REQUEST_CPUS", "1")
+                or "1"
+            )
+            request_cpus = max(1, min(128, int(request_cpus_raw)))
+        except Exception:
+            request_cpus = 1
 
         try:
             request_memory_raw = (
@@ -2273,7 +2385,7 @@ stream_error = False
 output = stdout.txt
 error = stderr.txt
 log = event.log
-request_cpus = 1
+request_cpus = {request_cpus}
 request_memory = {request_memory_mb}MB
 request_disk = 1024MB
 run_as_owner = {run_as_owner_value}
@@ -2473,10 +2585,21 @@ queue 1
         if not cluster_id:
             raise HTCondorClusterError(f"condor_submit 失败：{submit_text}")
 
+        try:
+            submitted_request_cpus = max(1, int((env or {}).get("LOCAL_WEB_HTCONDOR_REQUEST_CPUS") or 1))
+        except Exception:
+            submitted_request_cpus = 1
+        try:
+            submitted_request_memory_mb = max(1024, int((env or {}).get("LOCAL_WEB_HTCONDOR_REQUEST_MEMORY_MB") or 1024))
+        except Exception:
+            submitted_request_memory_mb = 1024
+
         self.running_jobs[str(job_id)] = {
             "cluster_id": cluster_id,
             "job_dir": str(files["job_dir"]),
             "event_log": str(files["event_log"]),
+            "request_cpus": submitted_request_cpus,
+            "request_memory_mb": submitted_request_memory_mb,
         }
 
         if on_update is not None:
@@ -2487,6 +2610,9 @@ queue 1
                     "cluster_id": cluster_id,
                     "job_dir": str(files["job_dir"]),
                     "target_machine": str(target_machine or ""),
+                    "request_cpus": submitted_request_cpus,
+                    "request_memory_mb": submitted_request_memory_mb,
+                    "threads_per_exe": str((env or {}).get("LOCAL_WEB_HTCONDOR_THREADS_PER_EXE") or ""),
                 })
             except Exception:
                 pass
@@ -2500,9 +2626,14 @@ queue 1
 
         wait_stdout = ""
         wait_stderr = ""
-        last_stdout_len = 0
-        last_stderr_len = 0
-        last_event_len = 0
+        stdout_offset = 0
+        stderr_offset = 0
+        event_offset = 0
+        # 仅保留最近的事件/输出片段用于 Hold 和 return_code 判断，避免内存无限增长。
+        stdout_tail = ""
+        stderr_tail = ""
+        event_tail = ""
+        tail_limit = 256 * 1024
         cancelled = False
         cancel_requested = False
 
@@ -2539,14 +2670,24 @@ queue 1
                     except Exception:
                         pass
 
-                # stream_output / stream_error 可能会把日志边运行边写回来。
-                # 如果执行节点暂时不支持流式输出，也不影响最后读取完整日志。
-                stdout_text = self._read_text_auto(files["stdout"])
-                stderr_text = self._read_text_auto(files["stderr"])
-                event_text = self._read_text_auto(files["event_log"])
-                last_stdout_len = self._emit_live_text(on_update, job_id, "stdout", stdout_text, last_stdout_len)
-                last_stderr_len = self._emit_live_text(on_update, job_id, "stderr", stderr_text, last_stderr_len)
-                last_event_len = self._emit_live_text(on_update, job_id, "event", event_text, last_event_len)
+                # 只读取自上次轮询后新增的日志字节，避免日志越长重复读取量越大。
+                stdout_piece, stdout_offset = self._read_text_delta_auto(files["stdout"], stdout_offset)
+                stderr_piece, stderr_offset = self._read_text_delta_auto(files["stderr"], stderr_offset)
+                event_piece, event_offset = self._read_text_delta_auto(files["event_log"], event_offset)
+                self._emit_live_piece(on_update, job_id, "stdout", stdout_piece)
+                self._emit_live_piece(on_update, job_id, "stderr", stderr_piece)
+                self._emit_live_piece(on_update, job_id, "event", event_piece)
+
+                if stdout_piece:
+                    stdout_tail = (stdout_tail + stdout_piece)[-tail_limit:]
+                if stderr_piece:
+                    stderr_tail = (stderr_tail + stderr_piece)[-tail_limit:]
+                if event_piece:
+                    event_tail = (event_tail + event_piece)[-tail_limit:]
+
+                stdout_text = stdout_tail
+                stderr_text = stderr_tail
+                event_text = event_tail
 
                 # HTCondor 传输输出失败时，作业会进入 Hold，condor_wait 不会自然返回。
                 # 典型情况：EXE 已经 return_code=0，但 result.txt 没有写在执行沙箱根目录，
@@ -2607,19 +2748,19 @@ queue 1
                         pass
                     raise HTCondorClusterError("condor_wait 等待超时，已尝试取消 HTCondor 作业。")
 
-                time.sleep(1.0)
+                time.sleep(self.job_poll_seconds)
 
             out, err = process.communicate(timeout=5)
             wait_stdout = out or ""
             wait_stderr = err or ""
 
-            # 最后再读一次，避免最后几行输出没有推到前端。
-            stdout_text = self._read_text_auto(files["stdout"])
-            stderr_text = self._read_text_auto(files["stderr"])
-            event_text = self._read_text_auto(files["event_log"])
-            last_stdout_len = self._emit_live_text(on_update, job_id, "stdout", stdout_text, last_stdout_len)
-            last_stderr_len = self._emit_live_text(on_update, job_id, "stderr", stderr_text, last_stderr_len)
-            last_event_len = self._emit_live_text(on_update, job_id, "event", event_text, last_event_len)
+            # 最后再读取一次增量，避免最后几行输出没有推到前端。
+            stdout_piece, stdout_offset = self._read_text_delta_auto(files["stdout"], stdout_offset)
+            stderr_piece, stderr_offset = self._read_text_delta_auto(files["stderr"], stderr_offset)
+            event_piece, event_offset = self._read_text_delta_auto(files["event_log"], event_offset)
+            self._emit_live_piece(on_update, job_id, "stdout", stdout_piece)
+            self._emit_live_piece(on_update, job_id, "stderr", stderr_piece)
+            self._emit_live_piece(on_update, job_id, "event", event_piece)
 
             if process.returncode != 0 and not cancelled:
                 wait_text = "\n".join(x for x in [wait_stdout, wait_stderr] if x)
