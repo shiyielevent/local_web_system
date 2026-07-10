@@ -198,6 +198,14 @@ class HTCondorPrepareShareRequest(BaseModel):
     unc_host: str = ""
 
 
+class HTCondorDeleteShareRequest(BaseModel):
+    share_name: str = ""
+    unc_root: str = ""
+    local_root: str = ""
+    # 删除 Windows 共享映射，但不会删除本地目录和数据文件。
+    delete_windows_share: bool = True
+
+
 class HTCondorNodeWeightsRequest(BaseModel):
     # mode=weighted 时按各节点权重分配输入文件；mode=equal 时退回平均分配。
     mode: str = "weighted"
@@ -412,6 +420,23 @@ def api_htcondor_prepare_shared_io(
         )
     except HTCondorClusterError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/htcondor/shared-io/delete")
+def api_htcondor_delete_shared_io(
+    payload: HTCondorDeleteShareRequest,
+    authorization: str | None = Header(default=None),
+):
+    require_admin(authorization)
+    try:
+        return htcondor_cluster_manager.delete_shared_io_config(
+            share_name=payload.share_name,
+            unc_root=payload.unc_root,
+            local_root=payload.local_root,
+            delete_windows_share=payload.delete_windows_share,
+        )
+    except HTCondorClusterError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.post("/api/htcondor/shared-io/test")

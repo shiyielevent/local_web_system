@@ -584,6 +584,13 @@ export async function prepareHTCondorSharedIO(payload = {}) {
   });
 }
 
+export async function deleteHTCondorSharedIO(payload = {}) {
+  return request('/api/htcondor/shared-io/delete', {
+    method: 'POST',
+    body: JSON.stringify(payload || {}),
+  });
+}
+
 export async function testHTCondorSharedIO() {
   return request('/api/htcondor/shared-io/test', {
     method: 'POST',

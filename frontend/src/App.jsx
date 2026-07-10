@@ -45,7 +45,9 @@ import {
   listDataFiles,
   previewDataFile,
   revealDataFile,
-  deleteDataFile,  getHTCondorStatus,
+  deleteDataFile,
+  getHTCondorSharedIO,
+  getHTCondorStatus,
   setHTCondorExecutionMode,
   runHTCondorSmokeTest,
   createHTCondorParent,
@@ -53,6 +55,7 @@ import {
   leaveHTCondorPool,
   saveHTCondorNodeWeights,
   prepareHTCondorSharedIO,
+  deleteHTCondorSharedIO,
   testHTCondorSharedIO,
 } from './api';
 
@@ -1070,138 +1073,30 @@ function SimpleOverlay({ title, onClose, children, width = 'min(960px, 96vw)' })
         style={{
           width,
           maxHeight: '94vh',
-          overflow: 'auto',
-          borderRadius: 18,
-          background: 'rgba(248,251,255,0.98)',
-          boxShadow: '0 22px 60px rgba(0,0,0,0.22)',
-          padding: 18,
-        }}
-      >
-        <div
-          style={{
-            display: 'flex',
-            justifyContent: 'space-between',
-            alignItems: 'center',
-            marginBottom: 16,
-          }}
-        >
-          <div style={{ fontSize: 22, fontWeight: 900, color: '#102a4a' }}>{title}</div>
-          <button style={styles.whiteBtn} onClick={onClose}>
-            关闭
-          </button>
-        </div>
-        {children}
-      </div>
-    </div>
-  );
-}
-
-
-function ShareNameDialog({ open, value, selectedPath, onChange, onConfirm, onCancel }) {
-  const inputRef = useRef(null);
-
-  useEffect(() => {
-    if (!open) return undefined;
-    const timer = setTimeout(() => {
-      inputRef.current?.focus?.();
-      inputRef.current?.select?.();
-    }, 40);
-    return () => clearTimeout(timer);
-  }, [open]);
-
-  if (!open) return null;
-
-  const cleanValue = String(value || '').trim();
-  const invalid = !cleanValue || !/^[0-9A-Za-z_.-]+$/.test(cleanValue);
-
-  return (
-    <div
-      style={{
-        position: 'fixed',
-        inset: 0,
-        zIndex: 7600,
-        background: 'rgba(7,22,44,0.30)',
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        padding: 14,
-      }}
-      onMouseDown={onCancel}
-    >
-      <div
-        style={{
-          width: 'min(440px, 94vw)',
-          borderRadius: 16,
           overflow: 'hidden',
-          boxShadow: '0 22px 60px rgba(5,25,55,0.28)',
+          borderRadius: 14,
           background: 'rgba(245,250,255,0.98)',
-          border: '1px solid rgba(255,255,255,0.45)',
+          boxShadow: '0 18px 46px rgba(5,25,55,0.28)',
+          border: '1px solid rgba(255,255,255,0.35)',
         }}
-        onMouseDown={(e) => e.stopPropagation()}
       >
         <div
           style={{
             background: 'linear-gradient(135deg,#0d4f92 0%,#1565c0 50%,#2c8ae8 100%)',
             color: '#fff',
-            padding: '12px 16px',
+            padding: '10px 14px',
             display: 'flex',
-            alignItems: 'center',
             justifyContent: 'space-between',
-            gap: 12,
+            alignItems: 'center',
           }}
         >
-          <div style={{ fontWeight: 900, fontSize: 17 }}>设置共享名</div>
-          <button
-            type="button"
-            style={{ ...styles.topBtn, padding: '6px 12px' }}
-            onClick={onCancel}
-          >
-            取消
+          <div style={{ fontWeight: 900 }}>{title}</div>
+          <button style={{ ...styles.topBtn, padding: '6px 10px' }} onClick={onClose}>
+            关闭
           </button>
         </div>
-
-        <div style={{ padding: 16 }}>
-          <div
-            style={{
-              padding: 12,
-              borderRadius: 12,
-              background: 'linear-gradient(135deg, rgba(25,118,210,0.10), rgba(54,162,235,0.08))',
-              border: '1px solid rgba(39,110,188,0.14)',
-            }}
-          >
-            <div style={{ fontSize: 13, color: '#5f7088' }}>父节点本地共享目录</div>
-            <div style={{ marginTop: 6, fontWeight: 900, color: '#173b61', overflowWrap: 'anywhere' }}>
-              {selectedPath || '-'}
-            </div>
-          </div>
-
-          <label style={{ display: 'block', marginTop: 14 }}>
-            <div style={labelStyle}>共享名</div>
-            <input
-              ref={inputRef}
-              style={{ ...styles.input, fontWeight: 800 }}
-              value={value || ''}
-              placeholder="例如 H8Data、FY4Data、AODData"
-              onChange={(e) => onChange(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && !invalid) onConfirm();
-                if (e.key === 'Escape') onCancel();
-              }}
-            />
-          </label>
-
-          <div style={{ marginTop: 8, color: invalid ? '#b91c1c' : '#64748b', fontSize: 12, lineHeight: 1.6 }}>
-            共享名只能使用英文、数字、下划线、短横线和点号，例如 H8Data。
-          </div>
-
-          <div style={{ marginTop: 16, display: 'flex', justifyContent: 'flex-end', gap: 10, flexWrap: 'wrap' }}>
-            <button type="button" style={styles.whiteBtn} onClick={onCancel}>
-              取消
-            </button>
-            <button type="button" style={styles.blueBtn} disabled={invalid} onClick={onConfirm}>
-              确定
-            </button>
-          </div>
+        <div style={{ padding: 16, maxHeight: 'calc(94vh - 46px)', overflow: 'auto' }}>
+          {children}
         </div>
       </div>
     </div>
@@ -2110,6 +2005,7 @@ function HTCondorPage({
   onLeavePool,
   onSaveWeights,
   onPrepareShare,
+  onShowShares,
   onTestShare,
 }) {
   const info = status || {};
@@ -2137,17 +2033,12 @@ function HTCondorPage({
   const nodeCount = uniqueMachines.length || nodeItems.length || 0;
   const parentAddress = info.parent_ip || info.bind_ip || '-';
   const sharedIo = info.shared_io || {};
-  const rawSharedShares = Array.isArray(sharedIo.shares) ? sharedIo.shares : [];
-  const sharedShares = rawSharedShares.length
-    ? rawSharedShares
-    : (sharedIo.local_root || sharedIo.unc_root || sharedIo.share_name ? [sharedIo] : []);
-  const sharedEnabled = !!sharedIo.enabled || sharedShares.some((item) => item?.enabled);
-  const primaryShare = sharedShares[0] || {};
-  const sharedUnc = primaryShare.unc_root || sharedIo.unc_root || '';
-  const sharedRole = sharedIo.role || primaryShare.role || '';
-  const [shareListOpen, setShareListOpen] = useState(false);
+  const sharedShares = Array.isArray(sharedIo.shares) ? sharedIo.shares : (sharedIo.unc_root ? [sharedIo] : []);
+  const sharedEnabled = !!sharedIo.enabled || sharedShares.length > 0;
+  const sharedUnc = sharedIo.unc_root || '';
+  const sharedRole = sharedIo.role || '';
   const autoChildUnc = clusterForm.parent_ip && clusterForm.shared_share_name
-    ? `\\${clusterForm.parent_ip}\\${clusterForm.shared_share_name}`
+    ? `\\${clusterForm.parent_ip}\${clusterForm.shared_share_name}`
     : '';
 
   const versionOutput = String(installedRuntime.version_output || '');
@@ -2354,129 +2245,6 @@ function HTCondorPage({
 
   return (
     <section style={{ display: 'grid', gap: 16, minHeight: 'calc(100vh - 98px)' }}>
-      {shareListOpen && (
-        <div
-          style={{
-            position: 'fixed',
-            inset: 0,
-            zIndex: 7200,
-            background: 'rgba(7,22,44,0.28)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            padding: 14,
-          }}
-          onMouseDown={() => setShareListOpen(false)}
-        >
-          <div
-            style={{
-              width: 'min(760px, 96vw)',
-              maxHeight: '90vh',
-              overflow: 'hidden',
-              borderRadius: 16,
-              boxShadow: '0 22px 60px rgba(5,25,55,0.28)',
-              background: 'rgba(245,250,255,0.98)',
-              border: '1px solid rgba(255,255,255,0.45)',
-            }}
-            onMouseDown={(e) => e.stopPropagation()}
-          >
-            <div
-              style={{
-                background: 'linear-gradient(135deg,#0d4f92 0%,#1565c0 50%,#2c8ae8 100%)',
-                color: '#fff',
-                padding: '12px 16px',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'space-between',
-                gap: 12,
-              }}
-            >
-              <div style={{ fontWeight: 900, fontSize: 17 }}>当前配置的共享目录</div>
-              <button
-                type="button"
-                style={{ ...styles.topBtn, padding: '6px 12px' }}
-                onClick={() => setShareListOpen(false)}
-              >
-                关闭
-              </button>
-            </div>
-            <div style={{ padding: 16, overflow: 'auto', maxHeight: 'calc(90vh - 56px)' }}>
-              <div
-                style={{
-                  padding: 12,
-                  borderRadius: 12,
-                  background: 'linear-gradient(135deg, rgba(25,118,210,0.10), rgba(54,162,235,0.08))',
-                  border: '1px solid rgba(39,110,188,0.14)',
-                  marginBottom: 12,
-                }}
-              >
-                <div style={{ fontSize: 13, color: '#5f7088' }}>共享目录状态</div>
-                <div style={{ fontSize: 20, fontWeight: 900, marginTop: 8, color: '#173b61' }}>
-                  {sharedEnabled ? `已配置 ${sharedShares.length || 0} 个共享目录` : '未配置共享目录'}
-                </div>
-                {sharedRole && (
-                  <div style={{ marginTop: 6, color: '#64748b', fontSize: 13 }}>当前角色：{sharedRole}</div>
-                )}
-              </div>
-
-              {sharedShares.length ? (
-                <div style={{ display: 'grid', gap: 10 }}>
-                  {sharedShares.map((share, index) => (
-                    <div
-                      key={`${share.unc_root || share.local_root || share.share_name || index}-${index}`}
-                      style={{
-                        padding: 12,
-                        borderRadius: 12,
-                        background: '#fff',
-                        border: '1px solid #d7e6f7',
-                        boxShadow: '0 6px 16px rgba(8,34,70,0.05)',
-                      }}
-                    >
-                      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap' }}>
-                        <div style={{ fontWeight: 900, color: '#12385f' }}>
-                          共享目录 {index + 1}：{share.share_name || '-'}
-                        </div>
-                        <span
-                          style={{
-                            padding: '4px 9px',
-                            borderRadius: 999,
-                            background: share.enabled !== false ? '#dcfce7' : '#fee2e2',
-                            color: share.enabled !== false ? '#166534' : '#991b1b',
-                            fontSize: 12,
-                            fontWeight: 800,
-                          }}
-                        >
-                          {share.enabled !== false ? '已启用' : '未启用'}
-                        </span>
-                      </div>
-                      <div style={{ marginTop: 8, display: 'grid', gap: 5, color: '#475569', fontSize: 13, lineHeight: 1.55, overflowWrap: 'anywhere' }}>
-                        <div><strong>父节点本地目录：</strong>{share.local_root || '-'}</div>
-                        <div><strong>UNC 路径：</strong>{share.unc_root || '-'}</div>
-                        <div><strong>共享名：</strong>{share.share_name || '-'}</div>
-                        {share.connect_message && <div><strong>连接结果：</strong>{share.connect_message}</div>}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <div
-                  style={{
-                    padding: 18,
-                    borderRadius: 12,
-                    background: '#fff',
-                    border: '1px dashed #cfe0f2',
-                    color: '#64748b',
-                    lineHeight: 1.7,
-                  }}
-                >
-                  当前还没有配置共享目录。请点击“添加共享目录”，选择父节点本地数据目录后创建共享。
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
-
       <div style={{ ...styles.card, padding: 24 }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap', alignItems: 'center' }}>
           <div>
@@ -2658,33 +2426,24 @@ function HTCondorPage({
           {cardTitle('集群配置', '父节点负责调度，子节点负责执行。')}
 
           <div style={{ display: 'grid', gap: 10 }}>
-            <div
-              style={{
-                display: 'grid',
-                gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)',
-                gap: 10,
-                alignItems: 'end',
-              }}
-            >
-              <label style={{ minWidth: 0 }}>
-                <div style={labelStyle}>父节点 IP</div>
-                <input
-                  style={styles.input}
-                  value={clusterForm.parent_ip}
-                  placeholder="例如 192.168.2.136"
-                  onChange={(e) => setClusterForm({ ...clusterForm, parent_ip: e.target.value })}
-                />
-              </label>
-              <label style={{ minWidth: 0 }}>
-                <div style={labelStyle}>本机绑定 IP，可空</div>
-                <input
-                  style={styles.input}
-                  value={clusterForm.bind_ip}
-                  placeholder={localIps[0] || '可留空，系统自动选择'}
-                  onChange={(e) => setClusterForm({ ...clusterForm, bind_ip: e.target.value, child_ip: e.target.value })}
-                />
-              </label>
-            </div>
+            <label>
+              <div style={labelStyle}>父节点 IP</div>
+              <input
+                style={styles.input}
+                value={clusterForm.parent_ip}
+                placeholder="例如 192.168.2.136"
+                onChange={(e) => setClusterForm({ ...clusterForm, parent_ip: e.target.value })}
+              />
+            </label>
+            <label>
+              <div style={labelStyle}>本机绑定 IP，可空</div>
+              <input
+                style={styles.input}
+                value={clusterForm.bind_ip}
+                placeholder={localIps[0] || '可留空，系统自动选择'}
+                onChange={(e) => setClusterForm({ ...clusterForm, bind_ip: e.target.value, child_ip: e.target.value })}
+              />
+            </label>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
               <label>
                 <div style={labelStyle}>动态端口起始</div>
@@ -2718,8 +2477,12 @@ function HTCondorPage({
             </div>
             <div style={{ marginTop: 10, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
               <button style={styles.blueBtn} disabled={!!busy} onClick={onPrepareShare}>添加共享目录</button>
-              <button style={styles.whiteBtn} disabled={!!busy} onClick={() => setShareListOpen(true)}>查看当前配置的共享目录</button>
+              <button style={styles.whiteBtn} disabled={!!busy} onClick={onShowShares}>查看当前配置的共享目录</button>
               <button style={styles.whiteBtn} disabled={!!busy || !sharedEnabled} onClick={onTestShare}>测试共享目录</button>
+            </div>
+            <div style={{ marginTop: 10, fontSize: 12, color: '#475569', lineHeight: 1.55, overflowWrap: 'anywhere' }}>
+              <div><strong>当前状态：</strong>{sharedEnabled ? `已配置 ${sharedShares.length || 1} 个共享目录` : '未配置共享目录'}{sharedRole ? ` / ${sharedRole}` : ''}</div>
+              {sharedIo.connect_message && <div><strong>最近结果：</strong>{sharedIo.connect_message}</div>}
             </div>
           </div>
 
@@ -2765,7 +2528,7 @@ function HTCondorPage({
           }}>
             <div style={{ fontWeight: 900, color: '#17406b', marginBottom: 6 }}>操作说明</div>
             <div>1. 父节点点击“启动集群”。</div>
-            <div>2. 父节点点击“添加共享目录”，选择本地数据目录后自动创建共享。</div>
+            <div>2. 父节点填写共享目录后点击“添加共享目录”。</div>
             <div>3. 子节点填写父节点 IP 后点击“加入集群”，系统会自动连接共享目录。</div>
             <div>4. 父节点刷新状态，在执行节点列表中确认子节点机器名。</div>
           </div>
@@ -2828,36 +2591,14 @@ function App() {
     child_ip: '',
     low_port: '9700',
     high_port: '9800',
-    shared_local_root: '',
+    shared_local_root: 'D:\\H8\\data',
     shared_share_name: 'H8Data',
     shared_unc_root: '',
     auto_shared_io: true,
   });
-
-  const [shareNameDialog, setShareNameDialog] = useState({
-    open: false,
-    value: '',
-    selectedPath: '',
-  });
-  const shareNameDialogResolveRef = useRef(null);
-
-  function requestShareName(defaultShareName, selectedPath) {
-    return new Promise((resolve) => {
-      shareNameDialogResolveRef.current = resolve;
-      setShareNameDialog({
-        open: true,
-        value: defaultShareName || 'LocalWebData',
-        selectedPath: selectedPath || '',
-      });
-    });
-  }
-
-  function closeShareNameDialog(result) {
-    const resolver = shareNameDialogResolveRef.current;
-    shareNameDialogResolveRef.current = null;
-    setShareNameDialog({ open: false, value: '', selectedPath: '' });
-    if (typeof resolver === 'function') resolver(result);
-  }
+  const [htcondorShareNameModal, setHTCondorShareNameModal] = useState(null);
+  const [htcondorShareListModal, setHTCondorShareListModal] = useState(null);
+  const [htcondorShareDeleteModal, setHTCondorShareDeleteModal] = useState(null);
 
 
   const [activeTab, setActiveTab] = useState(() => getSavedActiveTab() || 'module_mgmt');
@@ -3641,22 +3382,18 @@ async function installModuleFolder() {
       const data = await getHTCondorStatus();
       setHTCondorStatus(data);
       if (data) {
-        setHTCondorClusterForm((old) => {
-          const shares = Array.isArray(data.shared_io?.shares) ? data.shared_io.shares : [];
-          const firstShare = shares[0] || data.shared_io || {};
-          return {
-            ...old,
-            parent_ip: old.parent_ip || data.parent_ip || '',
-            bind_ip: old.bind_ip || data.bind_ip || (Array.isArray(data.local_ips) ? (data.local_ips[0] || '') : ''),
-            child_ip: old.child_ip || data.bind_ip || (Array.isArray(data.local_ips) ? (data.local_ips[0] || '') : ''),
-            low_port: String(data.low_port || old.low_port || '9700'),
-            high_port: String(data.high_port || old.high_port || '9800'),
-            shared_local_root: old.shared_local_root || firstShare.local_root || '',
-            shared_share_name: old.shared_share_name || firstShare.share_name || 'H8Data',
-            shared_unc_root: firstShare.unc_root || data.shared_io?.unc_root || old.shared_unc_root || '',
-            auto_shared_io: old.auto_shared_io !== false,
-          };
-        });
+        setHTCondorClusterForm((old) => ({
+          ...old,
+          parent_ip: old.parent_ip || data.parent_ip || '',
+          bind_ip: old.bind_ip || data.bind_ip || (Array.isArray(data.local_ips) ? (data.local_ips[0] || '') : ''),
+          child_ip: old.child_ip || data.bind_ip || (Array.isArray(data.local_ips) ? (data.local_ips[0] || '') : ''),
+          low_port: String(data.low_port || old.low_port || '9700'),
+          high_port: String(data.high_port || old.high_port || '9800'),
+          shared_local_root: old.shared_local_root || data.shared_io?.local_root || 'D:\\H8\\data',
+          shared_share_name: old.shared_share_name || data.shared_io?.share_name || 'H8Data',
+          shared_unc_root: data.shared_io?.unc_root || old.shared_unc_root || '',
+          auto_shared_io: old.auto_shared_io !== false,
+        }));
       }
       return data;
     } catch (e) {
@@ -3707,24 +3444,33 @@ async function installModuleFolder() {
   async function handleHTCondorPrepareShare() {
     let selectedPath = '';
     try {
-      const result = await chooseLocalDir({ title: '选择父节点本地共享目录' });
-      selectedPath = String(result?.path || '').trim();
+      const result = await chooseLocalDir();
+      selectedPath = result?.path || '';
     } catch (e) {
       setHTCondorMessage({ type: 'error', text: e?.message || '选择共享目录失败' });
       return null;
     }
-
     if (!selectedPath) return null;
     if (blockIfChinesePath(selectedPath, 'HTCondor共享目录')) return null;
 
-    const parts = selectedPath.split(/[\\/]+/).filter(Boolean);
-    const defaultShareName = String(parts[parts.length - 1] || 'LocalWebData')
-      .replace(/[^0-9A-Za-z_.-]+/g, '_')
-      .replace(/^[_\\.-]+|[_\\.-]+$/g, '') || 'LocalWebData';
-    const inputShareName = await requestShareName(defaultShareName, selectedPath);
-    if (inputShareName === null) return null;
-    const shareName = String(inputShareName || '').trim() || defaultShareName;
+    const rawDefaultName = String(selectedPath).split(/[\/]+/).filter(Boolean).pop() || 'H8Data';
+    const defaultName = rawDefaultName.replace(/[^0-9A-Za-z_.-]+/g, '_').replace(/^[_\-.]+|[_\-.]+$/g, '') || 'H8Data';
+    setHTCondorShareNameModal({
+      local_root: selectedPath,
+      share_name: defaultName,
+    });
+    return null;
+  }
 
+  async function confirmHTCondorPrepareShare() {
+    if (!htcondorShareNameModal) return null;
+    const selectedPath = String(htcondorShareNameModal.local_root || '').trim();
+    if (!selectedPath) {
+      setHTCondorMessage({ type: 'error', text: '共享目录不能为空' });
+      return null;
+    }
+    const rawName = String(htcondorShareNameModal.share_name || '').trim();
+    const shareName = rawName.replace(/[^0-9A-Za-z_.-]+/g, '_').replace(/^[_\-.]+|[_\-.]+$/g, '') || 'H8Data';
     const bindIp = htcondorClusterForm.bind_ip || htcondorStatus?.bind_ip || (Array.isArray(htcondorStatus?.local_ips) ? (htcondorStatus.local_ips[0] || '') : '');
     const payload = {
       local_root: selectedPath,
@@ -3739,7 +3485,46 @@ async function installModuleFolder() {
         shared_unc_root: data.unc_root,
         shared_share_name: data.share_name || shareName,
       }));
+      setHTCondorShareNameModal(null);
     }
+    return data;
+  }
+
+  async function handleHTCondorShowShares() {
+    try {
+      const data = await getHTCondorSharedIO();
+      const shares = Array.isArray(data?.shares) ? data.shares : (data?.unc_root ? [data] : []);
+      setHTCondorShareListModal({ data, shares });
+      return data;
+    } catch (e) {
+      setHTCondorMessage({ type: 'error', text: e?.message || '读取共享目录配置失败' });
+      return null;
+    }
+  }
+
+  function handleHTCondorAskDeleteShare(item, idx = 0) {
+    setHTCondorShareDeleteModal({ item, idx });
+  }
+
+  async function confirmHTCondorDeleteShare() {
+    const item = htcondorShareDeleteModal?.item || {};
+    const payload = {
+      share_name: item.share_name || '',
+      unc_root: item.unc_root || '',
+      local_root: item.local_root || '',
+      delete_windows_share: true,
+    };
+    const data = await runHTCondorAction('删除 HTCondor 共享目录', () => deleteHTCondorSharedIO(payload));
+    const shares = Array.isArray(data?.shares) ? data.shares : (data?.unc_root ? [data] : []);
+    setHTCondorShareDeleteModal(null);
+    setHTCondorShareListModal((old) => (old ? { data, shares } : old));
+    setHTCondorClusterForm((old) => {
+      const deletedUnc = String(item.unc_root || '').toLowerCase();
+      if (deletedUnc && String(old.shared_unc_root || '').toLowerCase() === deletedUnc) {
+        return { ...old, shared_local_root: '', shared_unc_root: '', shared_share_name: '' };
+      }
+      return old;
+    });
     return data;
   }
 
@@ -5624,14 +5409,6 @@ function renderTaskManagementPage() {
 
   return (
     <div style={styles.page}>
-      <ShareNameDialog
-        open={shareNameDialog.open}
-        value={shareNameDialog.value}
-        selectedPath={shareNameDialog.selectedPath}
-        onChange={(value) => setShareNameDialog((old) => ({ ...old, value }))}
-        onCancel={() => closeShareNameDialog(null)}
-        onConfirm={() => closeShareNameDialog(shareNameDialog.value)}
-      />
       <div style={styles.topbar}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 18, flexWrap: 'wrap', minWidth: 0, flex: '1 1 auto' }}>
           <div style={{ fontSize: 26, fontWeight: 900, whiteSpace: 'nowrap', flexShrink: 0 }}>云和气溶胶反演系统</div>
@@ -6143,6 +5920,7 @@ function renderTaskManagementPage() {
             onLeavePool={handleHTCondorLeavePool}
             onSaveWeights={handleHTCondorSaveWeights}
             onPrepareShare={handleHTCondorPrepareShare}
+            onShowShares={handleHTCondorShowShares}
             onTestShare={handleHTCondorTestShare}
           />
         )}
@@ -6173,6 +5951,172 @@ function renderTaskManagementPage() {
             {renderTaskTrayPanel()}
           </TaskTrayFloatingWindow>
         )}
+
+      {htcondorShareNameModal && (
+        <SimpleOverlay
+          title="添加共享目录"
+          onClose={() => setHTCondorShareNameModal(null)}
+          width="420px"
+        >
+          <div style={{ color: '#173353', lineHeight: 1.7 }}>
+            <div
+              style={{
+                padding: 12,
+                borderRadius: 12,
+                background: 'linear-gradient(135deg, rgba(25,118,210,0.10), rgba(54,162,235,0.08))',
+                border: '1px solid rgba(39,110,188,0.14)',
+                marginBottom: 12,
+              }}
+            >
+              <div style={{ fontSize: 13, color: '#5f7088' }}>已选择本地目录</div>
+              <div style={{ fontSize: 15, fontWeight: 900, color: '#173b61', marginTop: 6, overflowWrap: 'anywhere' }}>
+                {htcondorShareNameModal.local_root}
+              </div>
+            </div>
+
+            <label>
+              <div style={labelStyle}>共享名</div>
+              <input
+                style={styles.input}
+                value={htcondorShareNameModal.share_name || ''}
+                placeholder="例如 H8Data"
+                onChange={(e) => setHTCondorShareNameModal((old) => ({ ...old, share_name: e.target.value }))}
+              />
+            </label>
+            <div style={{ marginTop: 8, color: '#64748b', fontSize: 12, lineHeight: 1.6 }}>
+              共享名建议只使用英文、数字、下划线、短横线或点号。确认后系统会请求一次管理员权限创建 Windows 共享目录。
+            </div>
+
+            <div style={{ display: 'flex', gap: 10, marginTop: 16, flexWrap: 'wrap' }}>
+              <button style={styles.blueBtn} disabled={!!htcondorBusy} onClick={confirmHTCondorPrepareShare}>
+                确认添加共享目录
+              </button>
+              <button style={styles.whiteBtn} disabled={!!htcondorBusy} onClick={() => setHTCondorShareNameModal(null)}>
+                取消
+              </button>
+            </div>
+          </div>
+        </SimpleOverlay>
+      )}
+
+      {htcondorShareListModal && (
+        <SimpleOverlay
+          title="当前配置的共享目录"
+          onClose={() => setHTCondorShareListModal(null)}
+          width="min(760px, 96vw)"
+        >
+          <div style={{ color: '#173353', lineHeight: 1.7 }}>
+            <div
+              style={{
+                padding: 12,
+                borderRadius: 12,
+                background: 'linear-gradient(135deg, rgba(25,118,210,0.10), rgba(54,162,235,0.08))',
+                border: '1px solid rgba(39,110,188,0.14)',
+                marginBottom: 12,
+              }}
+            >
+              <div style={{ fontSize: 13, color: '#5f7088' }}>共享目录状态</div>
+              <div style={{ fontSize: 18, fontWeight: 900, color: '#173b61', marginTop: 6 }}>
+                已配置 {htcondorShareListModal.shares?.length || 0} 个共享目录
+              </div>
+              {htcondorShareListModal.data?.role && (
+                <div style={{ marginTop: 4, color: '#5f7088', fontSize: 12 }}>当前角色：{htcondorShareListModal.data.role}</div>
+              )}
+            </div>
+
+            {htcondorShareListModal.shares?.length ? (
+              <div style={{ display: 'grid', gap: 12 }}>
+                {htcondorShareListModal.shares.map((item, idx) => (
+                  <div
+                    key={`${item.unc_root || item.local_root || idx}`}
+                    style={{
+                      border: '1px solid #d7e6f7',
+                      background: '#fff',
+                      borderRadius: 12,
+                      padding: 12,
+                      boxShadow: '0 6px 16px rgba(8,34,70,0.05)',
+                    }}
+                  >
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10 }}>
+                      <div style={{ fontWeight: 900, color: '#17406b' }}>共享目录 {idx + 1}：{item.share_name || '-'}</div>
+                      <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                        <span style={{
+                          padding: '4px 9px',
+                          borderRadius: 999,
+                          background: item.enabled !== false ? '#dcfce7' : '#fee2e2',
+                          color: item.enabled !== false ? '#166534' : '#991b1b',
+                          fontSize: 12,
+                          fontWeight: 800,
+                          whiteSpace: 'nowrap',
+                        }}>
+                          {item.enabled !== false ? '已启用' : '未启用'}
+                        </span>
+                        <button
+                          style={{ ...styles.redBtn, padding: '6px 10px', borderRadius: 8, fontSize: 12 }}
+                          disabled={!!htcondorBusy}
+                          onClick={() => handleHTCondorAskDeleteShare(item, idx)}
+                        >
+                          删除
+                        </button>
+                      </div>
+                    </div>
+                    <div style={{ marginTop: 8, fontSize: 13, color: '#475569', overflowWrap: 'anywhere' }}>
+                      <div><strong>父节点本地目录：</strong>{item.local_root || '-'}</div>
+                      <div><strong>UNC 路径：</strong>{item.unc_root || '-'}</div>
+                      <div><strong>共享名：</strong>{item.share_name || '-'}</div>
+                      {item.connect_message && <div><strong>连接结果：</strong>{item.connect_message}</div>}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div style={{ padding: 12, borderRadius: 12, background: '#fff', border: '1px solid #d7e6f7', color: '#64748b' }}>
+                当前还没有配置共享目录。请先点击“添加共享目录”。
+              </div>
+            )}
+          </div>
+        </SimpleOverlay>
+      )}
+
+      {htcondorShareDeleteModal && (
+        <SimpleOverlay
+          title="删除共享目录"
+          onClose={() => setHTCondorShareDeleteModal(null)}
+          width="430px"
+        >
+          <div style={{ color: '#173353', lineHeight: 1.7 }}>
+            <div
+              style={{
+                padding: 12,
+                borderRadius: 12,
+                background: 'linear-gradient(135deg, rgba(220,38,38,0.08), rgba(245,158,11,0.08))',
+                border: '1px solid rgba(220,38,38,0.14)',
+                marginBottom: 12,
+              }}
+            >
+              <div style={{ fontSize: 13, color: '#8a5b5b' }}>即将删除共享配置</div>
+              <div style={{ fontSize: 16, fontWeight: 900, color: '#7f1d1d', marginTop: 6 }}>
+                {htcondorShareDeleteModal.item?.share_name || '-'}
+              </div>
+              <div style={{ marginTop: 8, fontSize: 13, color: '#475569', overflowWrap: 'anywhere' }}>
+                <div><strong>本地目录：</strong>{htcondorShareDeleteModal.item?.local_root || '-'}</div>
+                <div><strong>UNC 路径：</strong>{htcondorShareDeleteModal.item?.unc_root || '-'}</div>
+              </div>
+            </div>
+            <div style={{ color: '#64748b', fontSize: 13 }}>
+              删除操作只移除系统中的共享目录配置，并尝试删除 Windows 共享映射；不会删除本地目录和里面的数据文件。
+            </div>
+            <div style={{ display: 'flex', gap: 10, marginTop: 16, flexWrap: 'wrap' }}>
+              <button style={styles.redBtn} disabled={!!htcondorBusy} onClick={confirmHTCondorDeleteShare}>
+                确认删除
+              </button>
+              <button style={styles.whiteBtn} disabled={!!htcondorBusy} onClick={() => setHTCondorShareDeleteModal(null)}>
+                取消
+              </button>
+            </div>
+          </div>
+        </SimpleOverlay>
+      )}
 
       {moduleEditOpen && (
         <SimpleOverlay

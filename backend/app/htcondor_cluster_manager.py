@@ -123,12 +123,12 @@ class HTCondorClusterManager:
     # =========================
     # HTCondor 共享目录模式配置
     # =========================
-
     def _normalize_shared_io_items(self) -> List[Dict[str, Any]]:
-        """把历史单共享配置和新版多共享配置统一为 shares 列表。"""
+        """把旧版单共享配置和新版多共享配置统一成 shares 列表。"""
         raw = self.state.get("shared_io_config") or {}
         if not isinstance(raw, dict):
             raw = {}
+
         items: List[Dict[str, Any]] = []
 
         def add_item(item: Dict[str, Any]):
@@ -139,7 +139,7 @@ class HTCondorClusterManager:
             share_name = str(item.get("share_name") or "").strip()
             if not share_name:
                 share_name = (unc_root.rstrip("\\/").split("\\")[-1] if unc_root else "LocalWebData") or "LocalWebData"
-            enabled = bool(item.get("enabled", True)) and bool(unc_root or local_root)
+            enabled = bool(item.get("enabled", True)) and bool(local_root or unc_root)
             clean = {
                 "enabled": enabled,
                 "local_root": local_root,
@@ -156,7 +156,7 @@ class HTCondorClusterManager:
                 return
             for idx, old in enumerate(items):
                 old_key = str(old.get("unc_root") or old.get("local_root") or old.get("share_name") or "").lower()
-                if old_key == key:
+                if old_key == key or str(old.get("share_name") or "").lower() == share_name.lower():
                     items[idx] = {**old, **clean}
                     return
             items.append(clean)
@@ -256,13 +256,14 @@ class HTCondorClusterManager:
             unc_root = f"\\\\{host}\\{share_name}"
 
         items = self._normalize_shared_io_items()
+        raw = self.state.get("shared_io_config") or {}
         new_item = {
             "enabled": True,
             "local_root": local_root,
             "unc_root": unc_root,
             "share_name": share_name,
-            "role": str((self.state.get("shared_io_config") or {}).get("role") or "parent"),
-            "parent_ip": str((self.state.get("shared_io_config") or {}).get("parent_ip") or ""),
+            "role": str(raw.get("role") or "parent"),
+            "parent_ip": str(raw.get("parent_ip") or ""),
             "connect_ok": True,
             "connect_message": "共享目录已添加",
             "updated_at": now_iso(),
@@ -280,6 +281,111 @@ class HTCondorClusterManager:
         self._save_shared_io_items(items, primary_unc_root=unc_root)
         data = self.shared_io_config()
         data["message"] = "共享目录已添加"
+        return data
+
+    def delete_shared_io_config(
+        self,
+        share_name: str = "",
+        unc_root: str = "",
+        local_root: str = "",
+        delete_windows_share: bool = True,
+    ) -> Dict[str, Any]:
+        """删除一个共享目录配置。父节点可同时删除 Windows 共享，但不会删除本地数据文件。"""
+        share_name = str(share_name or "").strip()
+        unc_root = str(unc_root or "").strip()
+        local_root = str(local_root or "").strip()
+        if not (share_name or unc_root or local_root):
+            raise HTCondorClusterError("删除共享目录时必须提供共享名、UNC 路径或本地目录。")
+
+        items = self._normalize_shared_io_items()
+        kept: List[Dict[str, Any]] = []
+        deleted: List[Dict[str, Any]] = []
+
+        def same(a: str, b: str) -> bool:
+            return str(a or "").strip().rstrip("\\/").lower() == str(b or "").strip().rstrip("\\/").lower()
+
+        for item in items:
+            matched = False
+            if share_name and same(item.get("share_name"), share_name):
+                matched = True
+            if unc_root and same(item.get("unc_root"), unc_root):
+                matched = True
+            if local_root and same(item.get("local_root"), local_root):
+                matched = True
+            if matched:
+                deleted.append(item)
+            else:
+                kept.append(item)
+
+        if not deleted:
+            raise HTCondorClusterError("没有找到要删除的共享目录配置。")
+
+        commands: List[Dict[str, Any]] = []
+        admin_result: Dict[str, Any] | None = None
+        # 父节点删除共享名需要管理员权限；只删除共享映射，不删除本地文件夹。
+        if delete_windows_share and os.name == "nt":
+            names = []
+            for item in deleted:
+                name = str(item.get("share_name") or "").strip()
+                if name and name not in names:
+                    names.append(name)
+            if names:
+                result_path = self.runtime_dir / "cluster_admin" / "delete_share_result.json"
+                names_json = json.dumps(names, ensure_ascii=False)
+                script_text = f"""
+$ErrorActionPreference = 'Continue'
+$resultPath = {self._ps_quote(str(result_path))}
+$shareNames = ConvertFrom-Json -InputObject {self._ps_quote(names_json)}
+$commands = New-Object System.Collections.ArrayList
+function Add-CommandResult([string]$command, [bool]$ok, [string]$stdout, [string]$stderr, [int]$returncode) {{
+    [void]$commands.Add([ordered]@{{ command=$command; ok=$ok; stdout=$stdout; stderr=$stderr; returncode=$returncode }})
+}}
+foreach ($name in $shareNames) {{
+    try {{
+        $output = & net.exe share $name /delete /y 2>&1
+        $code = if ($null -eq $LASTEXITCODE) {{ 0 }} else {{ [int]$LASTEXITCODE }}
+        $text = (($output | Out-String).Trim())
+        Add-CommandResult ('net share ' + $name + ' /delete') ($code -eq 0 -or $text -match '不存在|does not exist|not found') $text '' $code
+    }} catch {{
+        Add-CommandResult ('net share ' + $name + ' /delete') $false '' $_.Exception.Message -1
+    }}
+    try {{
+        if (Get-Command Remove-SmbShare -ErrorAction SilentlyContinue) {{
+            $s = Get-SmbShare -Name $name -ErrorAction SilentlyContinue
+            if ($null -ne $s) {{
+                Remove-SmbShare -Name $name -Force -ErrorAction Stop
+                Add-CommandResult ('Remove-SmbShare ' + $name) $true 'ok' '' 0
+            }} else {{
+                Add-CommandResult ('Remove-SmbShare ' + $name) $true 'not exists' '' 0
+            }}
+        }}
+    }} catch {{
+        Add-CommandResult ('Remove-SmbShare ' + $name) $false '' $_.Exception.Message -1
+    }}
+}}
+[ordered]@{{
+    success = $true
+    message = '共享目录已从 Windows 共享中移除；本地数据文件未删除。'
+    deleted_share_names = $shareNames
+    commands = $commands
+}} | ConvertTo-Json -Depth 8 | Set-Content -Path $resultPath -Encoding UTF8
+"""
+                admin_result = self._run_elevated_ps("delete_share", script_text, timeout=180)
+                commands = list(admin_result.get("commands") or []) if isinstance(admin_result, dict) else []
+
+        # 子节点或非管理员场景下，尝试移除 net use 映射；失败不影响配置删除。
+        for item in deleted:
+            unc = str(item.get("unc_root") or "").strip()
+            if unc:
+                commands.append({"command": f"net use {unc} /delete", **self._run(["net.exe", "use", unc, "/delete", "/y"], timeout=30)})
+
+        self._save_shared_io_items(kept)
+        data = self.shared_io_config()
+        data["message"] = f"已删除 {len(deleted)} 个共享目录配置。本地目录和数据文件不会被删除。"
+        data["deleted"] = deleted
+        data["deleted_count"] = len(deleted)
+        data["commands"] = commands
+        data["admin_result"] = admin_result or {}
         return data
 
     def prepare_local_share(self, local_root: str, share_name: str = "LocalWebData", unc_host: str = "") -> Dict[str, Any]:
@@ -313,22 +419,6 @@ class HTCondorClusterManager:
         unc_root = f"\\\\{host}\\{share_name}"
 
         root = Path(local_root)
-        # 共享目录只应该指向数据目录，不能直接共享系统项目目录。
-        # 用户误选 D:/local_web_module_system 时，icacls 递归扫描 node_modules/runtime 等目录会非常慢，
-        # 管理员 PowerShell 窗口看起来会一直空白卡住；同时也不安全。
-        try:
-            resolved_root = root.resolve()
-            resolved_project = self.project_root.resolve()
-            resolved_base = self.base_dir.resolve()
-            if resolved_root in {resolved_project, resolved_base}:
-                raise HTCondorClusterError(
-                    "共享目录不能选择系统项目目录。请改成数据目录，例如 D:/H8/data。"
-                )
-        except HTCondorClusterError:
-            raise
-        except Exception:
-            pass
-
         result_path = self.runtime_dir / "cluster_admin" / "prepare_share_result.json"
         share_user = str(os.environ.get("LOCAL_WEB_HTCONDOR_SHARE_USER", "")).strip()
 
@@ -385,15 +475,15 @@ try {{
     Add-CommandResult ('New-Item -ItemType Directory -Force -Path ' + $localRoot) $true 'ok' '' 0
 
     # NTFS 权限优先用 SID，避免中文 Windows 上 Everyone/Users 名称本地化导致失败。
-    Run-External 'icacls.exe' @($localRoot, '/grant', '*S-1-1-0:(OI)(CI)M', '/C') $true | Out-Null
-    Run-External 'icacls.exe' @($localRoot, '/grant', '*S-1-5-32-545:(OI)(CI)M', '/C') $true | Out-Null
+    Run-External 'icacls.exe' @($localRoot, '/grant', '*S-1-1-0:(OI)(CI)M', '/T', '/C') $true | Out-Null
+    Run-External 'icacls.exe' @($localRoot, '/grant', '*S-1-5-32-545:(OI)(CI)M', '/T', '/C') $true | Out-Null
 
     $computerName = $env:COMPUTERNAME
     if ($computerName) {{
-        Run-External 'icacls.exe' @($localRoot, '/grant', ($computerName + '\\LocalWebCondor:(OI)(CI)M'), '/C') $true | Out-Null
+        Run-External 'icacls.exe' @($localRoot, '/grant', ($computerName + '\\LocalWebCondor:(OI)(CI)M'), '/T', '/C') $true | Out-Null
     }}
     if ($shareUser) {{
-        Run-External 'icacls.exe' @($localRoot, '/grant', ($shareUser + ':(OI)(CI)M'), '/C') $true | Out-Null
+        Run-External 'icacls.exe' @($localRoot, '/grant', ($shareUser + ':(OI)(CI)M'), '/T', '/C') $true | Out-Null
     }}
 
     # 已有同名共享时先删除。失败通常表示不存在，可以忽略。
@@ -478,15 +568,11 @@ $result | ConvertTo-Json -Depth 8 | Set-Content -Path $resultPath -Encoding UTF8
             )
 
         unc_root = str(admin_result.get("unc_root") or unc_root).strip()
-        self.set_shared_io_config(True, local_root=str(root), unc_root=unc_root, share_name=share_name)
-        items = self._normalize_shared_io_items()
-        for item in items:
-            if str(item.get("unc_root") or "").strip().lower() == unc_root.lower():
-                item["role"] = "parent"
-                item["connect_ok"] = True
-                item["connect_message"] = "父节点共享目录已创建，已通过一次 UAC 管理员授权完成。"
-                item["updated_at"] = now_iso()
-        self._save_shared_io_items(items, primary_unc_root=unc_root)
+        config = self.set_shared_io_config(True, local_root=str(root), unc_root=unc_root, share_name=share_name)
+        self.state["shared_io_config"]["role"] = "parent"
+        self.state["shared_io_config"]["connect_ok"] = True
+        self.state["shared_io_config"]["connect_message"] = "父节点共享目录已创建，已通过一次 UAC 管理员授权完成。"
+        self._save_state()
         config = self.shared_io_config()
         config["commands"] = commands
         config["message"] = f"已创建共享目录：{unc_root} -> {root}"
@@ -547,8 +633,7 @@ $result | ConvertTo-Json -Depth 8 | Set-Content -Path $resultPath -Encoding UTF8
             ok = False
             message = f"子节点自动连接共享目录失败：{type(exc).__name__}: {exc}"
 
-        items = self._normalize_shared_io_items()
-        new_item = {
+        self.state["shared_io_config"] = {
             "enabled": bool(ok),
             "local_root": "",
             "unc_root": unc_root,
@@ -559,16 +644,7 @@ $result | ConvertTo-Json -Depth 8 | Set-Content -Path $resultPath -Encoding UTF8
             "connect_message": message,
             "updated_at": now_iso(),
         }
-        key = unc_root.lower()
-        replaced = False
-        for idx, item in enumerate(items):
-            if str(item.get("unc_root") or "").strip().lower() == key:
-                items[idx] = {**item, **new_item}
-                replaced = True
-                break
-        if not replaced:
-            items.append(new_item)
-        self._save_shared_io_items(items, primary_unc_root=unc_root)
+        self._save_state()
         return {
             "ok": bool(ok),
             "enabled": bool(ok),
@@ -581,40 +657,54 @@ $result | ConvertTo-Json -Depth 8 | Set-Content -Path $resultPath -Encoding UTF8
         }
 
     def test_shared_io(self) -> Dict[str, Any]:
-        """在当前机器上测试共享目录是否可读写。
-
-        父节点测试通过只代表父节点本机可访问。子节点仍需能访问同一个 UNC 路径。
-        """
+        """测试当前配置的共享目录是否可读写。多共享目录会逐个测试。"""
         cfg = self.shared_io_config()
-        if not cfg.get("enabled"):
-            return {"ok": False, "message": "共享目录模式未启用", "config": cfg}
-        unc_root = str(cfg.get("unc_root") or "").strip()
-        if not unc_root:
-            return {"ok": False, "message": "共享 UNC 路径为空", "config": cfg}
+        shares = cfg.get("shares") if isinstance(cfg.get("shares"), list) else []
+        if not shares and cfg.get("unc_root"):
+            shares = [cfg]
+        if not cfg.get("enabled") or not shares:
+            return {"ok": False, "message": "共享目录模式未启用", "config": cfg, "results": []}
 
-        test_dir = Path(unc_root) / "_localweb_share_test"
-        test_file = test_dir / f"test_{int(time.time())}.txt"
-        try:
-            test_dir.mkdir(parents=True, exist_ok=True)
-            test_file.write_text("ok", encoding="utf-8")
-            text = test_file.read_text(encoding="utf-8")
+        results: List[Dict[str, Any]] = []
+        for item in shares:
+            unc_root = str(item.get("unc_root") or "").strip()
+            share_name = str(item.get("share_name") or "").strip()
+            if not unc_root:
+                results.append({"ok": False, "share_name": share_name, "message": "共享 UNC 路径为空"})
+                continue
+            test_dir = Path(unc_root) / "_localweb_share_test"
+            test_file = test_dir / f"test_{socket.gethostname()}_{int(time.time())}.txt"
             try:
-                test_file.unlink(missing_ok=True)
-            except Exception:
-                pass
-            return {
-                "ok": text == "ok",
-                "message": "共享目录读写测试通过" if text == "ok" else "共享目录读写测试异常",
-                "config": cfg,
-                "test_path": str(test_file),
-            }
-        except Exception as exc:
-            return {
-                "ok": False,
-                "message": f"共享目录读写测试失败：{type(exc).__name__}: {exc}",
-                "config": cfg,
-                "test_path": str(test_file),
-            }
+                test_dir.mkdir(parents=True, exist_ok=True)
+                test_file.write_text("ok", encoding="utf-8")
+                text = test_file.read_text(encoding="utf-8")
+                try:
+                    test_file.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                ok = text == "ok"
+                results.append({
+                    "ok": ok,
+                    "share_name": share_name,
+                    "unc_root": unc_root,
+                    "message": "共享目录读写测试通过" if ok else "共享目录读写测试异常",
+                    "test_path": str(test_file),
+                })
+            except Exception as exc:
+                results.append({
+                    "ok": False,
+                    "share_name": share_name,
+                    "unc_root": unc_root,
+                    "message": f"共享目录读写测试失败：{type(exc).__name__}: {exc}",
+                    "test_path": str(test_file),
+                })
+        ok = all(bool(x.get("ok")) for x in results)
+        return {
+            "ok": ok,
+            "message": "全部共享目录读写测试通过" if ok else "部分共享目录读写测试失败",
+            "config": cfg,
+            "results": results,
+        }
 
     def _condor_bin(self) -> Path:
         runtime = get_htcondor_runtime_status()
@@ -962,7 +1052,7 @@ $result | ConvertTo-Json -Depth 8 | Set-Content -Path $resultPath -Encoding UTF8
         launcher_text = f"""
 $ErrorActionPreference = 'Stop'
 $target = {self._ps_quote(str(script_path))}
-Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-NonInteractive','-File',$target) -Verb RunAs -WindowStyle Minimized -Wait
+Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',$target) -Verb RunAs -Wait
 """
         launcher_path.write_text(launcher_text, encoding="utf-8-sig")
 
