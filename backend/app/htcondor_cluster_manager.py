@@ -50,6 +50,15 @@ class HTCondorClusterManager:
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
         self.default_timeout_seconds = int(os.environ.get("LOCAL_WEB_HTCONDOR_JOB_TIMEOUT", "604800"))
+        # 作业监控轮询间隔。默认 1.5 秒，减少多个并发子任务同时每秒读取日志造成的磁盘 I/O。
+        # 如需更快刷新可设置 LOCAL_WEB_HTCONDOR_POLL_SECONDS=1；如任务很多可设为 2~3。
+        try:
+            self.job_poll_seconds = max(
+                0.5,
+                min(10.0, float(os.environ.get("LOCAL_WEB_HTCONDOR_POLL_SECONDS", "1.5") or "1.5")),
+            )
+        except Exception:
+            self.job_poll_seconds = 1.5
         self.running_jobs = {}
         self.state = self._load_state()
 
@@ -92,6 +101,62 @@ class HTCondorClusterManager:
         except Exception:
             return raw.decode(self._win_text_encoding(), errors="replace")
 
+    def _decode_text_bytes_auto(self, raw: bytes, at_start: bool = False) -> str:
+        """解码日志字节，兼容 UTF-8、UTF-16 BOM 和 Windows 本地编码。"""
+        if not raw:
+            return ""
+        try:
+            if at_start and raw.startswith(b"\xff\xfe"):
+                return raw.decode("utf-16-le", errors="replace").lstrip("\ufeff")
+            if at_start and raw.startswith(b"\xfe\xff"):
+                return raw.decode("utf-16-be", errors="replace").lstrip("\ufeff")
+            if at_start and raw.startswith(b"\xef\xbb\xbf"):
+                return raw.decode("utf-8-sig", errors="replace")
+
+            text = raw.decode("utf-8", errors="replace")
+            if "�" in text and os.name == "nt":
+                alt = raw.decode(self._win_text_encoding(), errors="replace")
+                if alt.count("�") < text.count("�"):
+                    return alt
+            return text
+        except Exception:
+            return raw.decode(self._win_text_encoding(), errors="replace")
+
+    def _read_text_delta_auto(self, path: Path, offset: int = 0) -> tuple[str, int]:
+        """只读取日志文件从 offset 之后新增的字节。
+
+        旧实现每轮都读取完整 stdout/stderr/event.log，日志越长，重复读取量越大。
+        新实现只读取新增部分；若文件被截断或重新创建，则自动从头读取。
+        """
+        try:
+            if not path.is_file():
+                return "", max(0, int(offset or 0))
+            size = int(path.stat().st_size)
+            current = max(0, int(offset or 0))
+            if size < current:
+                current = 0
+            if size == current:
+                return "", current
+            with path.open("rb") as stream:
+                stream.seek(current)
+                raw = stream.read()
+            return self._decode_text_bytes_auto(raw, at_start=(current == 0)), current + len(raw)
+        except Exception:
+            return "", max(0, int(offset or 0))
+
+    def _emit_live_piece(self, callback, job_id: str, prefix: str, piece: str):
+        """直接发送增量日志片段，避免再次按完整文本长度切片。"""
+        if callback is None or not piece:
+            return
+        try:
+            callback({
+                "type": str(prefix or "event").lower(),
+                "job_id": job_id,
+                "text": piece,
+            })
+        except Exception:
+            pass
+
     def _win_text_encoding(self) -> str:
         # Windows PowerShell 5.1 的错误输出通常是系统本地编码，
         # 中文 Windows 上一般是 gbk。这里不用写死 gbk，直接问系统。
@@ -123,12 +188,12 @@ class HTCondorClusterManager:
     # =========================
     # HTCondor 共享目录模式配置
     # =========================
-
     def _normalize_shared_io_items(self) -> List[Dict[str, Any]]:
-        """把历史单共享配置和新版多共享配置统一为 shares 列表。"""
+        """把旧版单共享配置和新版多共享配置统一成 shares 列表。"""
         raw = self.state.get("shared_io_config") or {}
         if not isinstance(raw, dict):
             raw = {}
+
         items: List[Dict[str, Any]] = []
 
         def add_item(item: Dict[str, Any]):
@@ -139,7 +204,7 @@ class HTCondorClusterManager:
             share_name = str(item.get("share_name") or "").strip()
             if not share_name:
                 share_name = (unc_root.rstrip("\\/").split("\\")[-1] if unc_root else "LocalWebData") or "LocalWebData"
-            enabled = bool(item.get("enabled", True)) and bool(unc_root or local_root)
+            enabled = bool(item.get("enabled", True)) and bool(local_root or unc_root)
             clean = {
                 "enabled": enabled,
                 "local_root": local_root,
@@ -156,7 +221,7 @@ class HTCondorClusterManager:
                 return
             for idx, old in enumerate(items):
                 old_key = str(old.get("unc_root") or old.get("local_root") or old.get("share_name") or "").lower()
-                if old_key == key:
+                if old_key == key or str(old.get("share_name") or "").lower() == share_name.lower():
                     items[idx] = {**old, **clean}
                     return
             items.append(clean)
@@ -256,13 +321,14 @@ class HTCondorClusterManager:
             unc_root = f"\\\\{host}\\{share_name}"
 
         items = self._normalize_shared_io_items()
+        raw = self.state.get("shared_io_config") or {}
         new_item = {
             "enabled": True,
             "local_root": local_root,
             "unc_root": unc_root,
             "share_name": share_name,
-            "role": str((self.state.get("shared_io_config") or {}).get("role") or "parent"),
-            "parent_ip": str((self.state.get("shared_io_config") or {}).get("parent_ip") or ""),
+            "role": str(raw.get("role") or "parent"),
+            "parent_ip": str(raw.get("parent_ip") or ""),
             "connect_ok": True,
             "connect_message": "共享目录已添加",
             "updated_at": now_iso(),
@@ -280,6 +346,111 @@ class HTCondorClusterManager:
         self._save_shared_io_items(items, primary_unc_root=unc_root)
         data = self.shared_io_config()
         data["message"] = "共享目录已添加"
+        return data
+
+    def delete_shared_io_config(
+        self,
+        share_name: str = "",
+        unc_root: str = "",
+        local_root: str = "",
+        delete_windows_share: bool = True,
+    ) -> Dict[str, Any]:
+        """删除一个共享目录配置。父节点可同时删除 Windows 共享，但不会删除本地数据文件。"""
+        share_name = str(share_name or "").strip()
+        unc_root = str(unc_root or "").strip()
+        local_root = str(local_root or "").strip()
+        if not (share_name or unc_root or local_root):
+            raise HTCondorClusterError("删除共享目录时必须提供共享名、UNC 路径或本地目录。")
+
+        items = self._normalize_shared_io_items()
+        kept: List[Dict[str, Any]] = []
+        deleted: List[Dict[str, Any]] = []
+
+        def same(a: str, b: str) -> bool:
+            return str(a or "").strip().rstrip("\\/").lower() == str(b or "").strip().rstrip("\\/").lower()
+
+        for item in items:
+            matched = False
+            if share_name and same(item.get("share_name"), share_name):
+                matched = True
+            if unc_root and same(item.get("unc_root"), unc_root):
+                matched = True
+            if local_root and same(item.get("local_root"), local_root):
+                matched = True
+            if matched:
+                deleted.append(item)
+            else:
+                kept.append(item)
+
+        if not deleted:
+            raise HTCondorClusterError("没有找到要删除的共享目录配置。")
+
+        commands: List[Dict[str, Any]] = []
+        admin_result: Dict[str, Any] | None = None
+        # 父节点删除共享名需要管理员权限；只删除共享映射，不删除本地文件夹。
+        if delete_windows_share and os.name == "nt":
+            names = []
+            for item in deleted:
+                name = str(item.get("share_name") or "").strip()
+                if name and name not in names:
+                    names.append(name)
+            if names:
+                result_path = self.runtime_dir / "cluster_admin" / "delete_share_result.json"
+                names_json = json.dumps(names, ensure_ascii=False)
+                script_text = f"""
+$ErrorActionPreference = 'Continue'
+$resultPath = {self._ps_quote(str(result_path))}
+$shareNames = ConvertFrom-Json -InputObject {self._ps_quote(names_json)}
+$commands = New-Object System.Collections.ArrayList
+function Add-CommandResult([string]$command, [bool]$ok, [string]$stdout, [string]$stderr, [int]$returncode) {{
+    [void]$commands.Add([ordered]@{{ command=$command; ok=$ok; stdout=$stdout; stderr=$stderr; returncode=$returncode }})
+}}
+foreach ($name in $shareNames) {{
+    try {{
+        $output = & net.exe share $name /delete /y 2>&1
+        $code = if ($null -eq $LASTEXITCODE) {{ 0 }} else {{ [int]$LASTEXITCODE }}
+        $text = (($output | Out-String).Trim())
+        Add-CommandResult ('net share ' + $name + ' /delete') ($code -eq 0 -or $text -match '不存在|does not exist|not found') $text '' $code
+    }} catch {{
+        Add-CommandResult ('net share ' + $name + ' /delete') $false '' $_.Exception.Message -1
+    }}
+    try {{
+        if (Get-Command Remove-SmbShare -ErrorAction SilentlyContinue) {{
+            $s = Get-SmbShare -Name $name -ErrorAction SilentlyContinue
+            if ($null -ne $s) {{
+                Remove-SmbShare -Name $name -Force -ErrorAction Stop
+                Add-CommandResult ('Remove-SmbShare ' + $name) $true 'ok' '' 0
+            }} else {{
+                Add-CommandResult ('Remove-SmbShare ' + $name) $true 'not exists' '' 0
+            }}
+        }}
+    }} catch {{
+        Add-CommandResult ('Remove-SmbShare ' + $name) $false '' $_.Exception.Message -1
+    }}
+}}
+[ordered]@{{
+    success = $true
+    message = '共享目录已从 Windows 共享中移除；本地数据文件未删除。'
+    deleted_share_names = $shareNames
+    commands = $commands
+}} | ConvertTo-Json -Depth 8 | Set-Content -Path $resultPath -Encoding UTF8
+"""
+                admin_result = self._run_elevated_ps("delete_share", script_text, timeout=180)
+                commands = list(admin_result.get("commands") or []) if isinstance(admin_result, dict) else []
+
+        # 子节点或非管理员场景下，尝试移除 net use 映射；失败不影响配置删除。
+        for item in deleted:
+            unc = str(item.get("unc_root") or "").strip()
+            if unc:
+                commands.append({"command": f"net use {unc} /delete", **self._run(["net.exe", "use", unc, "/delete", "/y"], timeout=30)})
+
+        self._save_shared_io_items(kept)
+        data = self.shared_io_config()
+        data["message"] = f"已删除 {len(deleted)} 个共享目录配置。本地目录和数据文件不会被删除。"
+        data["deleted"] = deleted
+        data["deleted_count"] = len(deleted)
+        data["commands"] = commands
+        data["admin_result"] = admin_result or {}
         return data
 
     def prepare_local_share(self, local_root: str, share_name: str = "LocalWebData", unc_host: str = "") -> Dict[str, Any]:
@@ -313,22 +484,6 @@ class HTCondorClusterManager:
         unc_root = f"\\\\{host}\\{share_name}"
 
         root = Path(local_root)
-        # 共享目录只应该指向数据目录，不能直接共享系统项目目录。
-        # 用户误选 D:/local_web_module_system 时，icacls 递归扫描 node_modules/runtime 等目录会非常慢，
-        # 管理员 PowerShell 窗口看起来会一直空白卡住；同时也不安全。
-        try:
-            resolved_root = root.resolve()
-            resolved_project = self.project_root.resolve()
-            resolved_base = self.base_dir.resolve()
-            if resolved_root in {resolved_project, resolved_base}:
-                raise HTCondorClusterError(
-                    "共享目录不能选择系统项目目录。请改成数据目录，例如 D:/H8/data。"
-                )
-        except HTCondorClusterError:
-            raise
-        except Exception:
-            pass
-
         result_path = self.runtime_dir / "cluster_admin" / "prepare_share_result.json"
         share_user = str(os.environ.get("LOCAL_WEB_HTCONDOR_SHARE_USER", "")).strip()
 
@@ -385,15 +540,15 @@ try {{
     Add-CommandResult ('New-Item -ItemType Directory -Force -Path ' + $localRoot) $true 'ok' '' 0
 
     # NTFS 权限优先用 SID，避免中文 Windows 上 Everyone/Users 名称本地化导致失败。
-    Run-External 'icacls.exe' @($localRoot, '/grant', '*S-1-1-0:(OI)(CI)M', '/C') $true | Out-Null
-    Run-External 'icacls.exe' @($localRoot, '/grant', '*S-1-5-32-545:(OI)(CI)M', '/C') $true | Out-Null
+    Run-External 'icacls.exe' @($localRoot, '/grant', '*S-1-1-0:(OI)(CI)M', '/T', '/C') $true | Out-Null
+    Run-External 'icacls.exe' @($localRoot, '/grant', '*S-1-5-32-545:(OI)(CI)M', '/T', '/C') $true | Out-Null
 
     $computerName = $env:COMPUTERNAME
     if ($computerName) {{
-        Run-External 'icacls.exe' @($localRoot, '/grant', ($computerName + '\\LocalWebCondor:(OI)(CI)M'), '/C') $true | Out-Null
+        Run-External 'icacls.exe' @($localRoot, '/grant', ($computerName + '\\LocalWebCondor:(OI)(CI)M'), '/T', '/C') $true | Out-Null
     }}
     if ($shareUser) {{
-        Run-External 'icacls.exe' @($localRoot, '/grant', ($shareUser + ':(OI)(CI)M'), '/C') $true | Out-Null
+        Run-External 'icacls.exe' @($localRoot, '/grant', ($shareUser + ':(OI)(CI)M'), '/T', '/C') $true | Out-Null
     }}
 
     # 已有同名共享时先删除。失败通常表示不存在，可以忽略。
@@ -478,15 +633,11 @@ $result | ConvertTo-Json -Depth 8 | Set-Content -Path $resultPath -Encoding UTF8
             )
 
         unc_root = str(admin_result.get("unc_root") or unc_root).strip()
-        self.set_shared_io_config(True, local_root=str(root), unc_root=unc_root, share_name=share_name)
-        items = self._normalize_shared_io_items()
-        for item in items:
-            if str(item.get("unc_root") or "").strip().lower() == unc_root.lower():
-                item["role"] = "parent"
-                item["connect_ok"] = True
-                item["connect_message"] = "父节点共享目录已创建，已通过一次 UAC 管理员授权完成。"
-                item["updated_at"] = now_iso()
-        self._save_shared_io_items(items, primary_unc_root=unc_root)
+        config = self.set_shared_io_config(True, local_root=str(root), unc_root=unc_root, share_name=share_name)
+        self.state["shared_io_config"]["role"] = "parent"
+        self.state["shared_io_config"]["connect_ok"] = True
+        self.state["shared_io_config"]["connect_message"] = "父节点共享目录已创建，已通过一次 UAC 管理员授权完成。"
+        self._save_state()
         config = self.shared_io_config()
         config["commands"] = commands
         config["message"] = f"已创建共享目录：{unc_root} -> {root}"
@@ -547,8 +698,7 @@ $result | ConvertTo-Json -Depth 8 | Set-Content -Path $resultPath -Encoding UTF8
             ok = False
             message = f"子节点自动连接共享目录失败：{type(exc).__name__}: {exc}"
 
-        items = self._normalize_shared_io_items()
-        new_item = {
+        self.state["shared_io_config"] = {
             "enabled": bool(ok),
             "local_root": "",
             "unc_root": unc_root,
@@ -559,16 +709,7 @@ $result | ConvertTo-Json -Depth 8 | Set-Content -Path $resultPath -Encoding UTF8
             "connect_message": message,
             "updated_at": now_iso(),
         }
-        key = unc_root.lower()
-        replaced = False
-        for idx, item in enumerate(items):
-            if str(item.get("unc_root") or "").strip().lower() == key:
-                items[idx] = {**item, **new_item}
-                replaced = True
-                break
-        if not replaced:
-            items.append(new_item)
-        self._save_shared_io_items(items, primary_unc_root=unc_root)
+        self._save_state()
         return {
             "ok": bool(ok),
             "enabled": bool(ok),
@@ -581,40 +722,54 @@ $result | ConvertTo-Json -Depth 8 | Set-Content -Path $resultPath -Encoding UTF8
         }
 
     def test_shared_io(self) -> Dict[str, Any]:
-        """在当前机器上测试共享目录是否可读写。
-
-        父节点测试通过只代表父节点本机可访问。子节点仍需能访问同一个 UNC 路径。
-        """
+        """测试当前配置的共享目录是否可读写。多共享目录会逐个测试。"""
         cfg = self.shared_io_config()
-        if not cfg.get("enabled"):
-            return {"ok": False, "message": "共享目录模式未启用", "config": cfg}
-        unc_root = str(cfg.get("unc_root") or "").strip()
-        if not unc_root:
-            return {"ok": False, "message": "共享 UNC 路径为空", "config": cfg}
+        shares = cfg.get("shares") if isinstance(cfg.get("shares"), list) else []
+        if not shares and cfg.get("unc_root"):
+            shares = [cfg]
+        if not cfg.get("enabled") or not shares:
+            return {"ok": False, "message": "共享目录模式未启用", "config": cfg, "results": []}
 
-        test_dir = Path(unc_root) / "_localweb_share_test"
-        test_file = test_dir / f"test_{int(time.time())}.txt"
-        try:
-            test_dir.mkdir(parents=True, exist_ok=True)
-            test_file.write_text("ok", encoding="utf-8")
-            text = test_file.read_text(encoding="utf-8")
+        results: List[Dict[str, Any]] = []
+        for item in shares:
+            unc_root = str(item.get("unc_root") or "").strip()
+            share_name = str(item.get("share_name") or "").strip()
+            if not unc_root:
+                results.append({"ok": False, "share_name": share_name, "message": "共享 UNC 路径为空"})
+                continue
+            test_dir = Path(unc_root) / "_localweb_share_test"
+            test_file = test_dir / f"test_{socket.gethostname()}_{int(time.time())}.txt"
             try:
-                test_file.unlink(missing_ok=True)
-            except Exception:
-                pass
-            return {
-                "ok": text == "ok",
-                "message": "共享目录读写测试通过" if text == "ok" else "共享目录读写测试异常",
-                "config": cfg,
-                "test_path": str(test_file),
-            }
-        except Exception as exc:
-            return {
-                "ok": False,
-                "message": f"共享目录读写测试失败：{type(exc).__name__}: {exc}",
-                "config": cfg,
-                "test_path": str(test_file),
-            }
+                test_dir.mkdir(parents=True, exist_ok=True)
+                test_file.write_text("ok", encoding="utf-8")
+                text = test_file.read_text(encoding="utf-8")
+                try:
+                    test_file.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                ok = text == "ok"
+                results.append({
+                    "ok": ok,
+                    "share_name": share_name,
+                    "unc_root": unc_root,
+                    "message": "共享目录读写测试通过" if ok else "共享目录读写测试异常",
+                    "test_path": str(test_file),
+                })
+            except Exception as exc:
+                results.append({
+                    "ok": False,
+                    "share_name": share_name,
+                    "unc_root": unc_root,
+                    "message": f"共享目录读写测试失败：{type(exc).__name__}: {exc}",
+                    "test_path": str(test_file),
+                })
+        ok = all(bool(x.get("ok")) for x in results)
+        return {
+            "ok": ok,
+            "message": "全部共享目录读写测试通过" if ok else "部分共享目录读写测试失败",
+            "config": cfg,
+            "results": results,
+        }
 
     def _condor_bin(self) -> Path:
         runtime = get_htcondor_runtime_status()
@@ -962,7 +1117,7 @@ $result | ConvertTo-Json -Depth 8 | Set-Content -Path $resultPath -Encoding UTF8
         launcher_text = f"""
 $ErrorActionPreference = 'Stop'
 $target = {self._ps_quote(str(script_path))}
-Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-NonInteractive','-File',$target) -Verb RunAs -WindowStyle Minimized -Wait
+Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',$target) -Verb RunAs -Wait
 """
         launcher_path.write_text(launcher_text, encoding="utf-8-sig")
 
@@ -1294,7 +1449,7 @@ finally {{
         args = [self._exe("condor_status.exe")]
         if pool_ip:
             args.extend(["-pool", f"{pool_ip}:9618"])
-        args.extend(["-af", "Name", "Machine", "State", "Activity", "Cpus", "Memory"])
+        args.extend(["-af", "Name", "Machine", "State", "Activity", "Cpus", "Memory", "SlotType", "PartitionableSlot"])
         result = self._run(args, timeout=15)
         text = "\n".join(x for x in [result.get("stdout", ""), result.get("stderr", ""), result.get("error", "")] if x).strip()
         items = []
@@ -1308,6 +1463,8 @@ finally {{
                     "activity": parts[3],
                     "cpus": parts[4],
                     "memory": parts[5],
+                    "slot_type": parts[6] if len(parts) >= 7 else "",
+                    "partitionable": str(parts[7]).lower() == "true" if len(parts) >= 8 else False,
                 })
         return {"ok": bool(result.get("ok")), "text": text, "items": items}
 
@@ -1888,6 +2045,29 @@ else {
             seen.add(key)
             self._grant_one_path_for_job(p)
 
+    def _local_machine_names(self) -> set[str]:
+        """返回当前父节点可能出现在 HTCondor Machine 字段中的名字。"""
+        names: set[str] = set()
+        for value in [
+            os.environ.get("COMPUTERNAME", ""),
+            os.environ.get("HOSTNAME", ""),
+            socket.gethostname(),
+            socket.getfqdn(),
+        ]:
+            text = str(value or "").strip().lower()
+            if text:
+                names.add(text)
+                names.add(text.split(".")[0])
+        return names
+
+    def _is_local_target_machine(self, target_machine: str) -> bool:
+        """判断 HTCondor 目标节点是否就是父节点本机。"""
+        target = str(target_machine or "").strip().lower()
+        if not target:
+            return False
+        local_names = self._local_machine_names()
+        return target in local_names or target.split(".")[0] in local_names
+
     def _write_job_files(
         self,
         job_id: str,
@@ -2039,7 +2219,13 @@ else {
         share_user = str(os.environ.get("LOCAL_WEB_HTCONDOR_SHARE_USER", "")).strip()
         share_password = str(os.environ.get("LOCAL_WEB_HTCONDOR_SHARE_PASSWORD", "")).strip()
 
-        if shared_cfg.get("enabled") and share_unc:
+        local_target_machine = self._is_local_target_machine(target_machine)
+        if shared_cfg.get("enabled") and share_unc and local_target_machine:
+            lines.extend([
+                "echo [HTCONDOR] shared directory mode enabled, but target is parent/local machine; skip net use and use local paths from config.",
+            ])
+
+        if shared_cfg.get("enabled") and share_unc and not local_target_machine:
             safe_unc = share_unc.replace("%", "%%")
             safe_user = share_user.replace("%", "%%")
             safe_password = share_password.replace("%", "%%")
@@ -2108,6 +2294,12 @@ else {
             val = str(value).replace("%", "%%")
             lines.append(f"set {key}={val}")
 
+        lines.extend([
+            "echo [HTCONDOR] request_cpus=%LOCAL_WEB_HTCONDOR_REQUEST_CPUS%",
+            "echo [HTCONDOR] request_memory_mb=%LOCAL_WEB_HTCONDOR_REQUEST_MEMORY_MB%",
+            "echo [HTCONDOR] threads_per_exe=%LOCAL_WEB_HTCONDOR_THREADS_PER_EXE%",
+        ])
+
         if working_dir:
             lines.append(f"cd /d {self._batch_quote(str(working_dir))}")
             lines.append("if errorlevel 1 exit /b 100")
@@ -2145,7 +2337,22 @@ else {
         transfer_output_line = f"transfer_output_files = {transfer_output_files}\n" if transfer_output_files else ""
 
         try:
-            request_memory_mb = int(os.environ.get("LOCAL_WEB_HTCONDOR_REQUEST_MEMORY_MB", "8192") or "8192")
+            request_cpus_raw = (
+                (env or {}).get("LOCAL_WEB_HTCONDOR_REQUEST_CPUS")
+                or os.environ.get("LOCAL_WEB_HTCONDOR_REQUEST_CPUS", "1")
+                or "1"
+            )
+            request_cpus = max(1, min(128, int(request_cpus_raw)))
+        except Exception:
+            request_cpus = 1
+
+        try:
+            request_memory_raw = (
+                (env or {}).get("LOCAL_WEB_HTCONDOR_REQUEST_MEMORY_MB")
+                or os.environ.get("LOCAL_WEB_HTCONDOR_REQUEST_MEMORY_MB", "16384")
+                or "16384"
+            )
+            request_memory_mb = int(request_memory_raw)
         except Exception:
             request_memory_mb = 8192
         request_memory_mb = max(1024, request_memory_mb)
@@ -2175,7 +2382,7 @@ stream_error = False
 output = stdout.txt
 error = stderr.txt
 log = event.log
-request_cpus = 1
+request_cpus = {request_cpus}
 request_memory = {request_memory_mb}MB
 request_disk = 1024MB
 run_as_owner = {run_as_owner_value}
@@ -2375,10 +2582,21 @@ queue 1
         if not cluster_id:
             raise HTCondorClusterError(f"condor_submit 失败：{submit_text}")
 
+        try:
+            submitted_request_cpus = max(1, int((env or {}).get("LOCAL_WEB_HTCONDOR_REQUEST_CPUS") or 1))
+        except Exception:
+            submitted_request_cpus = 1
+        try:
+            submitted_request_memory_mb = max(1024, int((env or {}).get("LOCAL_WEB_HTCONDOR_REQUEST_MEMORY_MB") or 1024))
+        except Exception:
+            submitted_request_memory_mb = 1024
+
         self.running_jobs[str(job_id)] = {
             "cluster_id": cluster_id,
             "job_dir": str(files["job_dir"]),
             "event_log": str(files["event_log"]),
+            "request_cpus": submitted_request_cpus,
+            "request_memory_mb": submitted_request_memory_mb,
         }
 
         if on_update is not None:
@@ -2389,6 +2607,9 @@ queue 1
                     "cluster_id": cluster_id,
                     "job_dir": str(files["job_dir"]),
                     "target_machine": str(target_machine or ""),
+                    "request_cpus": submitted_request_cpus,
+                    "request_memory_mb": submitted_request_memory_mb,
+                    "threads_per_exe": str((env or {}).get("LOCAL_WEB_HTCONDOR_THREADS_PER_EXE") or ""),
                 })
             except Exception:
                 pass
@@ -2402,9 +2623,14 @@ queue 1
 
         wait_stdout = ""
         wait_stderr = ""
-        last_stdout_len = 0
-        last_stderr_len = 0
-        last_event_len = 0
+        stdout_offset = 0
+        stderr_offset = 0
+        event_offset = 0
+        # 仅保留最近的事件/输出片段用于 Hold 和 return_code 判断，避免内存无限增长。
+        stdout_tail = ""
+        stderr_tail = ""
+        event_tail = ""
+        tail_limit = 256 * 1024
         cancelled = False
         cancel_requested = False
 
@@ -2441,14 +2667,24 @@ queue 1
                     except Exception:
                         pass
 
-                # stream_output / stream_error 可能会把日志边运行边写回来。
-                # 如果执行节点暂时不支持流式输出，也不影响最后读取完整日志。
-                stdout_text = self._read_text_auto(files["stdout"])
-                stderr_text = self._read_text_auto(files["stderr"])
-                event_text = self._read_text_auto(files["event_log"])
-                last_stdout_len = self._emit_live_text(on_update, job_id, "stdout", stdout_text, last_stdout_len)
-                last_stderr_len = self._emit_live_text(on_update, job_id, "stderr", stderr_text, last_stderr_len)
-                last_event_len = self._emit_live_text(on_update, job_id, "event", event_text, last_event_len)
+                # 只读取自上次轮询后新增的日志字节，避免日志越长重复读取量越大。
+                stdout_piece, stdout_offset = self._read_text_delta_auto(files["stdout"], stdout_offset)
+                stderr_piece, stderr_offset = self._read_text_delta_auto(files["stderr"], stderr_offset)
+                event_piece, event_offset = self._read_text_delta_auto(files["event_log"], event_offset)
+                self._emit_live_piece(on_update, job_id, "stdout", stdout_piece)
+                self._emit_live_piece(on_update, job_id, "stderr", stderr_piece)
+                self._emit_live_piece(on_update, job_id, "event", event_piece)
+
+                if stdout_piece:
+                    stdout_tail = (stdout_tail + stdout_piece)[-tail_limit:]
+                if stderr_piece:
+                    stderr_tail = (stderr_tail + stderr_piece)[-tail_limit:]
+                if event_piece:
+                    event_tail = (event_tail + event_piece)[-tail_limit:]
+
+                stdout_text = stdout_tail
+                stderr_text = stderr_tail
+                event_text = event_tail
 
                 # HTCondor 传输输出失败时，作业会进入 Hold，condor_wait 不会自然返回。
                 # 典型情况：EXE 已经 return_code=0，但 result.txt 没有写在执行沙箱根目录，
@@ -2509,19 +2745,19 @@ queue 1
                         pass
                     raise HTCondorClusterError("condor_wait 等待超时，已尝试取消 HTCondor 作业。")
 
-                time.sleep(1.0)
+                time.sleep(self.job_poll_seconds)
 
             out, err = process.communicate(timeout=5)
             wait_stdout = out or ""
             wait_stderr = err or ""
 
-            # 最后再读一次，避免最后几行输出没有推到前端。
-            stdout_text = self._read_text_auto(files["stdout"])
-            stderr_text = self._read_text_auto(files["stderr"])
-            event_text = self._read_text_auto(files["event_log"])
-            last_stdout_len = self._emit_live_text(on_update, job_id, "stdout", stdout_text, last_stdout_len)
-            last_stderr_len = self._emit_live_text(on_update, job_id, "stderr", stderr_text, last_stderr_len)
-            last_event_len = self._emit_live_text(on_update, job_id, "event", event_text, last_event_len)
+            # 最后再读取一次增量，避免最后几行输出没有推到前端。
+            stdout_piece, stdout_offset = self._read_text_delta_auto(files["stdout"], stdout_offset)
+            stderr_piece, stderr_offset = self._read_text_delta_auto(files["stderr"], stderr_offset)
+            event_piece, event_offset = self._read_text_delta_auto(files["event_log"], event_offset)
+            self._emit_live_piece(on_update, job_id, "stdout", stdout_piece)
+            self._emit_live_piece(on_update, job_id, "stderr", stderr_piece)
+            self._emit_live_piece(on_update, job_id, "event", event_piece)
 
             if process.returncode != 0 and not cancelled:
                 wait_text = "\n".join(x for x in [wait_stdout, wait_stderr] if x)

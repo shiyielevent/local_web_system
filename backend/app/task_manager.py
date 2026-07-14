@@ -2,10 +2,12 @@ from __future__ import annotations
 import copy
 import fnmatch
 import json
+import math
 import time
 import os
 import re
 import shutil
+import socket
 import subprocess
 import threading
 import traceback
@@ -93,6 +95,15 @@ class TaskManager:
         self.child_start_gate_locks: Dict[str, threading.Lock] = {}
         self._last_pressure_log_at: Dict[str, float] = {}
 
+        # HTCondor 节点状态短缓存：一次任务拆分会多次读取节点 CPU/内存。
+        # 复用 2 秒内的结果可减少 condor_status 进程启动和后端锁竞争。
+        self._htcondor_node_status_cache: Dict[str, Dict[str, Any]] = {}
+        self._htcondor_node_status_cache_at = 0.0
+        self._htcondor_node_status_cache_seconds = max(
+            0.5,
+            float(os.environ.get("LOCAL_WEB_HTCONDOR_NODE_STATUS_CACHE_SECONDS", "2.0")),
+        )
+
         # 可选 HTCondor 执行后端。
         self.htcondor_manager = None
         self.htcondor_job_timeout_seconds = max(
@@ -106,6 +117,8 @@ class TaskManager:
         self.max_logs_per_task = max(200, int(os.environ.get("LOCAL_WEB_MAX_LOG_LINES_PER_TASK", "2000")))
         self._save_dirty = False
         self._save_timer: threading.Timer | None = None
+        # 防止定时保存与关键状态立即保存同时写 tasks.json。
+        self._task_save_write_lock = threading.Lock()
 
         self._load_tasks()
         self._mark_interrupted_tasks()
@@ -124,14 +137,15 @@ class TaskManager:
     # HTCondor 共享目录模式
     # =========================
     def _htcondor_shared_io_config(self) -> Dict[str, Any]:
-        """读取共享目录模式配置。支持新版多共享目录，兼容旧版单共享字段。"""
+        """读取共享目录模式配置。新版兼容多个共享目录。"""
         manager = self.htcondor_manager
         state = getattr(manager, "state", {}) if manager is not None else {}
         cfg = (state or {}).get("shared_io_config") or {}
         if not isinstance(cfg, dict):
             cfg = {}
+
         env_enabled = str(os.environ.get("LOCAL_WEB_HTCONDOR_SHARED_IO", "")).strip().lower()
-        enabled_by_env = env_enabled in {"1", "true", "yes", "on"}
+        raw_shares = cfg.get("shares") if isinstance(cfg.get("shares"), list) else []
         shares: List[Dict[str, Any]] = []
 
         def add_share(item: Dict[str, Any]):
@@ -140,30 +154,37 @@ class TaskManager:
             local_root = str(item.get("local_root") or "").strip()
             unc_root = str(item.get("unc_root") or "").strip()
             share_name = str(item.get("share_name") or "").strip() or "LocalWebData"
-            if not (local_root and unc_root):
+            enabled = bool(item.get("enabled", True)) and bool(local_root and unc_root)
+            if not enabled:
                 return
-            clean = {"enabled": bool(item.get("enabled", True)), "local_root": local_root, "unc_root": unc_root, "share_name": share_name}
-            key = (local_root.lower(), unc_root.lower())
-            for old in shares:
-                if (str(old.get("local_root") or "").lower(), str(old.get("unc_root") or "").lower()) == key:
-                    old.update(clean)
+            clean = {"enabled": True, "local_root": local_root, "unc_root": unc_root, "share_name": share_name}
+            key = (unc_root or local_root or share_name).lower()
+            for idx, old in enumerate(shares):
+                old_key = str(old.get("unc_root") or old.get("local_root") or old.get("share_name") or "").lower()
+                if old_key == key:
+                    shares[idx] = clean
                     return
             shares.append(clean)
 
-        raw_shares = cfg.get("shares")
-        if isinstance(raw_shares, list):
-            for item in raw_shares:
-                add_share(item)
-        if cfg.get("local_root") and cfg.get("unc_root"):
-            add_share(cfg)
-        env_local_root = str(os.environ.get("LOCAL_WEB_HTCONDOR_SHARE_LOCAL_ROOT", "")).strip()
-        env_unc_root = str(os.environ.get("LOCAL_WEB_HTCONDOR_SHARE_UNC_ROOT", "")).strip()
-        env_share_name = str(os.environ.get("LOCAL_WEB_HTCONDOR_SHARE_NAME", "LocalWebData")).strip() or "LocalWebData"
-        if env_local_root and env_unc_root:
-            add_share({"enabled": True, "local_root": env_local_root, "unc_root": env_unc_root, "share_name": env_share_name})
-        primary = next((x for x in shares if x.get("enabled")), shares[0] if shares else {})
-        enabled = bool((cfg.get("enabled") or enabled_by_env) and shares) or any(bool(x.get("enabled")) for x in shares)
-        return {"enabled": bool(enabled), "local_root": str(primary.get("local_root") or ""), "unc_root": str(primary.get("unc_root") or ""), "share_name": str(primary.get("share_name") or "LocalWebData"), "shares": shares}
+        for item in raw_shares:
+            add_share(item)
+
+        # 兼容旧版单共享字段和环境变量。
+        local_root = str(cfg.get("local_root") or os.environ.get("LOCAL_WEB_HTCONDOR_SHARE_LOCAL_ROOT", "")).strip()
+        unc_root = str(cfg.get("unc_root") or os.environ.get("LOCAL_WEB_HTCONDOR_SHARE_UNC_ROOT", "")).strip()
+        share_name = str(cfg.get("share_name") or os.environ.get("LOCAL_WEB_HTCONDOR_SHARE_NAME", "LocalWebData")).strip() or "LocalWebData"
+        if local_root and unc_root:
+            add_share({"enabled": True, "local_root": local_root, "unc_root": unc_root, "share_name": share_name})
+
+        enabled = bool(shares) or env_enabled in {"1", "true", "yes", "on"}
+        primary = shares[0] if shares else {"local_root": local_root, "unc_root": unc_root, "share_name": share_name}
+        return {
+            "enabled": bool(enabled and shares),
+            "local_root": str(primary.get("local_root") or ""),
+            "unc_root": str(primary.get("unc_root") or ""),
+            "share_name": str(primary.get("share_name") or "LocalWebData"),
+            "shares": shares,
+        }
 
     def _htcondor_shared_io_enabled(self) -> bool:
         return bool(self._htcondor_shared_io_config().get("enabled"))
@@ -172,24 +193,28 @@ class TaskManager:
         return str(path).replace("/", "\\").rstrip("\\")
 
     def _path_to_shared_unc(self, path: Path | str) -> str:
-        """把父节点本地路径转换成对应 UNC 路径。多共享目录时按最长本地根路径匹配。"""
+        """把父节点本地路径转换成 UNC 路径。支持多个共享目录，优先匹配最长 local_root。"""
         cfg = self._htcondor_shared_io_config()
         if not cfg.get("enabled"):
             return ""
+
         text = str(path or "").strip()
         if not text:
             return ""
-        if text.startswith("\\"):
+        if text.startswith("\\\\"):
             return text
+
         shares = cfg.get("shares") if isinstance(cfg.get("shares"), list) else []
-        if not shares:
-            shares = [cfg]
-        matches: List[tuple[int, str]] = []
+        candidates = []
         for item in shares:
             local_root_text = str(item.get("local_root") or "").strip()
             unc_root = str(item.get("unc_root") or "").strip().rstrip("\\/")
-            if not local_root_text or not unc_root:
-                continue
+            if local_root_text and unc_root:
+                candidates.append((local_root_text, unc_root))
+        # 最长路径优先，避免 D:\H8 抢先匹配 D:\H8\data。
+        candidates.sort(key=lambda x: len(str(x[0])), reverse=True)
+
+        for local_root_text, unc_root in candidates:
             try:
                 p = Path(text).resolve()
                 root = Path(local_root_text).resolve()
@@ -197,12 +222,10 @@ class TaskManager:
             except Exception:
                 continue
             rel_text = str(rel).replace("/", "\\")
-            mapped = unc_root if rel_text in {".", ""} else unc_root + "\\" + rel_text
-            matches.append((len(str(root)), mapped))
-        if not matches:
-            return ""
-        matches.sort(key=lambda x: x[0], reverse=True)
-        return matches[0][1]
+            if rel_text in {".", ""}:
+                return unc_root
+            return unc_root + "\\" + rel_text
+        return ""
 
     def _shared_task_root(self, parent_id: str) -> Path:
         cfg = self._htcondor_shared_io_config()
@@ -221,8 +244,13 @@ class TaskManager:
         unc = self._path_to_shared_unc(local_path)
         return local_path, unc
 
-    def _rewrite_output_paths_for_part_shared(self, data: Any, part_name: str):
-        """共享目录模式下，把输出目录改成父节点共享 UNC 路径。"""
+    def _rewrite_output_paths_for_part_shared(self, data: Any, part_name: str, use_local_paths: bool = False):
+        """共享目录模式下重写输出路径。
+
+        远程子节点必须写 UNC 路径，例如 \\192.168.x.x\H8data\...；
+        父节点本机任务不要绕回 UNC，直接写父节点本地路径，例如 D:\H8\...。
+        这样可以避免 netCDF4/HDF5 在 Windows UNC/SMB 路径下读取/写入不稳定。
+        """
         output_words = ["output", "out_dir", "outpath", "result", "save_dir", "target_dir"]
 
         def walk(obj: Any, key_name: str = ""):
@@ -231,9 +259,10 @@ class TaskManager:
                     low_key = str(key).lower()
                     if isinstance(value, str) and any(word in low_key for word in output_words):
                         try:
-                            _, unc = self._make_shared_part_output_path(value, part_name)
-                            if unc:
-                                obj[key] = unc
+                            local_path, unc = self._make_shared_part_output_path(value, part_name)
+                            replacement = str(local_path) if use_local_paths else unc
+                            if replacement:
+                                obj[key] = replacement
                                 continue
                         except Exception:
                             pass
@@ -243,6 +272,42 @@ class TaskManager:
                     walk(item, key_name)
 
         walk(data)
+
+    def _htcondor_local_machine_names(self) -> set[str]:
+        """返回当前父节点可能出现在 HTCondor Machine 字段中的名字。"""
+        names: set[str] = set()
+        for value in [
+            os.environ.get("COMPUTERNAME", ""),
+            os.environ.get("HOSTNAME", ""),
+            socket.gethostname(),
+            socket.getfqdn(),
+        ]:
+            text = str(value or "").strip().lower()
+            if text:
+                names.add(text)
+                names.add(text.split(".")[0])
+        return names
+
+    def _htcondor_target_uses_local_paths(self, machine: str) -> bool:
+        """判断某个 HTCondor 目标节点是否就是父节点本机。
+
+        父节点本机任务直接读写 D:\... 本地路径；
+        远程子节点任务才读写 \\父节点IP\共享名\... UNC 路径。
+        """
+        target = str(machine or "").strip().lower()
+        if not target:
+            return False
+        return target in self._htcondor_local_machine_names() or target.split(".")[0] in self._htcondor_local_machine_names()
+
+    def _map_path_like_values_to_shared_target(self, value: Any, use_local_paths: bool = False) -> Any:
+        """按目标节点重写路径。
+
+        use_local_paths=True：父节点本机任务保留 D:\... 本地路径。
+        use_local_paths=False：远程子节点任务改写为 UNC 路径。
+        """
+        if use_local_paths:
+            return value
+        return self._map_path_like_values_to_shared_unc(value)
 
     def _map_path_like_values_to_shared_unc(self, value: Any) -> Any:
         """递归把配置里的父节点本地路径改成 UNC 路径。"""
@@ -255,37 +320,51 @@ class TaskManager:
             return unc or value
         return value
 
-    def _make_htcondor_safe_env(self, env: Dict[str, str] | None = None) -> Dict[str, str]:
-        """为 HTCondor 远程 EXE 注入可选环境变量。
+    def _make_htcondor_safe_env(
+        self,
+        env: Dict[str, str] | None = None,
+        thread_limit: int | str | None = None,
+    ) -> Dict[str, str]:
+        """为 HTCondor EXE 注入与 request_cpus 一致的线程预算。
 
-        默认不限制 sklearn/joblib/BLAS 线程数，优先保证高性能节点性能。
-        只有设置 LOCAL_WEB_HTCONDOR_THREAD_LIMIT 时才限制内部线程数。
+        优先级：
+        1. 系统环境变量 LOCAL_WEB_HTCONDOR_THREAD_LIMIT（管理员强制覆盖）；
+        2. 调度器为目标节点计算出的 threads_per_exe；
+        3. 两者都没有时保持模块原有行为。
 
-        示例：
-            LOCAL_WEB_HTCONDOR_THREAD_LIMIT=4
-            LOCAL_WEB_HTCONDOR_THREAD_LIMIT=8
-            LOCAL_WEB_HTCONDOR_THREAD_LIMIT=1
+        这样可避免“同一节点多个 EXE × 每个 EXE 再开满全部 CPU”的过度并行。
         """
         safe_env = dict(env or {})
         safe_env.setdefault("PYTHONUNBUFFERED", "1")
 
-        limit = str(os.environ.get("LOCAL_WEB_HTCONDOR_THREAD_LIMIT", "")).strip().lower()
+        explicit = str(os.environ.get("LOCAL_WEB_HTCONDOR_THREAD_LIMIT", "")).strip().lower()
+        if explicit and explicit not in {"0", "false", "no", "off"}:
+            limit_text = explicit
+        elif thread_limit is not None:
+            try:
+                limit_text = str(max(1, int(thread_limit)))
+            except Exception:
+                limit_text = ""
+        else:
+            limit_text = ""
 
-        # 默认不限制线程，避免高性能节点被强行单线程，导致分布式反而明显变慢。
-        if not limit or limit in {"0", "false", "no", "off"}:
+        if not limit_text:
             return safe_env
 
         thread_limits = {
-            "OMP_NUM_THREADS": limit,
-            "MKL_NUM_THREADS": limit,
-            "OPENBLAS_NUM_THREADS": limit,
-            "NUMEXPR_NUM_THREADS": limit,
-            "VECLIB_MAXIMUM_THREADS": limit,
-            "BLIS_NUM_THREADS": limit,
-            "LOKY_MAX_CPU_COUNT": limit,
+            "OMP_NUM_THREADS": limit_text,
+            "OMP_THREAD_LIMIT": limit_text,
+            "MKL_NUM_THREADS": limit_text,
+            "OPENBLAS_NUM_THREADS": limit_text,
+            "NUMEXPR_NUM_THREADS": limit_text,
+            "VECLIB_MAXIMUM_THREADS": limit_text,
+            "BLIS_NUM_THREADS": limit_text,
+            "LOKY_MAX_CPU_COUNT": limit_text,
+            "OMP_DYNAMIC": "FALSE",
+            "MKL_DYNAMIC": "FALSE",
         }
 
-        # 不覆盖用户/模块显式传入的环境变量；只给缺省值。
+        # 不覆盖模块显式传入的线程环境变量；只填缺省值。
         for key, value in thread_limits.items():
             safe_env.setdefault(key, value)
 
@@ -525,51 +604,89 @@ class TaskManager:
                 machines.append(machine)
         return machines
 
-    def _clamp_htcondor_node_weight(self, value: Any, default: int = 1) -> int:
+    def _clamp_htcondor_node_weight(self, value: Any, default: int = 0) -> int:
+        """把节点工作量分配比例限制在 0%~100%。"""
         try:
-            n = int(value)
+            n = int(round(float(value)))
         except Exception:
             n = default
-        return max(1, min(8, n))
+        return max(0, min(100, n))
+
+    def _normalize_htcondor_percent_weights(
+        self,
+        raw_values: Dict[str, Any] | None,
+        machines: List[str],
+        fallback_values: Dict[str, Any] | None = None,
+    ) -> Dict[str, int]:
+        """把旧权重或任意正值归一化成总和严格为 100% 的整数比例。"""
+        clean_machines: List[str] = []
+        for machine in machines or []:
+            name = str(machine or "").strip()
+            if name and name not in clean_machines:
+                clean_machines.append(name)
+        if not clean_machines:
+            return {}
+
+        raw_values = raw_values if isinstance(raw_values, dict) else {}
+        fallback_values = fallback_values if isinstance(fallback_values, dict) else {}
+
+        values: List[float] = []
+        for machine in clean_machines:
+            raw = raw_values.get(machine, fallback_values.get(machine, 0))
+            try:
+                value = max(0.0, float(raw or 0))
+            except Exception:
+                value = 0.0
+            values.append(value)
+
+        total = sum(values)
+        if total <= 0:
+            values = [1.0 for _ in clean_machines]
+            total = float(len(clean_machines))
+
+        exact = [100.0 * value / total for value in values]
+        result = [int(value) for value in exact]
+        remaining = 100 - sum(result)
+        order = sorted(
+            range(len(clean_machines)),
+            key=lambda i: (exact[i] - result[i], values[i], -i),
+            reverse=True,
+        )
+        for offset in range(max(0, remaining)):
+            result[order[offset % len(order)]] += 1
+
+        return {
+            machine: result[index]
+            for index, machine in enumerate(clean_machines)
+        }
 
     def _htcondor_default_node_weights(self, machines: List[str]) -> Dict[str, int]:
-        """按节点 CPU/内存生成默认权重。
-
-        权重只影响“输入文件数量”分配，不会让同一节点同时启动多个 EXE。
-        """
+        """按节点 CPU/内存能力生成总和为 100% 的建议分配比例。"""
         machines = [str(x).strip() for x in machines if str(x).strip()]
         if not machines:
             return {}
 
         scores: Dict[str, float] = {machine: 1.0 for machine in machines}
-        manager = self.htcondor_manager
-        if manager is not None:
+        status_map = self._htcondor_node_status_by_machine()
+        process_slots_map = self._htcondor_configured_process_slots(machines)
+        for machine in machines:
+            item = status_map.get(machine) or {}
             try:
-                data = manager.node_status()
-                for item in data.get("items") or []:
-                    machine = str(item.get("machine") or "").strip()
-                    if machine not in scores:
-                        continue
-                    try:
-                        cpus = max(1.0, float(item.get("cpus") or 1))
-                    except Exception:
-                        cpus = 1.0
-                    try:
-                        memory_mb = max(512.0, float(item.get("memory") or 1024))
-                    except Exception:
-                        memory_mb = 1024.0
-                    scores[machine] = max(scores.get(machine, 1.0), cpus * max(1.0, (memory_mb / 1024.0) ** 0.5))
+                cpus = max(1.0, float(item.get("cpus") or 1))
             except Exception:
-                pass
+                cpus = 1.0
+            try:
+                memory_mb = max(512.0, float(item.get("memory") or 1024))
+            except Exception:
+                memory_mb = 1024.0
+            slots = self._clamp_htcondor_node_process_slot(process_slots_map.get(machine, 1), default=1)
+            effective_cpus = min(cpus, max(1.0, float(slots * 8)))
+            scores[machine] = effective_cpus * max(1.0, (memory_mb / 1024.0) ** 0.5)
 
-        min_score = max(1.0, min(scores.values()))
-        return {
-            machine: self._clamp_htcondor_node_weight(round(score / min_score), default=1)
-            for machine, score in scores.items()
-        }
+        return self._normalize_htcondor_percent_weights(scores, machines)
 
     def _htcondor_machine_weights(self, machines: List[str]) -> Dict[str, int]:
-        """读取管理员设置的节点权重；没有设置时使用设备信息建议权重。"""
+        """读取节点工作量百分比；兼容旧版 1~8 权重并自动归一化为 100%。"""
         machines = [str(x).strip() for x in machines if str(x).strip()]
         default_weights = self._htcondor_default_node_weights(machines)
         manager = self.htcondor_manager
@@ -580,60 +697,418 @@ class TaskManager:
 
         mode = str(config.get("mode") or "weighted").strip().lower()
         if mode == "equal":
-            return {machine: 1 for machine in machines}
+            return self._normalize_htcondor_percent_weights(
+                {machine: 1 for machine in machines},
+                machines,
+            )
 
-        raw_weights = config.get("weights") or {}
-        result: Dict[str, int] = {}
-        for machine in machines:
-            if isinstance(raw_weights, dict) and machine in raw_weights:
-                result[machine] = self._clamp_htcondor_node_weight(raw_weights.get(machine), default=default_weights.get(machine, 1))
-            else:
-                result[machine] = self._clamp_htcondor_node_weight(default_weights.get(machine, 1), default=1)
+        raw_weights = config.get("weights") if isinstance(config.get("weights"), dict) else {}
+        if raw_weights:
+            return self._normalize_htcondor_percent_weights(
+                raw_weights,
+                machines,
+                fallback_values=default_weights,
+            )
+        return default_weights
+
+    def _clamp_htcondor_node_process_slot(self, value: Any, default: int = 1) -> int:
+        """限制单节点同时运行 EXE 的数量。"""
+        try:
+            n = int(value)
+        except Exception:
+            n = default
+        return max(1, min(8, n))
+
+    def _htcondor_node_status_by_machine(self, force_refresh: bool = False) -> Dict[str, Dict[str, Any]]:
+        """读取 HTCondor 节点状态并按 machine 聚合，带短时缓存。"""
+        now = time.time()
+        if (
+            not force_refresh
+            and self._htcondor_node_status_cache
+            and now - self._htcondor_node_status_cache_at <= self._htcondor_node_status_cache_seconds
+        ):
+            return {k: dict(v) for k, v in self._htcondor_node_status_cache.items()}
+
+        manager = self.htcondor_manager
+        if manager is None:
+            return {}
+        try:
+            data = manager.node_status()
+            items = data.get("items") or []
+        except Exception:
+            return {}
+
+        result: Dict[str, Dict[str, Any]] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            machine = str(item.get("machine") or "").strip()
+            if not machine:
+                continue
+            old = result.get(machine) or {}
+            try:
+                cpus = max(float(old.get("cpus") or 0), float(item.get("cpus") or 0))
+            except Exception:
+                cpus = float(old.get("cpus") or 0) if old.get("cpus") else 0
+            try:
+                memory = max(float(old.get("memory") or 0), float(item.get("memory") or 0))
+            except Exception:
+                memory = float(old.get("memory") or 0) if old.get("memory") else 0
+            result[machine] = {
+                **old,
+                **item,
+                "cpus": cpus or item.get("cpus"),
+                "memory": memory or item.get("memory"),
+            }
+
+        self._htcondor_node_status_cache = {k: dict(v) for k, v in result.items()}
+        self._htcondor_node_status_cache_at = now
         return result
 
+    def _htcondor_default_process_slots(self, machines: List[str]) -> Dict[str, int]:
+        """按 CPU/内存给单节点进程槽生成保守默认值。"""
+        machines = [str(x).strip() for x in machines if str(x).strip()]
+        status_map = self._htcondor_node_status_by_machine()
+        result: Dict[str, int] = {}
+        for machine in machines:
+            item = status_map.get(machine) or {}
+            try:
+                cpus = max(1, int(float(item.get("cpus") or 1)))
+            except Exception:
+                cpus = 1
+            try:
+                memory_mb = max(512.0, float(item.get("memory") or 1024))
+            except Exception:
+                memory_mb = 1024.0
+
+            by_cpu = max(1, cpus // 8)
+            by_memory = max(1, int((memory_mb / 1024.0) // 8))
+            result[machine] = self._clamp_htcondor_node_process_slot(min(by_cpu, by_memory, 4), default=1)
+        return result
+
+    def _htcondor_configured_process_slots(self, machines: List[str]) -> Dict[str, int]:
+        """读取管理员配置的进程槽，不在这里进行模块级安全降级。"""
+        machines = [str(x).strip() for x in machines if str(x).strip()]
+        default_slots = self._htcondor_default_process_slots(machines)
+        manager = self.htcondor_manager
+        state = getattr(manager, "state", {}) if manager is not None else {}
+        config = (state or {}).get("node_weight_config") or {}
+        if not isinstance(config, dict):
+            config = {}
+
+        raw_slots = config.get("process_slots") or {}
+        result: Dict[str, int] = {}
+        for machine in machines:
+            if isinstance(raw_slots, dict) and machine in raw_slots:
+                result[machine] = self._clamp_htcondor_node_process_slot(
+                    raw_slots.get(machine),
+                    default=default_slots.get(machine, 1),
+                )
+            else:
+                result[machine] = self._clamp_htcondor_node_process_slot(
+                    default_slots.get(machine, 1),
+                    default=1,
+                )
+        return result
+
+    def _htcondor_module_performance_profile(self, module_item: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        """读取模块性能画像；旧模块没有 performance 字段时使用通用保守值。"""
+        module_item = module_item if isinstance(module_item, dict) else {}
+        raw = module_item.get("performance") if isinstance(module_item.get("performance"), dict) else {}
+
+        def as_int(key: str, default: int, minimum: int = 0) -> int:
+            try:
+                value = int(raw.get(key, default))
+            except Exception:
+                value = default
+            return max(minimum, value)
+
+        try:
+            headroom = float(raw.get("memory_headroom_ratio", 1.15))
+        except Exception:
+            headroom = 1.15
+        headroom = max(1.0, min(2.0, headroom))
+
+        return {
+            "estimated_peak_memory_mb": as_int(
+                "estimated_peak_memory_mb",
+                int(os.environ.get("LOCAL_WEB_HTCONDOR_DEFAULT_PEAK_MEMORY_MB", "4096")),
+                1024,
+            ),
+            "request_memory_mb": as_int("request_memory_mb", 0, 0),
+            "preferred_threads": as_int(
+                "preferred_threads",
+                int(os.environ.get("LOCAL_WEB_HTCONDOR_DEFAULT_THREADS_PER_EXE", "4")),
+                1,
+            ),
+            "min_threads_per_exe": as_int("min_threads_per_exe", 1, 1),
+            "max_process_slots": self._clamp_htcondor_node_process_slot(
+                as_int("max_process_slots", 8, 1),
+                default=8,
+            ),
+            "reserved_cpus": as_int("reserved_cpus", 0, 0),
+            "reserved_memory_mb": as_int("reserved_memory_mb", 0, 0),
+            "memory_headroom_ratio": headroom,
+        }
+
+    def _htcondor_resource_plans(
+        self,
+        machines: List[str],
+        module_item: Dict[str, Any] | None = None,
+        configured_slots: Dict[str, int] | None = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        """计算每个节点的 EXE 资源预算，但不改变管理员设置的进程槽。
+
+        三个概念严格解耦：
+        - 节点百分比：只决定每个节点承担多少预计输入工作量；
+        - 节点进程槽：唯一决定该节点生成多少个 EXE 子任务、最多并发多少个 EXE；
+        - 资源计划：只根据进程槽计算每个 EXE 的 request_cpus、内部线程数和 request_memory。
+
+        CPU/内存安全槽和模块画像仅作为诊断与告警信息，不再静默减少子任务数量。
+        """
+        machines = [str(x).strip() for x in machines if str(x).strip()]
+        status_map = self._htcondor_node_status_by_machine()
+        configured = configured_slots or self._htcondor_configured_process_slots(machines)
+        profile = self._htcondor_module_performance_profile(module_item)
+
+        explicit_thread_text = str(os.environ.get("LOCAL_WEB_HTCONDOR_THREAD_LIMIT", "")).strip().lower()
+        explicit_threads = 0
+        if explicit_thread_text and explicit_thread_text not in {"0", "false", "no", "off"}:
+            try:
+                explicit_threads = max(1, int(explicit_thread_text))
+            except Exception:
+                explicit_threads = 0
+
+        plans: Dict[str, Dict[str, Any]] = {}
+        for machine in machines:
+            item = status_map.get(machine) or {}
+            try:
+                cpus = max(1, int(float(item.get("cpus") or 1)))
+            except Exception:
+                cpus = 1
+            try:
+                memory_mb = max(1024, int(float(item.get("memory") or 8192)))
+            except Exception:
+                memory_mb = 8192
+
+            administrator_slots = self._clamp_htcondor_node_process_slot(configured.get(machine, 1), default=1)
+            preferred_threads = explicit_threads or int(profile["preferred_threads"])
+            preferred_threads = max(int(profile["min_threads_per_exe"]), preferred_threads)
+
+            reserved_cpus = int(profile["reserved_cpus"])
+            if reserved_cpus <= 0:
+                reserved_cpus = max(2, int(round(cpus * 0.15)))
+            reserved_cpus = min(max(0, cpus - 1), reserved_cpus)
+            usable_cpus = max(1, cpus - reserved_cpus)
+
+            reserved_memory_mb = int(profile["reserved_memory_mb"])
+            if reserved_memory_mb <= 0:
+                reserved_memory_mb = max(2048, int(memory_mb * 0.15))
+            reserved_memory_mb = min(max(0, memory_mb - 1024), reserved_memory_mb)
+            usable_memory_mb = max(1024, memory_mb - reserved_memory_mb)
+
+            estimated_peak_mb = max(1024, int(profile["estimated_peak_memory_mb"]))
+            profiled_request_mb = int(profile["request_memory_mb"])
+            if profiled_request_mb <= 0:
+                profiled_request_mb = int(math.ceil(
+                    estimated_peak_mb * float(profile["memory_headroom_ratio"]) / 256.0
+                ) * 256)
+            per_job_memory_need_mb = max(1024, estimated_peak_mb, profiled_request_mb)
+
+            cpu_safe_slots = max(1, usable_cpus // max(1, preferred_threads))
+            memory_safe_slots = max(1, usable_memory_mb // max(1024, per_job_memory_need_mb))
+            advisory_safe_slots = max(1, min(
+                int(profile["max_process_slots"]),
+                cpu_safe_slots,
+                memory_safe_slots,
+            ))
+
+            # 关键原则：管理员配置的进程槽是子任务数量与节点并发上限的唯一依据。
+            # 资源计划只能调整“每个 EXE 用多少 CPU 线程、申请多少内存”，不能减少 EXE 数量。
+            actual_slots = administrator_slots
+
+            threads_per_exe = max(
+                1,
+                min(preferred_threads, usable_cpus // max(1, actual_slots)),
+            )
+            memory_share_mb = max(1024, usable_memory_mb // max(1, actual_slots))
+            request_memory_mb = max(1024, min(memory_share_mb, per_job_memory_need_mb))
+
+            warnings: List[str] = []
+            if administrator_slots > cpu_safe_slots:
+                warnings.append(
+                    f"配置进程槽{administrator_slots}高于CPU建议槽{cpu_safe_slots}，"
+                    f"系统保留子任务数量不变，并把每EXE线程调整为{threads_per_exe}。"
+                )
+            if administrator_slots > memory_safe_slots:
+                warnings.append(
+                    f"配置进程槽{administrator_slots}高于内存建议槽{memory_safe_slots}，"
+                    f"每EXE可申请内存约{request_memory_mb}MB，请关注实际峰值。"
+                )
+            if administrator_slots > int(profile["max_process_slots"]):
+                warnings.append(
+                    f"配置进程槽{administrator_slots}高于模块画像建议上限{int(profile['max_process_slots'])}，"
+                    "系统不自动降槽，仅记录告警。"
+                )
+
+            plans[machine] = {
+                "machine": machine,
+                "node_cpus": cpus,
+                "node_memory_mb": memory_mb,
+                "administrator_process_slots": administrator_slots,
+                "cpu_safe_process_slots": cpu_safe_slots,
+                "memory_safe_process_slots": memory_safe_slots,
+                "profile_max_process_slots": int(profile["max_process_slots"]),
+                "advisory_safe_process_slots": advisory_safe_slots,
+                "configured_process_slots": administrator_slots,
+                # 保留旧字段供现有代码读取；现在它等于管理员配置，不再被安全计划改小。
+                "actual_process_slots": actual_slots,
+                "reserved_cpus": reserved_cpus,
+                "reserved_memory_mb": reserved_memory_mb,
+                "threads_per_exe": threads_per_exe,
+                "request_cpus": threads_per_exe,
+                "request_memory_mb": request_memory_mb,
+                "estimated_peak_memory_mb": estimated_peak_mb,
+                "warnings": warnings,
+                "profile": dict(profile),
+            }
+        return plans
+
+    def _htcondor_machine_process_slots(
+        self,
+        machines: List[str],
+        module_item: Dict[str, Any] | None = None,
+    ) -> Dict[str, int]:
+        """返回管理员配置的节点进程槽；权重和资源画像不能改变该数量。"""
+        plans = self._htcondor_resource_plans(machines, module_item=module_item)
+        return {
+            machine: self._clamp_htcondor_node_process_slot(
+                (plans.get(machine) or {}).get("actual_process_slots", 1),
+                default=1,
+            )
+            for machine in machines
+        }
+
+    def _htcondor_machine_memory_mb(self, machine: str) -> int:
+        """返回节点内存 MB，用于多进程时自动降低 request_memory。"""
+        item = self._htcondor_node_status_by_machine().get(str(machine or "").strip()) or {}
+        try:
+            return max(1024, int(float(item.get("memory") or 0)))
+        except Exception:
+            return 0
+
+    def _htcondor_request_memory_mb_for_target(self, target_machine: str, process_slots: int = 1) -> int:
+        """为单个 HTCondor 作业计算 request_memory。
+
+        如果设置了 LOCAL_WEB_HTCONDOR_REQUEST_MEMORY_MB，则尊重用户显式设置。
+        否则按节点内存 / 进程槽动态估算，避免每个作业都请求 16GB 导致多进程无法同时匹配。
+        """
+        explicit = str(os.environ.get("LOCAL_WEB_HTCONDOR_REQUEST_MEMORY_MB", "")).strip()
+        if explicit:
+            try:
+                return max(1024, int(explicit))
+            except Exception:
+                pass
+
+        memory_mb = self._htcondor_machine_memory_mb(target_machine)
+        slots = self._clamp_htcondor_node_process_slot(process_slots, default=1)
+        if memory_mb > 0:
+            # 留 15% 给系统、HTCondor 和文件缓存，其余按进程槽均分。
+            return max(1024, min(16384, int((memory_mb * 0.85) / max(1, slots))))
+
+        # 取不到节点内存时，保持相对保守但允许多进程匹配。
+        return 8192 if slots <= 1 else max(2048, int(8192 / slots))
+
     def _split_items_by_machine_weight(self, items: List[Any], machines: List[str]) -> List[List[Any]]:
-        """按节点权重直接计算每台机器应分配的输入数量。
+        """按节点百分比划分输入工作量，所有节点比例总和固定为 100%。
 
-        计算方式：
-        - total = 输入文件总数
-        - weight_sum = 所有节点权重之和
-        - 节点基础分配数 = floor(total * 当前节点权重 / weight_sum)
-        - 因 floor 产生的剩余文件，按小数余数从大到小补齐，保证不丢文件。
+        默认启用“节点级大小感知”：
+        - 百分比表示目标输入字节占比，而不只是文件数量占比；
+        - 大文件优先分配给当前相对负载最低的节点；
+        - 结果仍保持每个节点内部的原始文件顺序。
 
-        这与旧的 weighted_indices 循环分发不同。旧方式按权重循环散列文件，
-        不利于准确排查每个节点实际拿到多少文件。这里改成确定性的数量切分。
+        可设置 LOCAL_WEB_HTCONDOR_NODE_SIZE_AWARE_SPLIT=0 退回按文件数量百分比分配。
+        进程槽不会参与这里的节点比例计算，只在下一阶段决定子任务数量。
         """
         machines = [str(x).strip() for x in machines if str(x).strip()]
         chunks: List[List[Any]] = [[] for _ in machines]
         if not items or not machines:
             return chunks
 
-        total = len(items)
-        weights_map = self._htcondor_machine_weights(machines)
-        weights = [
-            self._clamp_htcondor_node_weight(weights_map.get(machine, 1), default=1)
+        values = list(items)
+        percentages_map = self._htcondor_machine_weights(machines)
+        percentages = [
+            self._clamp_htcondor_node_weight(percentages_map.get(machine, 0), default=0)
             for machine in machines
         ]
-        weight_sum = sum(weights)
-        if weight_sum <= 0:
-            weights = [1 for _ in machines]
-            weight_sum = len(weights)
+        if sum(percentages) != 100:
+            normalized = self._normalize_htcondor_percent_weights(
+                {machine: percentages[index] for index, machine in enumerate(machines)},
+                machines,
+            )
+            percentages = [normalized.get(machine, 0) for machine in machines]
 
-        raw_counts = [(total * weight) / weight_sum for weight in weights]
+        active_indices = [i for i, value in enumerate(percentages) if value > 0]
+        if not active_indices:
+            active_indices = list(range(len(machines)))
+            percentages = [
+                self._normalize_htcondor_percent_weights(
+                    {machine: 1 for machine in machines},
+                    machines,
+                ).get(machine, 0)
+                for machine in machines
+            ]
+
+        enabled = str(os.environ.get("LOCAL_WEB_HTCONDOR_NODE_SIZE_AWARE_SPLIT", "1")).strip().lower()
+        size_aware = enabled not in {"0", "false", "no", "off"}
+
+        if size_aware:
+            weighted_items = [
+                (index, item, max(1, self._estimate_split_item_bytes(item)))
+                for index, item in enumerate(values)
+            ]
+            total_bytes = sum(row[2] for row in weighted_items)
+            targets = [
+                (total_bytes * percentages[i] / 100.0) if percentages[i] > 0 else 0.0
+                for i in range(len(machines))
+            ]
+            loads = [0 for _ in machines]
+            bins: List[List[tuple[int, Any, int]]] = [[] for _ in machines]
+
+            # 大文件先分，按“预计负载 / 目标负载”最小者接收。
+            weighted_items.sort(key=lambda row: (-row[2], row[0]))
+            for row in weighted_items:
+                _, _, size = row
+                target = min(
+                    active_indices,
+                    key=lambda i: (
+                        (loads[i] + size) / max(1.0, targets[i]),
+                        loads[i] - targets[i],
+                        i,
+                    ),
+                )
+                bins[target].append(row)
+                loads[target] += size
+
+            for index, bucket in enumerate(bins):
+                bucket.sort(key=lambda row: row[0])
+                chunks[index] = [row[1] for row in bucket]
+            return chunks
+
+        # 兼容模式：按文件数量百分比分配，最大余数法保证不丢文件。
+        total = len(values)
+        raw_counts = [(total * value) / 100.0 for value in percentages]
         counts = [int(value) for value in raw_counts]
 
-        # floor 后可能少分若干个文件。按小数余数补齐，保证 sum(counts) == total。
         remaining = total - sum(counts)
-        if remaining > 0:
-            order = sorted(
-                range(len(machines)),
-                key=lambda i: (raw_counts[i] - counts[i], weights[i]),
-                reverse=True,
-            )
-            for offset in range(remaining):
-                counts[order[offset % len(order)]] += 1
+        order = sorted(
+            active_indices,
+            key=lambda i: (raw_counts[i] - counts[i], percentages[i], -i),
+            reverse=True,
+        )
+        for offset in range(max(0, remaining)):
+            counts[order[offset % len(order)]] += 1
 
-        # 极端情况下如果因为异常多分了，也从末尾节点回收。正常不会触发。
         overflow = sum(counts) - total
         if overflow > 0:
             for i in range(len(counts) - 1, -1, -1):
@@ -647,20 +1122,269 @@ class TaskManager:
         for index, count in enumerate(counts):
             if count <= 0:
                 continue
-            end = min(cursor + count, total)
-            chunks[index] = list(items[cursor:end])
-            cursor = end
+            chunks[index] = values[cursor: cursor + count]
+            cursor += count
 
-        # 如果仍有尾部文件没有分配，补到最后一个非空节点；保证没有输入丢失。
         if cursor < total:
-            target = next((i for i in range(len(chunks) - 1, -1, -1) if chunks[i]), len(chunks) - 1)
-            chunks[target].extend(items[cursor:])
-
+            target = active_indices[-1]
+            chunks[target].extend(values[cursor:])
         return chunks
 
+    def _htcondor_small_batch_enabled(self, module_item: Dict[str, Any] | None = None) -> bool:
+        """是否启用 HTCondor 小批次拆分。
+
+        默认关闭。原因：
+        - 你的 H8 CM/CTH EXE 在子节点手工运行 35 个文件可以成功；
+        - 系统层面默认不应该把一个节点的输入再切成很多小批次，否则会反复启动 EXE、
+          反复加载模型，导致整体性能明显下降；
+        - 只有在某台节点确实出现 MemoryError 时，才通过环境变量或模块配置显式开启。
+
+        开启方式：
+            setx LOCAL_WEB_HTCONDOR_ENABLE_SMALL_BATCH "1"
+            setx LOCAL_WEB_HTCONDOR_MAX_FILES_PER_JOB "8"
+        """
+        raw_env = str(os.environ.get("LOCAL_WEB_HTCONDOR_ENABLE_SMALL_BATCH", "")).strip().lower()
+        if raw_env:
+            return raw_env in {"1", "true", "yes", "on"}
+
+        if isinstance(module_item, dict):
+            parallel = module_item.get("parallel") if isinstance(module_item.get("parallel"), dict) else {}
+            for key in [
+                "htcondor_enable_small_batch",
+                "enable_htcondor_small_batch",
+                "htcondor_small_batch",
+                "small_batch",
+            ]:
+                value = parallel.get(key) if isinstance(parallel, dict) else None
+                if value not in {None, ""}:
+                    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+                value = module_item.get(key)
+                if value not in {None, ""}:
+                    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+        return False
+
+    def _htcondor_max_files_per_job(self, module_item: Dict[str, Any] | None = None) -> int:
+        """每个 HTCondor 子任务最多处理多少个输入文件。
+
+        默认返回一个很大的值，等价于“不启用小批次”：每台节点按百分比拿到自己的文件后，
+        只生成 1 个 HTCondor 子任务，尽量模拟你在子节点手工执行
+        `CM_CTH.exe config.json` 的方式，避免多次启动 EXE 造成性能下降。
+
+        只有显式启用 LOCAL_WEB_HTCONDOR_ENABLE_SMALL_BATCH=1 后，才读取
+        LOCAL_WEB_HTCONDOR_MAX_FILES_PER_JOB 或模块配置来限制单个子任务文件数。
+        """
+        if not self._htcondor_small_batch_enabled(module_item):
+            return 1000000
+
+        raw_values: List[Any] = []
+        env_value = os.environ.get("LOCAL_WEB_HTCONDOR_MAX_FILES_PER_JOB", "")
+        if str(env_value or "").strip():
+            raw_values.append(env_value)
+
+        if isinstance(module_item, dict):
+            parallel = module_item.get("parallel") if isinstance(module_item.get("parallel"), dict) else {}
+            for key in ["htcondor_max_files_per_job", "max_files_per_htcondor_job", "htcondor_files_per_job"]:
+                value = parallel.get(key) if isinstance(parallel, dict) else None
+                if value not in {None, ""}:
+                    raw_values.append(value)
+            for key in ["htcondor_max_files_per_job", "max_files_per_htcondor_job", "htcondor_files_per_job"]:
+                value = module_item.get(key)
+                if value not in {None, ""}:
+                    raw_values.append(value)
+
+        raw_values.append(8)
+        for raw in raw_values:
+            try:
+                value = int(raw)
+                if value <= 0:
+                    continue
+                return max(1, min(10000, value))
+            except Exception:
+                continue
+        return 8
+
+    def _split_items_by_machine_weight_and_job_limit(
+        self,
+        items: List[Any],
+        machines: List[str],
+        max_items_per_job: int | None = None,
+    ) -> List[Dict[str, Any]]:
+        """先按节点百分比分配预计工作量，再把每台节点的文件切成多个小子任务。
+
+        返回项格式：
+        {"machine": "LAPTOP-...", "items": [...], "machine_job_index": 1}
+
+        这样既保留节点百分比分配，又能限制单个 EXE 的输入文件数。
+        最终返回顺序按机器轮询交错，便于调度器做到每个节点同一时间只跑一个 EXE。
+        """
+        machines = [str(x).strip() for x in machines if str(x).strip()]
+        if not items or not machines:
+            return []
+
+        try:
+            limit = int(max_items_per_job or self._htcondor_max_files_per_job())
+        except Exception:
+            limit = self._htcondor_max_files_per_job()
+        limit = max(1, min(10000, limit))
+
+        machine_chunks = self._split_items_by_machine_weight(items, machines)
+        per_machine_jobs: Dict[str, List[Dict[str, Any]]] = {machine: [] for machine in machines}
+        for machine, machine_items in zip(machines, machine_chunks):
+            machine_items = list(machine_items or [])
+            if not machine_items:
+                continue
+            for offset in range(0, len(machine_items), limit):
+                chunk = machine_items[offset: offset + limit]
+                if not chunk:
+                    continue
+                per_machine_jobs[machine].append({
+                    "machine": machine,
+                    "items": chunk,
+                    "machine_job_index": len(per_machine_jobs[machine]) + 1,
+                })
+
+        result: List[Dict[str, Any]] = []
+        while any(per_machine_jobs.get(machine) for machine in machines):
+            for machine in machines:
+                queue = per_machine_jobs.get(machine) or []
+                if queue:
+                    result.append(queue.pop(0))
+        return result
+
+
+    def _estimate_split_item_bytes(self, item: Any) -> int:
+        """估算一个拆分项的输入字节数，用于同一节点内的负载均衡。"""
+        try:
+            if isinstance(item, Path):
+                return int(item.stat().st_size) if item.is_file() else 0
+            if isinstance(item, str):
+                path = Path(item)
+                return int(path.stat().st_size) if path.is_file() else 0
+            if isinstance(item, dict):
+                return sum(self._estimate_split_item_bytes(value) for value in item.values())
+            if isinstance(item, (list, tuple, set)):
+                return sum(self._estimate_split_item_bytes(value) for value in item)
+        except Exception:
+            return 0
+        return 0
+
+    def _split_items_for_process_slots(self, items: List[Any], parts: int) -> List[List[Any]]:
+        """把一个节点拿到的输入分到多个进程槽。
+
+        默认采用 LPT（大文件优先）贪心分配，使各 EXE 的预计输入字节数更接近，
+        减少“一个子任务最后拖尾、其他子任务已经空闲”的情况。
+        该逻辑只改变同一节点内部的文件组合：
+        - 不改变节点百分比分到的预计工作量；
+        - 不改变进程槽决定的子任务数量。
+        """
+        values = list(items or [])
+        parts = max(1, min(int(parts or 1), len(values) or 1))
+        if not values:
+            return []
+
+        enabled = str(os.environ.get("LOCAL_WEB_HTCONDOR_SIZE_AWARE_SPLIT", "1")).strip().lower()
+        use_size_aware = enabled not in {"0", "false", "no", "off"}
+
+        if not use_size_aware or parts <= 1:
+            base = len(values) // parts
+            extra = len(values) % parts
+            result: List[List[Any]] = []
+            cursor = 0
+            for index in range(parts):
+                count = base + (1 if index < extra else 0)
+                result.append(values[cursor: cursor + count])
+                cursor += count
+            return [chunk for chunk in result if chunk]
+
+        weighted = [
+            (index, value, max(1, self._estimate_split_item_bytes(value)))
+            for index, value in enumerate(values)
+        ]
+        # 大输入先分；大小相同时保持原始顺序，结果可重复。
+        weighted.sort(key=lambda row: (-row[2], row[0]))
+
+        bins: List[List[tuple[int, Any, int]]] = [[] for _ in range(parts)]
+        loads = [0 for _ in range(parts)]
+        for row in weighted:
+            target = min(range(parts), key=lambda i: (loads[i], len(bins[i]), i))
+            bins[target].append(row)
+            loads[target] += row[2]
+
+        result: List[List[Any]] = []
+        for bucket in bins:
+            bucket.sort(key=lambda row: row[0])
+            if bucket:
+                result.append([row[1] for row in bucket])
+        return result
+
+    def _split_items_by_machine_weight_and_process_slots(
+        self,
+        items: List[Any],
+        machines: List[str],
+        module_item: Dict[str, Any] | None = None,
+    ) -> List[Dict[str, Any]]:
+        """先按节点百分比分配预计工作量，再只按节点进程槽拆分子任务。
+
+        百分比只影响工作量分配，不参与子任务数量计算。
+        例如：A 比例33%、进程槽2；B 比例67%、进程槽2。
+        系统先按33%:67%分配预计输入量，再把A的文件切成2份、B的文件切成2份，最终共4个子任务。
+        """
+        machines = [str(x).strip() for x in machines if str(x).strip()]
+        if not items or not machines:
+            return []
+
+        machine_chunks = self._split_items_by_machine_weight(items, machines)
+        resource_plans = self._htcondor_resource_plans(machines, module_item=module_item)
+        process_slots_map = {
+            machine: int((resource_plans.get(machine) or {}).get("actual_process_slots", 1))
+            for machine in machines
+        }
+
+        per_machine_jobs: Dict[str, List[Dict[str, Any]]] = {machine: [] for machine in machines}
+        for machine, machine_items in zip(machines, machine_chunks):
+            machine_items = list(machine_items or [])
+            if not machine_items:
+                continue
+
+            slots = self._clamp_htcondor_node_process_slot(process_slots_map.get(machine, 1), default=1)
+            parts = max(1, min(slots, len(machine_items)))
+
+            # 可选兼容：如果用户同时开启小批次，则每个进程槽内部仍可按 max_files_per_job 再切。
+            max_files_per_job = self._htcondor_max_files_per_job(module_item)
+            if self._htcondor_small_batch_enabled(module_item):
+                parts = max(parts, (len(machine_items) + max_files_per_job - 1) // max(1, max_files_per_job))
+
+            balanced_chunks = self._split_items_for_process_slots(machine_items, parts)
+            for chunk in balanced_chunks:
+                if not chunk:
+                    continue
+                estimated_bytes = sum(self._estimate_split_item_bytes(item) for item in chunk)
+                per_machine_jobs[machine].append({
+                    "machine": machine,
+                    "items": chunk,
+                    "machine_job_index": len(per_machine_jobs[machine]) + 1,
+                    "machine_process_slots": slots,
+                    "estimated_input_bytes": estimated_bytes,
+                    "resource_plan": dict(resource_plans.get(machine) or {}),
+                })
+
+        result: List[Dict[str, Any]] = []
+        while any(per_machine_jobs.get(machine) for machine in machines):
+            for machine in machines:
+                queue = per_machine_jobs.get(machine) or []
+                if queue:
+                    result.append(queue.pop(0))
+        return result
+
     def _htcondor_entries_distribution_text(self, entries: List[Dict[str, Any]]) -> str:
-        """把 HTCondor 子任务的实际文件分配数量整理成日志文本。"""
-        rows: List[str] = []
+        """把 HTCondor 子任务的实际文件分配数量整理成日志文本。
+
+        同一个节点可能对应一个或多个 HTCondor 子任务。
+        这里按节点聚合展示，避免日志里出现很多重复的机器名。
+        """
+        summary: Dict[str, Dict[str, Any]] = {}
+        order: List[str] = []
         for entry in entries or []:
             spec = entry.get("spec") if isinstance(entry, dict) else {}
             spec = spec if isinstance(spec, dict) else {}
@@ -668,11 +1392,45 @@ class TaskManager:
             machine = str(inputs.get("machine") or spec.get("target_machine") or "").strip()
             if not machine:
                 continue
-            weight = inputs.get("node_weight", "")
-            part_count = inputs.get("part_count", "")
-            if part_count == "":
-                continue
-            rows.append(f"{machine}=权重{weight}, {part_count}个文件")
+            if machine not in summary:
+                summary[machine] = {"weight": inputs.get("node_weight", ""), "files": 0, "jobs": 0}
+                order.append(machine)
+            try:
+                summary[machine]["files"] += int(inputs.get("part_count") or 0)
+            except Exception:
+                pass
+            summary[machine]["jobs"] += 1
+            if inputs.get("node_weight", "") != "":
+                summary[machine]["weight"] = inputs.get("node_weight", "")
+
+        rows: List[str] = []
+        for machine in order:
+            item = summary[machine]
+            rows.append(
+                f"{machine}=权重{item.get('weight', '')}, "
+                f"{item.get('files', 0)}个文件/{item.get('jobs', 0)}个子任务"
+            )
+        return "；".join(rows)
+
+    def _htcondor_entries_balance_text(self, entries: List[Dict[str, Any]]) -> str:
+        """展示各子任务预计输入量，便于验证大小感知负载均衡是否生效。"""
+        rows: List[str] = []
+        for entry in entries or []:
+            spec = entry.get("spec") if isinstance(entry, dict) else {}
+            spec = spec if isinstance(spec, dict) else {}
+            inputs = spec.get("inputs") if isinstance(spec.get("inputs"), dict) else {}
+            machine = str(inputs.get("machine") or spec.get("target_machine") or "").strip()
+            part_name = str(inputs.get("part_name") or inputs.get("part_index") or "-")
+            try:
+                count = int(inputs.get("part_count") or 0)
+            except Exception:
+                count = 0
+            try:
+                size_mb = float(inputs.get("estimated_input_bytes") or 0) / 1024.0 / 1024.0
+            except Exception:
+                size_mb = 0.0
+            if machine:
+                rows.append(f"{part_name}/{machine}={count}个文件,约{size_mb:.1f}MB")
         return "；".join(rows)
 
     def _find_json_config_arg(self, command: List[str]) -> tuple[int, Path] | tuple[None, None]:
@@ -938,8 +1696,15 @@ class TaskManager:
         if len(files) < 2:
             return []
 
-        # 按公式 文件总数 * 节点权重 / 权重总和 计算每台机器的文件数。
-        chunks = self._split_items_by_machine_weight(files, machines)
+        max_files_per_job = self._htcondor_max_files_per_job(module_item)
+        process_slots_map = self._htcondor_machine_process_slots(machines, module_item=module_item)
+        job_chunks = self._split_items_by_machine_weight_and_process_slots(
+            files,
+            machines,
+            module_item=module_item,
+        )
+        if not job_chunks:
+            return []
 
         output_defs = self._module_output_defs(module_item, split_key=split_key)
         aux_input_defs = self._module_aux_input_defs(module_item, split_key=split_key)
@@ -949,8 +1714,11 @@ class TaskManager:
             shared_root.mkdir(parents=True, exist_ok=True)
 
         entries: List[Dict[str, Any]] = []
-        for index, machine in enumerate(machines):
-            if not chunks[index]:
+        total_parts = len(job_chunks)
+        for index, job_chunk in enumerate(job_chunks):
+            machine = str(job_chunk.get("machine") or "").strip()
+            chunk_items = list(job_chunk.get("items") or [])
+            if not machine or not chunk_items:
                 continue
 
             part_name = f"part_{index + 1}_{machine}"
@@ -961,18 +1729,38 @@ class TaskManager:
             part_input_dir = part_dir / split_key
             part_input_dir.mkdir(parents=True, exist_ok=True)
 
+            # 共享目录模式下不再复制大输入文件到 _localweb_htcondor_shared。
+            # 由于多数黑盒 EXE 只接受“输入目录”而不是“文件列表”，系统仍需为每个子任务生成
+            # 一个只包含本批文件的目录视图；目录视图中的文件默认使用 hardlink/symlink 引用原始文件。
+            allow_shared_input_copy = str(os.environ.get("LOCAL_WEB_ALLOW_SHARED_INPUT_COPY", "0")).strip().lower() in {"1", "true", "yes", "on"}
+            allow_copy_for_inputs = (not shared_io) or allow_shared_input_copy
             used_modes = []
-            for source in chunks[index]:
+            for source in chunk_items:
                 mode = self._link_or_copy_file(source, part_input_dir / source.name)
                 used_modes.append(mode)
+                if shared_io and str(mode).startswith("failed"):
+                    failed_refs.append(str(source))
+            if failed_refs:
+                preview = "; ".join(failed_refs[:5])
+                more = f"；另有 {len(failed_refs) - 5} 个文件" if len(failed_refs) > 5 else ""
+                raise RuntimeError(
+                    "共享目录无复制模式下，无法为部分输入文件创建 hardlink/symlink 引用。"
+                    "为避免占用大量磁盘空间，系统已阻止复制回退。"
+                    "请把输入目录放到共享根目录所在的同一 NTFS 磁盘，或以管理员身份运行系统；"
+                    "如确实允许复制兜底，可设置 LOCAL_WEB_ALLOW_SHARED_INPUT_COPY=1。"
+                    f"失败文件：{preview}{more}"
+                )
 
             part_config = copy.deepcopy(config_data)
             output_mappings: List[Dict[str, Any]] = []
 
             shared_input_unc = self._path_to_shared_unc(part_input_dir) if shared_io else ""
-            if shared_io and shared_input_unc:
-                # 共享目录模式：配置文件直接写 UNC 路径，子节点通过网络共享读取父节点目录。
-                # 因为不再使用 __LOCAL_WEB_JOB_DIR__，htcondor_cluster_manager.py 不会传输 input/output 大目录。
+            use_local_paths = bool(shared_io and self._htcondor_target_uses_local_paths(machine))
+            if shared_io and use_local_paths:
+                # 父节点本机任务直接读写本地路径，避免 netCDF4/HDF5 通过 UNC 访问自己的共享目录。
+                part_config[split_key] = str(part_input_dir)
+            elif shared_io and shared_input_unc:
+                # 远程子节点通过 UNC 读取父节点共享目录。
                 part_config[split_key] = shared_input_unc
             else:
                 # 文件传输模式：子节点运行时真实路径由 htcondor_cluster_manager.py 中的
@@ -984,10 +1772,11 @@ class TaskManager:
                 if not out_key or out_key not in part_config:
                     continue
                 original_out_path = str(config_data.get(out_key) or '').strip()
-                if shared_io and shared_input_unc and original_out_path:
-                    _, out_unc = self._make_shared_part_output_path(original_out_path, part_name)
-                    if out_unc:
-                        part_config[out_key] = out_unc
+                if shared_io and (shared_input_unc or use_local_paths) and original_out_path:
+                    out_local, out_unc = self._make_shared_part_output_path(original_out_path, part_name)
+                    out_value = str(out_local) if use_local_paths else out_unc
+                    if out_value:
+                        part_config[out_key] = out_value
                         continue
 
                 out_dir = part_dir / out_key
@@ -1010,6 +1799,9 @@ class TaskManager:
                 aux_source = Path(str(config_data.get(aux_key) or ""))
                 if not aux_source.is_dir():
                     continue
+                if shared_io and use_local_paths:
+                    part_config[aux_key] = str(aux_source)
+                    continue
                 if shared_io and shared_input_unc:
                     aux_unc = self._path_to_shared_unc(aux_source)
                     if aux_unc:
@@ -1027,14 +1819,15 @@ class TaskManager:
                     aux_files = [p for p in sorted(aux_source.iterdir()) if p.is_file()]
                 for source in aux_files:
                     self._link_or_copy_file(source, aux_dir / source.name)
-                aux_unc = self._path_to_shared_unc(aux_dir) if shared_io and shared_input_unc else ""
-                part_config[aux_key] = aux_unc or f"__LOCAL_WEB_JOB_DIR__/{aux_key}"
+                aux_unc = self._path_to_shared_unc(aux_dir) if shared_io and shared_input_unc and not use_local_paths else ""
+                part_config[aux_key] = str(aux_dir) if use_local_paths else (aux_unc or f"__LOCAL_WEB_JOB_DIR__/{aux_key}")
 
-            # 每个子任务只处理一部分文件，内部并行数按节点数拆开。
-            # 这样可以避免两台机器同时各开很多进程，把电脑拖死。
+            # 每个子任务只处理一部分文件，内部并行数按“节点数 * 该节点进程槽”拆开。
+            # 这样在单节点同时启动多个 EXE 时，不会每个 EXE 内部又开很多线程/进程。
+            machine_process_slots = self._clamp_htcondor_node_process_slot(process_slots_map.get(machine, 1), default=1)
             for key in ["parallel_workers", "_parallel_workers", "_effective_parallel_workers"]:
                 if isinstance(part_config.get(key), int):
-                    part_config[key] = max(1, int(part_config[key]) // max(1, len(machines)))
+                    part_config[key] = max(1, int(part_config[key]) // max(1, len(machines) * machine_process_slots))
 
             part_config_path = part_dir / "config.json"
             part_config_path.write_text(
@@ -1047,7 +1840,7 @@ class TaskManager:
 
             entries.append({
                 "spec": {
-                    "label": f"{module_item.get('name') or 'HTCondor'} 子任务 {index + 1} / {machine}",
+                    "label": f"{module_item.get('name') or 'HTCondor'} 子任务 {index + 1}/{total_parts} / {machine}",
                     "module_id": module_id,
                     "module_name": str(module_item.get("name") or parent_task.get("module_name") or ""),
                     "command": part_command,
@@ -1059,14 +1852,19 @@ class TaskManager:
                         "module_id": module_id,
                         "split_key": split_key,
                         "machine": machine,
-                        "node_weight": self._htcondor_machine_weights(machines).get(machine, 1),
+                        "node_weight": self._htcondor_machine_weights(machines).get(machine, 0),
+                        "node_weight_percent": self._htcondor_machine_weights(machines).get(machine, 0),
                         "part_config": str(part_config_path),
                         "part_input_dir": str(part_input_dir),
                         "part_name": part_name,
-                        "part_count": len(chunks[index]),
+                        "part_count": len(chunk_items),
+                        "part_index": index + 1,
+                        "part_total": total_parts,
+                        "machine_part_index": int(job_chunk.get("machine_job_index") or 1),
+                        "htcondor_max_files_per_job": max_files_per_job,
                         "file_patterns": self._module_file_patterns(module_item, split_input),
                         "output_mappings": output_mappings,
-                        "shared_io": bool(shared_io and shared_input_unc),
+                        "shared_io": bool(shared_io and (shared_input_unc or use_local_paths)),
                         "shared_input_dir_unc": shared_input_unc,
                         "link_modes": sorted(set(used_modes)),
                     },
@@ -1165,20 +1963,43 @@ class TaskManager:
 
         walk(data)
 
-    def _link_or_copy_file(self, source: Path, target: Path) -> str:
-        """优先硬链接，失败再复制。"""
+    def _link_or_copy_file(self, source: Path, target: Path, allow_copy: bool = True) -> str:
+        """为子任务准备输入文件引用。
+
+        默认优先创建 NTFS 硬链接；硬链接不会复制文件数据，只是给同一份文件增加一个目录入口。
+        共享目录模式下会传入 allow_copy=False，表示禁止退回到 shutil.copy2，避免把大型 NC/HDF/TIF
+        输入文件再次复制到 _localweb_htcondor_shared 目录造成空间浪费。
+        """
         target.parent.mkdir(parents=True, exist_ok=True)
+
         try:
-            if target.exists():
+            if target.exists() or target.is_symlink():
                 target.unlink()
+        except Exception:
+            pass
+
+        try:
             os.link(source, target)
             return "hardlink"
         except Exception:
-            try:
-                shutil.copy2(source, target)
-                return "copy"
-            except Exception:
-                return "failed"
+            pass
+
+        # 符号链接不占用文件数据空间，但 Windows 下可能需要管理员权限或开发者模式。
+        # 因此只作为硬链接失败后的第二选择。
+        try:
+            os.symlink(source, target)
+            return "symlink"
+        except Exception:
+            pass
+
+        if not allow_copy:
+            return "failed_no_copy"
+
+        try:
+            shutil.copy2(source, target)
+            return "copy"
+        except Exception:
+            return "failed"
 
     def _make_htcondor_split_entries(
         self,
@@ -1237,10 +2058,20 @@ class TaskManager:
             if not isinstance(original_list, list) or len(original_list) < 2:
                 return []
 
-            chunks = self._split_items_by_machine_weight(original_list, machines)
+            max_files_per_job = self._htcondor_max_files_per_job()
+            job_chunks = self._split_items_by_machine_weight_and_job_limit(
+                original_list,
+                machines,
+                max_items_per_job=max_files_per_job,
+            )
+            if not job_chunks:
+                return []
 
-            for index, machine in enumerate(machines):
-                if not chunks[index]:
+            total_parts = len(job_chunks)
+            for index, job_chunk in enumerate(job_chunks):
+                machine = str(job_chunk.get("machine") or "").strip()
+                chunk_values = list(job_chunk.get("items") or [])
+                if not machine or not chunk_values:
                     continue
                 part_name = f"part_{index + 1}_{machine}"
                 part_dir = split_root / part_name
@@ -1248,12 +2079,11 @@ class TaskManager:
 
                 part_config = copy.deepcopy(config_data)
                 shared_io = self._htcondor_shared_io_enabled()
-                chunk_values = chunks[index]
                 if shared_io:
-                    chunk_values = self._map_path_like_values_to_shared_unc(chunk_values)
+                    chunk_values = self._map_path_like_values_to_shared_target(chunk_values, use_local_paths=use_local_paths)
                 self._set_by_path(part_config, list_path, chunk_values)
                 if shared_io:
-                    self._rewrite_output_paths_for_part_shared(part_config, part_name)
+                    self._rewrite_output_paths_for_part_shared(part_config, part_name, use_local_paths=use_local_paths)
                 else:
                     self._rewrite_output_paths_for_part(part_config, part_name)
 
@@ -1267,7 +2097,7 @@ class TaskManager:
                 part_command[config_index] = str(part_config_path)
                 entries.append({
                     "spec": {
-                        "label": f"HTCondor 子任务 {index + 1} / {machine}",
+                        "label": f"HTCondor 子任务 {index + 1}/{total_parts} / {machine}",
                         "command": part_command,
                         "working_dir": working_dir,
                         "env": env or {},
@@ -1275,9 +2105,14 @@ class TaskManager:
                         "inputs": {
                             "split_mode": "config_list",
                             "machine": machine,
-                            "node_weight": self._htcondor_machine_weights(machines).get(machine, 1),
+                            "node_weight": self._htcondor_machine_weights(machines).get(machine, 0),
+                            "node_weight_percent": self._htcondor_machine_weights(machines).get(machine, 0),
                             "part_config": str(part_config_path),
-                            "part_count": len(chunks[index]),
+                            "part_count": len(chunk_values),
+                            "part_index": index + 1,
+                            "part_total": total_parts,
+                            "machine_part_index": int(job_chunk.get("machine_job_index") or 1),
+                            "htcondor_max_files_per_job": max_files_per_job,
                             "shared_io": bool(self._htcondor_shared_io_enabled()),
                         },
                     }
@@ -1301,10 +2136,20 @@ class TaskManager:
             if len(files) < 2:
                 return []
 
-            chunks = self._split_items_by_machine_weight(files, machines)
+            max_files_per_job = self._htcondor_max_files_per_job()
+            job_chunks = self._split_items_by_machine_weight_and_job_limit(
+                files,
+                machines,
+                max_items_per_job=max_files_per_job,
+            )
+            if not job_chunks:
+                return []
 
-            for index, machine in enumerate(machines):
-                if not chunks[index]:
+            total_parts = len(job_chunks)
+            for index, job_chunk in enumerate(job_chunks):
+                machine = str(job_chunk.get("machine") or "").strip()
+                chunk_items = list(job_chunk.get("items") or [])
+                if not machine or not chunk_items:
                     continue
                 part_name = f"part_{index + 1}_{machine}"
                 shared_io = self._htcondor_shared_io_enabled()
@@ -1312,17 +2157,32 @@ class TaskManager:
                 part_input_dir = part_dir / "input"
                 part_input_dir.mkdir(parents=True, exist_ok=True)
 
+                allow_shared_input_copy = str(os.environ.get("LOCAL_WEB_ALLOW_SHARED_INPUT_COPY", "0")).strip().lower() in {"1", "true", "yes", "on"}
+                allow_copy_for_inputs = (not shared_io) or allow_shared_input_copy
                 used_modes = []
-                for source in chunks[index]:
+                for source in chunk_items:
                     mode = self._link_or_copy_file(source, part_input_dir / source.name)
                     used_modes.append(mode)
+                    if shared_io and str(mode).startswith("failed"):
+                        failed_refs.append(str(source))
+                if failed_refs:
+                    preview = "; ".join(failed_refs[:5])
+                    more = f"；另有 {len(failed_refs) - 5} 个文件" if len(failed_refs) > 5 else ""
+                    raise RuntimeError(
+                        "共享目录无复制模式下，无法为部分输入文件创建 hardlink/symlink 引用。"
+                        "为避免占用大量磁盘空间，系统已阻止复制回退。"
+                        "请把输入目录放到共享根目录所在的同一 NTFS 磁盘，或以管理员身份运行系统；"
+                        "如确实允许复制兜底，可设置 LOCAL_WEB_ALLOW_SHARED_INPUT_COPY=1。"
+                        f"失败文件：{preview}{more}"
+                    )
                 link_modes.extend(used_modes)
 
                 part_config = copy.deepcopy(config_data)
                 shared_input_unc = self._path_to_shared_unc(part_input_dir) if shared_io else ""
-                self._set_by_path(part_config, dir_path, shared_input_unc or str(part_input_dir))
-                if shared_io and shared_input_unc:
-                    self._rewrite_output_paths_for_part_shared(part_config, part_name)
+                use_local_paths = bool(shared_io and self._htcondor_target_uses_local_paths(machine))
+                self._set_by_path(part_config, dir_path, str(part_input_dir) if use_local_paths else (shared_input_unc or str(part_input_dir)))
+                if shared_io and (shared_input_unc or use_local_paths):
+                    self._rewrite_output_paths_for_part_shared(part_config, part_name, use_local_paths=use_local_paths)
                 else:
                     self._rewrite_output_paths_for_part(part_config, part_name)
 
@@ -1336,7 +2196,7 @@ class TaskManager:
                 part_command[config_index] = str(part_config_path)
                 entries.append({
                     "spec": {
-                        "label": f"HTCondor 子任务 {index + 1} / {machine}",
+                        "label": f"HTCondor 子任务 {index + 1}/{total_parts} / {machine}",
                         "command": part_command,
                         "working_dir": working_dir,
                         "env": env or {},
@@ -1344,10 +2204,15 @@ class TaskManager:
                         "inputs": {
                             "split_mode": "input_dir",
                             "machine": machine,
-                            "node_weight": self._htcondor_machine_weights(machines).get(machine, 1),
+                            "node_weight": self._htcondor_machine_weights(machines).get(machine, 0),
+                            "node_weight_percent": self._htcondor_machine_weights(machines).get(machine, 0),
                             "part_config": str(part_config_path),
                             "part_input_dir": str(part_input_dir),
-                            "part_count": len(chunks[index]),
+                            "part_count": len(chunk_items),
+                            "part_index": index + 1,
+                            "part_total": total_parts,
+                            "machine_part_index": int(job_chunk.get("machine_job_index") or 1),
+                            "htcondor_max_files_per_job": max_files_per_job,
                             "shared_io": bool(shared_io and shared_input_unc),
                             "shared_input_dir_unc": shared_input_unc,
                             "link_modes": sorted(set(used_modes)),
@@ -1392,20 +2257,43 @@ class TaskManager:
         machines = self._htcondor_available_machines()
         auto_split = str(os.environ.get("LOCAL_WEB_HTCONDOR_AUTO_SPLIT", "1")).strip().lower() not in {"0", "false", "no", "off"}
         if auto_split and len(machines) >= 2:
-            entries = self._make_htcondor_split_entries(
-                parent_id=task_id,
-                command=command,
-                working_dir=working_dir,
-                env=env or {},
-                machines=machines,
-            )
+            try:
+                entries = self._make_htcondor_split_entries(
+                    parent_id=task_id,
+                    command=command,
+                    working_dir=working_dir,
+                    env=env or {},
+                    machines=machines,
+                )
+            except Exception as exc:
+                self.append_log(task_id, f"[HTCONDOR-ERROR] 自动拆分失败：{type(exc).__name__}: {exc}")
+                self.append_log(task_id, traceback.format_exc())
+                self.update_task(
+                    task_id,
+                    status="failed",
+                    return_code=-1,
+                    ended_at=now_iso(),
+                    execution_backend="htcondor",
+                )
+                return
             if entries:
                 self.append_log(task_id, f"[HTCONDOR] 检测到 {len(machines)} 个可用执行节点：{', '.join(machines)}")
                 weight_text = ', '.join([f"{m}={self._htcondor_machine_weights(machines).get(m, 1)}" for m in machines])
-                self.append_log(task_id, f"[HTCONDOR] 节点任务权重：{weight_text}。系统按 文件总数 * 节点权重 / 权重总和 计算各节点文件数。")
+                module_item = self._find_module_item(str((self.get_task(task_id) or {}).get("module_id") or ""))
+                small_batch_enabled = self._htcondor_small_batch_enabled(module_item)
+                max_files_per_job = self._htcondor_max_files_per_job(module_item)
+                if small_batch_enabled:
+                    self.append_log(task_id, f"[HTCONDOR] 节点任务权重：{weight_text}。系统先按 文件总数 * 节点权重 / 权重总和 计算各节点文件数，再按小批次拆成多个 HTCondor 子任务。")
+                    if len(entries) > len(machines):
+                        self.append_log(task_id, f"[HTCONDOR] 已启用小批次拆分：每个 HTCondor 子任务最多处理 {max_files_per_job} 个文件；每个节点同一时间最多运行 1 个 EXE。")
+                else:
+                    self.append_log(task_id, f"[HTCONDOR] 节点任务权重：{weight_text}。系统按 文件总数 * 节点权重 / 权重总和 分配文件；当前默认不启用小批次拆分，每个节点直接运行一个完整子任务。")
                 distribution_text = self._htcondor_entries_distribution_text(entries)
                 if distribution_text:
                     self.append_log(task_id, f"[HTCONDOR] 实际文件分配：{distribution_text}")
+                balance_text = self._htcondor_entries_balance_text(entries)
+                if balance_text:
+                    self.append_log(task_id, f"[HTCONDOR-BALANCE] 子任务预计输入量：{balance_text}")
                 self.append_log(task_id, f"[HTCONDOR] 已将本次任务自动拆分为 {len(entries)} 个子任务，并指定到不同节点执行。")
                 self.update_task(
                     task_id,
@@ -1413,10 +2301,10 @@ class TaskManager:
                     parallel_total=len(entries),
                     parallel_done=0,
                     parallel_failed=0,
-                    max_workers=len(entries),
+                    max_workers=min(len(machines), len(entries)),
                     execution_backend="htcondor",
                 )
-                self._run_htcondor_job_group(task_id, entries, len(entries), "自动多节点任务")
+                self._run_htcondor_job_group(task_id, entries, min(len(machines), len(entries)), "自动多节点任务")
                 return
 
             self.append_log(
@@ -1526,10 +2414,41 @@ class TaskManager:
         entries = self._assign_htcondor_targets(entries, machines)
 
         total = len(entries)
+        module_id_for_plan = ""
+        for entry in entries:
+            spec_for_plan = entry.get("spec") if isinstance(entry, dict) else {}
+            module_id_for_plan = str((spec_for_plan or {}).get("module_id") or "").strip()
+            if module_id_for_plan:
+                break
+        module_item_for_plan = self._find_module_item(module_id_for_plan) if module_id_for_plan else {}
+
+        # 拆分阶段已经把安全进程槽写入 entry；这里优先复用，避免管理员配置值
+        # 与实际拆分数不一致。没有写入时再按模块画像重新计算。
+        entry_slot_overrides: Dict[str, int] = {}
+        for entry in entries:
+            spec_for_plan = entry.get("spec") if isinstance(entry, dict) else {}
+            inputs_for_plan = spec_for_plan.get("inputs") if isinstance((spec_for_plan or {}).get("inputs"), dict) else {}
+            machine_for_plan = str((spec_for_plan or {}).get("target_machine") or "").strip()
+            if machine_for_plan:
+                entry_slot_overrides[machine_for_plan] = self._clamp_htcondor_node_process_slot(
+                    inputs_for_plan.get("machine_process_slots", 1),
+                    default=1,
+                )
+        resource_plans = self._htcondor_resource_plans(
+            machines,
+            module_item=module_item_for_plan,
+        )
+        process_slots_map = {
+            machine: entry_slot_overrides.get(
+                machine,
+                int((resource_plans.get(machine) or {}).get("actual_process_slots", 1)),
+            )
+            for machine in machines
+        }
         if machines:
-            # HTCondor 模式下并发数按可用节点自动放大。
-            # 这样用户只点一次运行，也能让父节点和子节点同时拿到任务。
-            max_workers = max(int(max_workers or 1), min(len(machines), max(1, total)))
+            # 默认最多同时提交“节点数”个任务，并且下面会按 target_machine 做单节点互斥。
+            # 这样既能让不同节点并行，也避免同一节点同时启动多个 EXE 造成资源争抢。
+            max_workers = min(len(machines), max(1, total))
         max_workers = max(1, min(int(max_workers or 1), max(1, total)))
 
         manager = self.htcondor_manager
@@ -1555,6 +2474,9 @@ class TaskManager:
         else:
             self.append_log(parent_id, "[HTCONDOR] 未启用远程 EXE 线程限制，优先保证节点计算性能。")
         self.append_log(parent_id, "[HTCONDOR] 系统会为每个子任务写入 target_machine，尽量让不同节点同时运行。")
+        if total > max(1, len(machines)):
+            self.append_log(parent_id, "[HTCONDOR] 已启用节点互斥调度：同一执行节点同一时间最多运行 1 个 EXE，避免资源峰值叠加。")
+
         shared_count = 0
         for entry in entries:
             spec = entry.get("spec") if isinstance(entry, dict) else {}
@@ -1565,14 +2487,30 @@ class TaskManager:
             cfg = self._htcondor_shared_io_config()
             self.append_log(
                 parent_id,
-                f"[HTCONDOR] 共享目录模式已启用：子节点通过 {cfg.get('unc_root')} 直接读取输入并写回输出；HTCondor 只传输 cmd/config/result 小文件。"
+                f"[HTCONDOR] 共享目录模式已启用：已配置 {len(cfg.get('shares') or []) or 1} 个共享目录，子节点通过 UNC 直接读取输入并写回输出；HTCondor 只传输 cmd/config/result 小文件。"
             )
+            link_modes = sorted({
+                str(mode)
+                for entry in entries
+                for spec in [entry.get("spec") if isinstance(entry, dict) else {}]
+                for inputs in [spec.get("inputs") if isinstance(spec.get("inputs"), dict) else {}]
+                for mode in (inputs.get("link_modes") or spec.get("link_modes") or [])
+                if str(mode).strip()
+            })
+            if link_modes:
+                self.append_log(
+                    parent_id,
+                    f"[LINK] 共享目录输入引用方式：{', '.join(link_modes)}。系统默认不复制大输入文件到 _localweb_htcondor_shared；part 目录只保存 config 与 hardlink/symlink 引用。"
+                )
         else:
             self.append_log(parent_id, "[HTCONDOR] 文件传输模式：系统会为拆分任务传输子任务 config.json 和对应输入子目录；输出目录按子任务隔离。")
 
         done_count = 0
         failures = 0
         future_map: Dict[Any, Dict[str, Any]] = {}
+        active_targets: set[str] = set()
+        submitted_count = 0
+        pending_entries: List[tuple[int, Dict[str, Any]]] = list(enumerate(entries))
 
         htcondor_cleanup_roots: list[str] = []
         for entry in entries:
@@ -1581,128 +2519,154 @@ class TaskManager:
             if cleanup_root and cleanup_root not in htcondor_cleanup_roots:
                 htcondor_cleanup_roots.append(cleanup_root)
 
+        def make_on_update(current_child_id: str, current_label: str, current_target: str):
+            def on_update(info):
+                info = info or {}
+                kind = str(info.get("type") or "")
+                text = str(info.get("text") or "")
+
+                if kind == "submitted":
+                    cluster_id = str(info.get("cluster_id") or "")
+                    job_dir = str(info.get("job_dir") or "")
+                    self.update_task(
+                        current_child_id,
+                        htcondor_cluster_id=cluster_id,
+                        htcondor_job_dir=job_dir,
+                        execution_backend="htcondor",
+                    )
+                    self.append_log(
+                        parent_id,
+                        f"[HTCONDOR] {current_label} 已进入队列，ClusterId={cluster_id}，目标节点={current_target or '-'}"
+                    )
+                    return
+
+                if not text:
+                    return
+                if kind == "stdout":
+                    self._append_htcondor_output(current_child_id, "STDOUT", text)
+                elif kind == "stderr":
+                    self._append_htcondor_output(current_child_id, "STDERR", text)
+                elif kind == "event":
+                    useful = []
+                    for line in text.splitlines():
+                        raw = str(line or "").strip()
+                        low = raw.lower()
+                        if (
+                            "submitted" in low
+                            or "executing" in low
+                            or "terminated" in low
+                            or "aborted" in low
+                            or "held" in low
+                            or "removed" in low
+                        ):
+                            useful.append(raw)
+                    if useful:
+                        self._append_htcondor_output(current_child_id, "CONDOR", "\n".join(useful), max_lines=80)
+            return on_update
+
+        def make_should_cancel(current_child_id: str):
+            def should_cancel():
+                task = self.get_task(current_child_id) or {}
+                return (
+                    parent_id in self.cancel_flags
+                    or current_child_id in self.cancel_flags
+                    or task.get("status") == "cancelled"
+                )
+            return should_cancel
+
+        def submit_entry(pool: ThreadPoolExecutor, entry_index: int, entry: Dict[str, Any]):
+            nonlocal submitted_count
+            spec = entry["spec"]
+            child_id = entry.get("child_id")
+            label = str(spec.get("label") or f"子任务 {entry_index + 1}")
+            target_machine = str(spec.get("target_machine") or "")
+
+            if not child_id:
+                parent_task = self.get_task(parent_id) or {}
+                child = self.create_task(
+                    module_id=spec.get("module_id", ""),
+                    module_name=spec.get("module_name", label),
+                    command=spec.get("command") or [],
+                    inputs=spec.get("inputs") or {},
+                    kind="module",
+                    extra={
+                        "parent_id": parent_id,
+                        "job_index": entry_index + 1,
+                        "owner_username": str(parent_task.get("owner_username") or ""),
+                        "execution_backend": "htcondor",
+                        "target_machine": target_machine,
+                    },
+                )
+                child_id = child["id"]
+                with self.lock:
+                    parent = self.tasks.get(parent_id)
+                    if parent:
+                        parent.setdefault("children", []).append(child_id)
+            else:
+                self.update_task(
+                    child_id,
+                    status="running",
+                    started_at=now_iso(),
+                    execution_backend="htcondor",
+                    target_machine=target_machine,
+                )
+
+            future = pool.submit(
+                manager.run_job,
+                job_id=child_id,
+                command=spec.get("command") or [],
+                working_dir=spec.get("working_dir"),
+                env=self._make_htcondor_safe_env(spec.get("env") or {}),
+                timeout_seconds=self.htcondor_job_timeout_seconds,
+                on_update=make_on_update(child_id, label, target_machine),
+                should_cancel=make_should_cancel(child_id),
+                target_machine=target_machine,
+            )
+            future_map[future] = {
+                "child_id": child_id,
+                "label": label,
+                "target_machine": target_machine,
+                "spec": spec,
+            }
+            if target_machine:
+                active_targets.add(target_machine)
+                self.append_log(parent_id, f"[HTCONDOR] 已提交 {submitted_count + 1}/{total}: {label} -> {target_machine}")
+            else:
+                self.append_log(parent_id, f"[HTCONDOR] 已提交 {submitted_count + 1}/{total}: {label}")
+            submitted_count += 1
+
+        def launch_available(pool: ThreadPoolExecutor):
+            if parent_id in self.cancel_flags:
+                return
+            while len(future_map) < max_workers and pending_entries:
+                selected_pos = None
+                for pos, (entry_index, entry) in enumerate(pending_entries):
+                    spec = entry.get("spec") if isinstance(entry, dict) else {}
+                    target_machine = str((spec or {}).get("target_machine") or "").strip()
+                    if not target_machine or target_machine not in active_targets:
+                        selected_pos = pos
+                        break
+                if selected_pos is None:
+                    # 所有剩余任务的目标节点都正在运行任务；等待某个节点释放。
+                    break
+                entry_index, entry = pending_entries.pop(selected_pos)
+                submit_entry(pool, entry_index, entry)
+
         try:
             with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                for index, entry in enumerate(entries):
-                    if parent_id in self.cancel_flags:
-                        break
-                    spec = entry["spec"]
-                    child_id = entry.get("child_id")
-                    label = str(spec.get("label") or f"子任务 {index + 1}")
-                    target_machine = str(spec.get("target_machine") or "")
-
-                    if not child_id:
-                        parent_task = self.get_task(parent_id) or {}
-                        child = self.create_task(
-                            module_id=spec.get("module_id", ""),
-                            module_name=spec.get("module_name", label),
-                            command=spec.get("command") or [],
-                            inputs=spec.get("inputs") or {},
-                            kind="module",
-                            extra={
-                                "parent_id": parent_id,
-                                "job_index": index + 1,
-                                "owner_username": str(parent_task.get("owner_username") or ""),
-                                "execution_backend": "htcondor",
-                                "target_machine": target_machine,
-                            },
-                        )
-                        child_id = child["id"]
-                        with self.lock:
-                            parent = self.tasks.get(parent_id)
-                            if parent:
-                                parent.setdefault("children", []).append(child_id)
-                    else:
-                        self.update_task(
-                            child_id,
-                            status="running",
-                            started_at=now_iso(),
-                            execution_backend="htcondor",
-                            target_machine=target_machine,
-                        )
-
-                    def make_on_update(current_child_id: str, current_label: str, current_target: str):
-                        def on_update(info):
-                            info = info or {}
-                            kind = str(info.get("type") or "")
-                            text = str(info.get("text") or "")
-
-                            if kind == "submitted":
-                                cluster_id = str(info.get("cluster_id") or "")
-                                job_dir = str(info.get("job_dir") or "")
-                                self.update_task(
-                                    current_child_id,
-                                    htcondor_cluster_id=cluster_id,
-                                    htcondor_job_dir=job_dir,
-                                    execution_backend="htcondor",
-                                )
-                                self.append_log(
-                                    parent_id,
-                                    f"[HTCONDOR] {current_label} 已进入队列，ClusterId={cluster_id}，目标节点={current_target or '-'}"
-                                )
-                                return
-
-                            if not text:
-                                return
-                            if kind == "stdout":
-                                self._append_htcondor_output(current_child_id, "STDOUT", text)
-                            elif kind == "stderr":
-                                self._append_htcondor_output(current_child_id, "STDERR", text)
-                            elif kind == "event":
-                                useful = []
-                                for line in text.splitlines():
-                                    raw = str(line or "").strip()
-                                    low = raw.lower()
-                                    if (
-                                        "submitted" in low
-                                        or "executing" in low
-                                        or "terminated" in low
-                                        or "aborted" in low
-                                        or "held" in low
-                                        or "removed" in low
-                                    ):
-                                        useful.append(raw)
-                                if useful:
-                                    self._append_htcondor_output(current_child_id, "CONDOR", "\n".join(useful), max_lines=80)
-                        return on_update
-
-                    def make_should_cancel(current_child_id: str):
-                        def should_cancel():
-                            task = self.get_task(current_child_id) or {}
-                            return (
-                                parent_id in self.cancel_flags
-                                or current_child_id in self.cancel_flags
-                                or task.get("status") == "cancelled"
-                            )
-                        return should_cancel
-
-                    future = pool.submit(
-                        manager.run_job,
-                        job_id=child_id,
-                        command=spec.get("command") or [],
-                        working_dir=spec.get("working_dir"),
-                        env=self._make_htcondor_safe_env(spec.get("env") or {}),
-                        timeout_seconds=self.htcondor_job_timeout_seconds,
-                        on_update=make_on_update(child_id, label, target_machine),
-                        should_cancel=make_should_cancel(child_id),
-                        target_machine=target_machine,
-                    )
-                    future_map[future] = {
-                        "child_id": child_id,
-                        "label": label,
-                        "target_machine": target_machine,
-                        "spec": spec,
-                    }
-                    if target_machine:
-                        self.append_log(parent_id, f"[HTCONDOR] 已提交 {index + 1}/{total}: {label} -> {target_machine}")
-                    else:
-                        self.append_log(parent_id, f"[HTCONDOR] 已提交 {index + 1}/{total}: {label}")
-
+                launch_available(pool)
                 cancel_notice_written = False
-                while future_map:
-                    if parent_id in self.cancel_flags and not cancel_notice_written:
-                        self.append_log(parent_id, "[HTCONDOR] 收到取消请求，正在等待已提交的任务结束或取消。")
-                        cancel_notice_written = True
+                while future_map or pending_entries:
+                    if parent_id in self.cancel_flags:
+                        if not cancel_notice_written:
+                            self.append_log(parent_id, "[HTCONDOR] 收到取消请求，正在等待已提交的任务结束或取消，未提交的小批次将不再提交。")
+                            cancel_notice_written = True
+                        pending_entries.clear()
+
+                    if not future_map:
+                        launch_available(pool)
+                        if not future_map:
+                            break
 
                     done, _ = wait(list(future_map.keys()), timeout=0.5, return_when=FIRST_COMPLETED)
                     if not done:
@@ -1712,6 +2676,9 @@ class TaskManager:
                         meta = future_map.pop(future)
                         child_id = meta["child_id"]
                         label = meta["label"]
+                        target_machine = str(meta.get("target_machine") or "")
+                        if target_machine:
+                            active_targets.discard(target_machine)
                         try:
                             result = future.result()
                             status = self._apply_htcondor_result(child_id, result)
@@ -1732,8 +2699,6 @@ class TaskManager:
                                         label=label,
                                     )
 
-                            # 输出已经回收到用户目录后，立即删除 job_dir 里的 file/cm_files/outpath 等大副本。
-                            # 即使子任务失败，也只保留日志文件，避免失败任务长期占用大量磁盘。
                             self._cleanup_htcondor_job_dir(
                                 parent_id,
                                 str((result or {}).get("job_dir") or ""),
@@ -1764,8 +2729,8 @@ class TaskManager:
                         )
                         self.append_log(parent_id, f"[HTCONDOR] 完成 {done_count}/{total}: {label}，状态={status}")
 
-            # 如果用户曾经点过“取消”，但两个 HTCondor 子任务最终都已经正常 return_code=0，
-            # 仍然应该按 success 收尾，否则输出回收会被误判为取消任务而跳过。
+                    launch_available(pool)
+
             if failures == 0 and done_count == total:
                 final_status = "success"
                 return_code = 0
@@ -2571,17 +3536,31 @@ class TaskManager:
             self.drain_lock.release()
 
     def _save_tasks(self):
-        """立即把任务快照写入 tasks.json。
+        """原子保存任务快照。
 
-        只在状态变化、任务结束等关键位置直接调用。
-        高频日志写入改由 _schedule_save_tasks() 合并，避免每输出一行日志就重写完整 JSON。
+        改进点：
+        1. 使用独立写锁，避免定时保存和立即保存互相覆盖；
+        2. 先复制内存快照，再释放任务锁，减少 API 读取和日志追加被磁盘写入阻塞；
+        3. 先写 .tmp，再 os.replace 原子替换，避免进程中断留下半个 JSON。
         """
-        with self.lock:
-            data = list(self.tasks.values())
-            self.tasks_file.write_text(
-                json.dumps(data, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+        with self._task_save_write_lock:
+            with self.lock:
+                data = copy.deepcopy(list(self.tasks.values()))
+                self._save_dirty = False
+
+            text = json.dumps(data, ensure_ascii=False, indent=2)
+            temp_file = self.tasks_file.with_name(self.tasks_file.name + ".tmp")
+            try:
+                temp_file.write_text(text, encoding="utf-8")
+                os.replace(temp_file, self.tasks_file)
+            except Exception:
+                try:
+                    if temp_file.exists():
+                        temp_file.unlink()
+                except Exception:
+                    pass
+                # 极少数文件系统不支持原子替换时回退到直接写入。
+                self.tasks_file.write_text(text, encoding="utf-8")
 
     def _flush_scheduled_save(self):
         with self.lock:
@@ -2769,12 +3748,18 @@ class TaskManager:
         )
 
     def update_task(self, task_id: str, **kwargs):
+        """更新任务状态；普通进度更新合并写盘，终态立即持久化。"""
         with self.lock:
             task = self.tasks.get(task_id)
             if not task:
                 return
             task.update(kwargs)
-        self._save_tasks()
+
+        status = str(kwargs.get("status") or "").strip().lower()
+        if status in TERMINAL_STATUSES or kwargs.get("ended_at"):
+            self._save_tasks()
+        else:
+            self._schedule_save_tasks()
 
     def submit_module_task(
             self,

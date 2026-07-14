@@ -192,13 +192,94 @@ class HTCondorPrepareShareRequest(BaseModel):
     share_name: str = "LocalWebData"
 
 
+class HTCondorDeleteShareRequest(BaseModel):
+    share_name: str = ""
+    unc_root: str = ""
+    local_root: str = ""
+    # 删除 Windows 共享映射，但不会删除本地目录和数据文件。
+    delete_windows_share: bool = True
+
+
 class HTCondorNodeWeightsRequest(BaseModel):
-    # mode=weighted 时按各节点权重分配输入文件；mode=equal 时退回平均分配。
+    # mode=weighted 时按百分比分配输入工作量；mode=equal 时由系统平均分成 100%。
     mode: str = "weighted"
     weights: Dict[str, int] = {}
+    weight_unit: str = "percent"
+    # 每个执行节点允许同时运行多少个 EXE。1 表示单节点串行；2/3/4 表示该节点可并行启动多个 EXE。
+    process_slots: Dict[str, int] = {}
 
 
-def _clamp_node_weight(value: Any, default: int = 1) -> int:
+def _clamp_node_weight(value: Any, default: int = 0) -> int:
+    """把节点分配比例限制在 0%~100%。"""
+    try:
+        n = int(round(float(value)))
+    except Exception:
+        n = default
+    return max(0, min(100, n))
+
+
+def _normalize_percent_weights(
+    raw_values: Dict[str, Any] | None,
+    machine_names: List[str],
+    fallback_values: Dict[str, Any] | None = None,
+) -> Dict[str, int]:
+    """把任意正权重归一化成总和严格为 100 的整数百分比。
+
+    兼容旧版 1~8 权重：例如 2:7 会自动迁移为 22%:78%。
+    使用最大余数法补齐取整误差，保证所有当前节点之和始终等于 100%。
+    """
+    machines: List[str] = []
+    for machine in machine_names or []:
+        name = str(machine or "").strip()
+        if name and name not in machines:
+            machines.append(name)
+    if not machines:
+        return {}
+
+    raw_values = raw_values if isinstance(raw_values, dict) else {}
+    fallback_values = fallback_values if isinstance(fallback_values, dict) else {}
+
+    values: List[float] = []
+    for machine in machines:
+        raw = raw_values.get(machine, fallback_values.get(machine, 0))
+        try:
+            value = max(0.0, float(raw or 0))
+        except Exception:
+            value = 0.0
+        values.append(value)
+
+    total = sum(values)
+    if total <= 0:
+        values = [1.0 for _ in machines]
+        total = float(len(machines))
+
+    exact = [100.0 * value / total for value in values]
+    result = [int(value) for value in exact]
+    remaining = 100 - sum(result)
+    order = sorted(
+        range(len(machines)),
+        key=lambda i: (exact[i] - result[i], values[i], -i),
+        reverse=True,
+    )
+    for offset in range(max(0, remaining)):
+        result[order[offset % len(order)]] += 1
+
+    return {machine: result[index] for index, machine in enumerate(machines)}
+
+
+def _equal_percent_weights(machine_names: List[str]) -> Dict[str, int]:
+    return _normalize_percent_weights(
+        {str(machine): 1 for machine in machine_names or []},
+        machine_names,
+    )
+
+
+def _clamp_node_process_slot(value: Any, default: int = 1) -> int:
+    """限制单节点 EXE 进程槽数量。
+
+    进程槽表示同一个 HTCondor 执行节点上允许同时运行的 EXE 数量。
+    为避免用户误设过高导致内存不足，这里限制在 1~8。
+    """
     try:
         n = int(value)
     except Exception:
@@ -206,17 +287,46 @@ def _clamp_node_weight(value: Any, default: int = 1) -> int:
     return max(1, min(8, n))
 
 
-def _htcondor_weight_suggestions_from_nodes(nodes_items: List[Dict[str, Any]]) -> Dict[str, int]:
-    """根据节点 CPU/内存生成默认任务权重。
+def _htcondor_process_slot_suggestions_from_nodes(nodes_items: List[Dict[str, Any]]) -> Dict[str, int]:
+    """根据节点 CPU/内存生成默认进程槽建议。
 
-    权重只控制“输入文件数量分配”，不代表同一节点同时启动多个 EXE。
-    为了避免权重过大导致界面和分配不可控，默认限制在 1~8。
+    遥感 EXE 通常会加载模型和大数组，默认建议保持保守：
+    - 约每 8 个 CPU 核和 8GB 内存建议 1 个 EXE；
+    - 最高建议 4 个，超过后需要管理员手动确认。
     """
-    machines: Dict[str, float] = {}
+    suggestions: Dict[str, int] = {}
     for item in nodes_items or []:
         machine = str(item.get("machine") or "").strip()
         if not machine:
             continue
+        try:
+            cpus = max(1, int(float(item.get("cpus") or 1)))
+        except Exception:
+            cpus = 1
+        try:
+            memory_mb = max(512.0, float(item.get("memory") or 1024))
+        except Exception:
+            memory_mb = 1024.0
+
+        by_cpu = max(1, cpus // 8)
+        by_mem = max(1, int((memory_mb / 1024.0) // 8))
+        suggestions[machine] = _clamp_node_process_slot(min(by_cpu, by_mem, 4), default=1)
+    return suggestions
+
+
+def _htcondor_weight_suggestions_from_nodes(
+    nodes_items: List[Dict[str, Any]],
+    process_slots: Dict[str, int] | None = None,
+) -> Dict[str, int]:
+    """根据节点有效并行 CPU、内存和进程槽生成总和为 100% 的建议比例。"""
+    scores: Dict[str, float] = {}
+    machine_names: List[str] = []
+    for item in nodes_items or []:
+        machine = str(item.get("machine") or "").strip()
+        if not machine:
+            continue
+        if machine not in machine_names:
+            machine_names.append(machine)
         try:
             cpus = max(1.0, float(item.get("cpus") or 1))
         except Exception:
@@ -225,24 +335,27 @@ def _htcondor_weight_suggestions_from_nodes(nodes_items: List[Dict[str, Any]]) -
             memory_mb = max(512.0, float(item.get("memory") or 1024))
         except Exception:
             memory_mb = 1024.0
-        # CPU 是主要因素，内存作为温和修正，避免单纯大内存导致权重过高。
-        score = cpus * max(1.0, (memory_mb / 1024.0) ** 0.5)
-        machines[machine] = max(machines.get(machine, 0.0), score)
 
-    if not machines:
-        return {}
+        slots = _clamp_node_process_slot((process_slots or {}).get(machine, 1))
+        # 每个 EXE 默认按约 8 个 CPU 线程估算。建议比例与当前进程槽相匹配，
+        # 避免“分配比例很高，但该节点只允许一个 EXE”的配置失衡。
+        effective_cpus = min(cpus, max(1.0, float(slots * 8)))
+        score = effective_cpus * max(1.0, (memory_mb / 1024.0) ** 0.5)
+        scores[machine] = max(scores.get(machine, 0.0), score)
 
-    min_score = max(1.0, min(machines.values()))
-    suggestions: Dict[str, int] = {}
-    for machine, score in machines.items():
-        suggestions[machine] = _clamp_node_weight(round(score / min_score), default=1)
-    return suggestions
+    return _normalize_percent_weights(scores, machine_names)
 
 
 def _htcondor_node_weight_summary(status_data: Dict[str, Any]) -> Dict[str, Any]:
     nodes = status_data.get("nodes") or {}
     items = nodes.get("items") if isinstance(nodes, dict) else []
     items = items if isinstance(items, list) else []
+
+    machine_names: List[str] = []
+    for item in items:
+        machine = str(item.get("machine") or "").strip()
+        if machine and machine not in machine_names:
+            machine_names.append(machine)
 
     state = getattr(htcondor_cluster_manager, "state", {}) or {}
     raw_config = state.get("node_weight_config") or {}
@@ -253,25 +366,37 @@ def _htcondor_node_weight_summary(status_data: Dict[str, Any]) -> Dict[str, Any]
     if mode not in {"weighted", "equal"}:
         mode = "weighted"
 
-    saved_weights_raw = raw_config.get("weights") or {}
-    saved_weights = {
-        str(k): _clamp_node_weight(v)
-        for k, v in (saved_weights_raw.items() if isinstance(saved_weights_raw, dict) else [])
+    saved_process_slots_raw = raw_config.get("process_slots") or {}
+    saved_process_slots = {
+        str(k): _clamp_node_process_slot(v)
+        for k, v in (saved_process_slots_raw.items() if isinstance(saved_process_slots_raw, dict) else [])
         if str(k).strip()
     }
 
-    suggestions = _htcondor_weight_suggestions_from_nodes(items)
-    machine_names: List[str] = []
-    for item in items:
-        machine = str(item.get("machine") or "").strip()
-        if machine and machine not in machine_names:
-            machine_names.append(machine)
+    process_slot_suggestions = _htcondor_process_slot_suggestions_from_nodes(items)
+    effective_process_slots = {
+        machine: _clamp_node_process_slot(
+            saved_process_slots.get(machine, process_slot_suggestions.get(machine, 1))
+        )
+        for machine in machine_names
+    }
+    suggestions = _htcondor_weight_suggestions_from_nodes(items, effective_process_slots)
+    raw_saved_weights = raw_config.get("weights") if isinstance(raw_config.get("weights"), dict) else {}
+    if mode == "equal":
+        current_weights = _equal_percent_weights(machine_names)
+    elif raw_saved_weights:
+        # 兼容旧版 1~8 权重和新版百分比；两者都统一转换为 100%。
+        current_weights = _normalize_percent_weights(raw_saved_weights, machine_names, suggestions)
+    else:
+        current_weights = dict(suggestions)
 
     rows: List[Dict[str, Any]] = []
     for machine in machine_names:
         node = next((x for x in items if str(x.get("machine") or "").strip() == machine), {})
-        suggested = _clamp_node_weight(suggestions.get(machine, 1))
-        weight = 1 if mode == "equal" else _clamp_node_weight(saved_weights.get(machine, suggested))
+        suggested = _clamp_node_weight(suggestions.get(machine, 0))
+        weight = _clamp_node_weight(current_weights.get(machine, suggested))
+        suggested_slots = _clamp_node_process_slot(process_slot_suggestions.get(machine, 1))
+        process_slots = _clamp_node_process_slot(saved_process_slots.get(machine, suggested_slots))
         rows.append({
             "machine": machine,
             "name": node.get("name") or "",
@@ -280,14 +405,23 @@ def _htcondor_node_weight_summary(status_data: Dict[str, Any]) -> Dict[str, Any]
             "cpus": node.get("cpus") or "",
             "memory": node.get("memory") or "",
             "suggested_weight": suggested,
+            "suggested_weight_percent": suggested,
             "weight": weight,
-            "source": "manual" if machine in saved_weights and mode == "weighted" else ("equal" if mode == "equal" else "suggested"),
+            "weight_percent": weight,
+            "source": "manual" if raw_saved_weights and mode == "weighted" else ("equal" if mode == "equal" else "suggested"),
+            "suggested_process_slots": suggested_slots,
+            "process_slots": process_slots,
+            "process_slot_source": "manual" if machine in saved_process_slots else "suggested",
         })
 
     return {
         "mode": mode,
-        "weights": saved_weights,
+        "weight_unit": "percent",
+        "weight_total": sum(current_weights.values()),
+        "weights": current_weights,
+        "process_slots": saved_process_slots,
         "suggestions": suggestions,
+        "process_slot_suggestions": process_slot_suggestions,
         "items": rows,
         "updated_at": raw_config.get("updated_at") or "",
     }
@@ -320,25 +454,61 @@ def api_htcondor_save_node_weights(
     require_admin(authorization)
     mode = str(payload.mode or "weighted").strip().lower()
     if mode not in {"weighted", "equal"}:
-        raise HTTPException(status_code=400, detail="节点任务权重模式只能是 weighted 或 equal")
+        raise HTTPException(status_code=400, detail="节点任务分配模式只能是 weighted 或 equal")
 
-    clean_weights: Dict[str, int] = {}
-    for machine, value in (payload.weights or {}).items():
-        machine_name = str(machine or "").strip()
-        if not machine_name:
-            continue
-        clean_weights[machine_name] = _clamp_node_weight(value)
+    status_data = htcondor_cluster_manager.status()
+    nodes = status_data.get("nodes") or {}
+    node_items = nodes.get("items") if isinstance(nodes, dict) else []
+    node_items = node_items if isinstance(node_items, list) else []
+    machine_names: List[str] = []
+    for item in node_items:
+        machine = str(item.get("machine") or "").strip()
+        if machine and machine not in machine_names:
+            machine_names.append(machine)
+
+    if not machine_names:
+        raise HTTPException(status_code=400, detail="当前没有可用执行节点，无法保存任务分配比例。")
+
+    if mode == "equal":
+        clean_weights = _equal_percent_weights(machine_names)
+    else:
+        submitted = payload.weights if isinstance(payload.weights, dict) else {}
+        missing = [machine for machine in machine_names if machine not in submitted]
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail=f"缺少节点分配比例：{', '.join(missing)}。所有当前节点的比例之和必须为 100%。",
+            )
+        clean_weights = {
+            machine: _clamp_node_weight(submitted.get(machine), default=0)
+            for machine in machine_names
+        }
+        total = sum(clean_weights.values())
+        if total != 100:
+            raise HTTPException(
+                status_code=400,
+                detail=f"所有当前节点的分配比例之和必须为 100%，当前合计为 {total}%。",
+            )
+
+    clean_process_slots: Dict[str, int] = {}
+    for machine in machine_names:
+        value = (payload.process_slots or {}).get(machine, 1)
+        clean_process_slots[machine] = _clamp_node_process_slot(value)
 
     htcondor_cluster_manager.state["node_weight_config"] = {
         "mode": mode,
+        "weight_unit": "percent",
         "weights": clean_weights,
+        "process_slots": clean_process_slots,
         "updated_at": now_iso(),
     }
     htcondor_cluster_manager._save_state()
 
-    data = htcondor_cluster_manager.status()
-    summary = _htcondor_node_weight_summary(data)
-    summary["message"] = "节点任务权重已保存，后续 HTCondor 任务将按该权重分配输入文件"
+    summary = _htcondor_node_weight_summary(status_data)
+    summary["message"] = (
+        "节点任务分配比例与进程槽已保存：所有节点比例合计 100%；"
+        "比例只控制工作量分配，进程槽只控制子任务数量和同节点 EXE 并发数。"
+    )
     return summary
 
 
@@ -405,6 +575,23 @@ def api_htcondor_prepare_shared_io(
         )
     except HTCondorClusterError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/htcondor/shared-io/delete")
+def api_htcondor_delete_shared_io(
+    payload: HTCondorDeleteShareRequest,
+    authorization: str | None = Header(default=None),
+):
+    require_admin(authorization)
+    try:
+        return htcondor_cluster_manager.delete_shared_io_config(
+            share_name=payload.share_name,
+            unc_root=payload.unc_root,
+            local_root=payload.local_root,
+            delete_windows_share=payload.delete_windows_share,
+        )
+    except HTCondorClusterError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.post("/api/htcondor/shared-io/test")
