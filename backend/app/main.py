@@ -3748,6 +3748,7 @@ def _infer_executable_inputs_from_config(param_json: dict, module_root: Path, mo
     parallel_patterns = parallel_cfg.get("file_patterns") or parallel_cfg.get("patterns") or "*"
     parallel_mode = str(parallel_cfg.get("mode") or "").strip()
     parallel_input_key = str(parallel_cfg.get("input_key") or "").strip()
+    module_id_lower = str(module_data.get("id") or module_data.get("module_id") or "").lower()
 
     for item in inputs:
         key = str(item.get("key") or "")
@@ -3763,7 +3764,10 @@ def _infer_executable_inputs_from_config(param_json: dict, module_root: Path, mo
                 item["type"] = "file_path" if value_path.is_file() else "dir_path"
 
         # 输出目录/输出文件
-        if any(x in lower for x in ["out", "output", "result", "save", "输出"]):
+        joint_cm_cth_output = lower == "cm_files" and any(
+            token in module_id_lower for token in ["cm_cth", "cm-cth", "cmcth"]
+        )
+        if any(x in lower for x in ["out", "output", "result", "save", "输出"]) or joint_cm_cth_output:
             item["io_role"] = "output"
             item["batch_role"] = "OUTPUT_DIR"
             if item.get("type") not in {"file_path", "dir_path"}:
@@ -3884,7 +3888,15 @@ def _normalize_new_executable_manifest(module_root: Path, manifest_path: Path, r
     ):
         command_template = ["{executable}", "{config_json}"]
 
-    inputs = _infer_executable_inputs_from_config(param_json or {}, source_path, {"parallel": parallel_cfg})
+    inputs = _infer_executable_inputs_from_config(
+        param_json or {},
+        source_path,
+        {
+            "id": module_id,
+            "module_id": module_id,
+            "parallel": parallel_cfg,
+        },
+    )
 
     # 如果声明了 JD/JL 配对，确保输入字段只按 JD 生成任务。
     if isinstance(parallel_cfg, dict) and (parallel_cfg.get("jd_jl_pair") is True or parallel_cfg.get("jd_only") is True):
@@ -6717,6 +6729,23 @@ def build_batch_jobs_for_module(module: dict, inputs: dict, parallel_workers: in
         role_indexes[primary_role] = _build_role_index(primary_files)
 
     total = len(primary_files)
+    primary_pass_mode = str(
+        primary_field.get("batch_pass_mode")
+        or primary_field.get("pass_mode")
+        or ""
+    ).strip().lower()
+    primary_uses_directory_view = primary_pass_mode in {
+        "directory",
+        "dir",
+        "folder",
+        "directory_view",
+        "single_file_dir",
+        "single_file_directory",
+    }
+    batch_view_root: Path | None = None
+    if primary_uses_directory_view:
+        safe_module_id = sanitize_filename(str(module.get("id") or "batch")).strip() or "batch"
+        batch_view_root = Path(tempfile.mkdtemp(prefix=f"batch_{safe_module_id}_", dir=str(RUNTIME_DIR)))
 
     for idx, primary_path in enumerate(primary_files, start=1):
         keys = _extract_datetime_keys(primary_path)
@@ -6725,7 +6754,37 @@ def build_batch_jobs_for_module(module: dict, inputs: dict, parallel_workers: in
             slot = f"{slot[:8]}_{slot[8:12]}"
 
         job_inputs = dict(inputs)
-        job_inputs[primary_key] = str(primary_path.resolve())
+        job_link_modes: list[str] = []
+        job_cleanup_root = str(batch_view_root.resolve()) if batch_view_root else ""
+        if primary_uses_directory_view and batch_view_root is not None:
+            safe_slot = str(slot or primary_path.stem).replace(":", "_").replace("/", "_").replace("\\", "_")
+            view_dir = batch_view_root / f"{idx:04d}_{safe_slot}"
+            view_dir.mkdir(parents=True, exist_ok=True)
+            view_file = view_dir / primary_path.name
+            try:
+                if view_file.exists() or view_file.is_symlink():
+                    view_file.unlink()
+                os.link(str(primary_path.resolve()), str(view_file))
+                job_link_modes.append("hardlink")
+            except Exception as hardlink_exc:
+                try:
+                    if view_file.exists() or view_file.is_symlink():
+                        view_file.unlink()
+                    os.symlink(str(primary_path.resolve()), str(view_file), target_is_directory=False)
+                    job_link_modes.append("symlink")
+                except Exception as symlink_exc:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"无法为批处理子任务创建输入目录视图: {primary_path}\n"
+                            f"hardlink失败: {type(hardlink_exc).__name__}: {hardlink_exc}\n"
+                            f"symlink失败: {type(symlink_exc).__name__}: {symlink_exc}\n"
+                            "请确认输入数据和系统 runtime 在同一 NTFS 磁盘，或以管理员身份运行后端。"
+                        ),
+                    )
+            job_inputs[primary_key] = str(view_dir.resolve())
+        else:
+            job_inputs[primary_key] = str(primary_path.resolve())
         used_by_role[primary_role].add(str(primary_path.resolve()))
 
         ok = True
@@ -6776,6 +6835,27 @@ def build_batch_jobs_for_module(module: dict, inputs: dict, parallel_workers: in
         if out_path is not None:
             output_paths.append(out_path)
 
+        primary_output_field = _get_output_dir_field_for_batch(module)
+        primary_output_key = primary_output_field.get("key") if primary_output_field else ""
+        for field in module.get("inputs", []) or []:
+            key = field.get("key")
+            if not key or key == primary_output_key:
+                continue
+            if bool(field.get("control_only", False)) or not is_output_field(field):
+                continue
+
+            raw_output = str(job_inputs.get(key) or "").strip()
+            if not raw_output:
+                continue
+
+            output_path = Path(raw_output)
+            field_type = str(field.get("type") or "").lower()
+            if field_type == "dir_path" or not output_path.suffix:
+                output_path.mkdir(parents=True, exist_ok=True)
+            elif output_path.parent:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_paths.append(output_path.resolve())
+
         # 平台字段不写进 exe config。
         for field in module.get("inputs", []) or []:
             if field.get("control_only") is True:
@@ -6814,6 +6894,8 @@ def build_batch_jobs_for_module(module: dict, inputs: dict, parallel_workers: in
             "working_dir": working_dir,
             "env": runtime_env,
             "inputs": exe_inputs,
+            "cleanup_root": job_cleanup_root,
+            "link_modes": job_link_modes,
         })
 
     if missing:
@@ -6836,7 +6918,16 @@ def build_batch_jobs_for_module(module: dict, inputs: dict, parallel_workers: in
     if not jobs:
         raise HTTPException(status_code=400, detail="没有生成任何批处理 job，请检查输入目录和 batch_role 配置")
 
-    return jobs, output_paths
+    unique_output_paths: list[Path] = []
+    seen_output_paths: set[str] = set()
+    for path in output_paths:
+        key = str(path.resolve()).lower() if sys.platform.startswith("win") else str(path.resolve())
+        if key in seen_output_paths:
+            continue
+        seen_output_paths.add(key)
+        unique_output_paths.append(path.resolve())
+
+    return jobs, unique_output_paths
 def task_belongs_to_user(task: dict, user) -> bool:
     if not task:
         return False

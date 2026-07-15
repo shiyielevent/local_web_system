@@ -20,14 +20,16 @@
       "resources"
     ],
     "parallel": {
-      "mode": "none",
-      "input_key": "",
-      "output_key": "",
+      "mode": "batch_group",
+      "input_key": "file",
+      "output_key": "outpath",
+      "batch_role": "input",
       "file_patterns": "*R21*.nc;*R21*.NC",
       "output_suffix": ".tif",
+      "output_naming": "source_stem",
+      "output_mode": "directory",
       "files_per_job": 1,
-      "chunk_multiplier": 1,
-      "output_naming": "source_stem"
+      "chunk_multiplier": 1
     },
     "tags": [
       "h8",
@@ -48,12 +50,13 @@
         "admin_fixed": false,
         "path_mode": "absolute",
         "io_role": "input",
-        "default": "D:/H8/data/input",
+        "default": "D:/H8/data1/input2",
         "batch_role": "input",
         "match_mode": "each_file",
         "file_patterns": "*R21*.nc;*R21*.NC",
-        "batch_allow_all_files": true,
-        "batch_allow_no_extension": true
+        "batch_allow_all_files": false,
+        "batch_allow_no_extension": false,
+        "batch_pass_mode": "directory_view"
       },
       {
         "key": "cm_files",
@@ -63,8 +66,10 @@
         "visible_to_user": true,
         "admin_fixed": false,
         "path_mode": "absolute",
-        "io_role": "input",
-        "default": "D:/H8/data/CM"
+        "io_role": "output",
+        "default": "D:/H8/data1/CM",
+        "batch_role": "OUTPUT_DIR",
+        "output_mode": "directory"
       },
       {
         "key": "outpath",
@@ -75,8 +80,9 @@
         "admin_fixed": false,
         "path_mode": "absolute",
         "io_role": "output",
-        "default": "D:/H8/data/output",
-        "batch_role": "OUTPUT_DIR"
+        "default": "D:/H8/data1/output",
+        "batch_role": "OUTPUT_DIR",
+        "output_mode": "directory"
       }
     ],
     "_manifest_format": "executable_module_json",

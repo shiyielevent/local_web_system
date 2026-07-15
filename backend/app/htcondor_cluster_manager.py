@@ -2372,15 +2372,21 @@ else {
             request_cpus = 1
 
         try:
+            default_request_memory_raw = (
+                (env or {}).get("LOCAL_WEB_HTCONDOR_DEFAULT_PEAK_MEMORY_MB")
+                or os.environ.get("LOCAL_WEB_HTCONDOR_DEFAULT_PEAK_MEMORY_MB")
+                or "4096"
+            )
             request_memory_raw = (
                 (env or {}).get("LOCAL_WEB_HTCONDOR_REQUEST_MEMORY_MB")
-                or os.environ.get("LOCAL_WEB_HTCONDOR_REQUEST_MEMORY_MB", "16384")
-                or "16384"
+                or os.environ.get("LOCAL_WEB_HTCONDOR_REQUEST_MEMORY_MB")
+                or default_request_memory_raw
+                or "4096"
             )
-            request_memory_mb = int(request_memory_raw)
+            request_memory_mb = int(float(request_memory_raw))
         except Exception:
-            request_memory_mb = 8192
-        request_memory_mb = max(1024, request_memory_mb)
+            request_memory_mb = 4096
+        request_memory_mb = max(1024, min(262144, request_memory_mb))
 
         # 共享目录模式优先让作业按提交用户 LocalWebCondor 运行。
         # 当前系统提交 condor_submit 时已经切换到了 LocalWebCondor，
