@@ -1332,51 +1332,80 @@ try {
         throw '找不到 Condor 服务。'
     }
 
-    $reconfigExe = Find-CondorExe 'condor_reconfig.exe'
-    $restartExe = Find-CondorExe 'condor_restart.exe'
+    # NETWORK_INTERFACE / CONDOR_HOST 改变后，condor_reconfig 与
+    # condor_restart -master 不能可靠地重建 master 的继承地址。
+    # 旧 master 可能继续把原 IP 传给 shared_port/startd，表现为
+    # 9618 已监听，但 condor_status / condor_ping 永久等待。
+    # 因此集群角色或绑定 IP 改动后必须完整停止并启动 Windows 服务。
+    $oldMasterPid = 0
+    try {
+        $oldMasterPid = [int](Get-CimInstance Win32_Service -Filter "Name='Condor'" -ErrorAction Stop).ProcessId
+    } catch {}
 
-    # 第一优先级：使用 HTCondor 自己的 reconfig/restart。
-    # 这样不会触发 Windows Stop-Service 的长时间阻塞，也不会刷屏输出
-    # “正在等待服务 Condor 停止...”。
-    if ($reconfigExe) {
-        [void](Invoke-ExternalWithTimeout -FilePath $reconfigExe -Arguments '' -Seconds 12)
-        Start-Sleep -Seconds 2
-    }
+    # 清理网页健康检查留下的挂起客户端，避免旧连接干扰重启验证。
+    Get-Process -Name condor_status,condor_ping,condor_q -ErrorAction SilentlyContinue |
+        Stop-Process -Force -ErrorAction SilentlyContinue
 
-    if ($restartExe) {
-        [void](Invoke-ExternalWithTimeout -FilePath $restartExe -Arguments '-master' -Seconds 20)
-        Start-Sleep -Seconds 6
-    }
-
+    $scExe = Join-Path $env:SystemRoot 'System32\sc.exe'
+    $taskkillExe = Join-Path $env:SystemRoot 'System32\taskkill.exe'
     $svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
-    if ($null -eq $svc) {
-        throw '找不到 Condor 服务。'
-    }
 
-    if ($svc.Status -eq 'Stopped') {
-        Start-Service -Name $serviceName -ErrorAction Stop
-        if (-not (Wait-CondorServiceState -Wanted 'Running' -Seconds 45)) {
-            throw 'Condor 服务启动超时。'
-        }
-    }
-    elseif ($svc.Status -eq 'Running') {
-        # 服务已经运行，说明配置重载/重启请求已完成或服务没有必要停止。
-        # 再做一次轻量 reconfig，确保新配置被 master/schedd/startd 看见。
-        if ($reconfigExe) {
-            [void](Invoke-ExternalWithTimeout -FilePath $reconfigExe -Arguments '' -Seconds 12)
-        }
-    }
-    else {
-        # 兜底：服务处于 StopPending/StartPending 等中间状态时，只等待有限时间。
-        # 不能再调用 Stop-Service，因为它会在部分机器上一直刷屏等待。
-        if (-not (Wait-CondorServiceState -Wanted 'Running' -Seconds 20)) {
-            $svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
-            $statusText = if ($null -eq $svc) { 'missing' } else { [string]$svc.Status }
-            throw "Condor 服务处于 $statusText，系统已停止继续等待，避免管理员 PowerShell 卡死。请手动重启系统或在没有任务运行时重启 Condor 服务。"
+    if ($svc.Status -ne 'Stopped') {
+        [void](Invoke-ExternalWithTimeout -FilePath $scExe -Arguments 'stop Condor' -Seconds 12)
+
+        if (-not (Wait-CondorServiceState -Wanted 'Stopped' -Seconds 15)) {
+            $servicePid = 0
+            try {
+                $servicePid = [int](Get-CimInstance Win32_Service -Filter "Name='Condor'" -ErrorAction Stop).ProcessId
+            } catch {}
+
+            if ($servicePid -gt 0) {
+                [void](Invoke-ExternalWithTimeout -FilePath $taskkillExe -Arguments "/PID $servicePid /T /F" -Seconds 15)
+            }
+
+            if (-not (Wait-CondorServiceState -Wanted 'Stopped' -Seconds 20)) {
+                $current = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+                $statusText = if ($null -eq $current) { 'missing' } else { [string]$current.Status }
+                throw "Condor 服务停止超时，当前状态：$statusText。"
+            }
         }
     }
 
-    Start-Sleep -Seconds 5
+    # 服务停止后删除动态地址文件，防止客户端在新 master 建立前读取旧 IP。
+    $staleAddressFiles = @(
+        'C:/Condor/log/.master_address',
+        'C:/Condor/log/.collector_address',
+        'C:/Condor/log/.startd_address',
+        'C:/Condor/log/shared_port_ad',
+        'C:/Condor/spool/.schedd_address'
+    )
+    foreach ($path in $staleAddressFiles) {
+        Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+    }
+
+    Start-Service -Name $serviceName -ErrorAction Stop
+    if (-not (Wait-CondorServiceState -Wanted 'Running' -Seconds 45)) {
+        throw 'Condor 服务启动超时。'
+    }
+    Start-Sleep -Seconds 6
+
+    $newMasterPid = 0
+    try {
+        $newMasterPid = [int](Get-CimInstance Win32_Service -Filter "Name='Condor'" -ErrorAction Stop).ProcessId
+    } catch {}
+    if ($oldMasterPid -gt 0 -and $newMasterPid -eq $oldMasterPid) {
+        throw "Condor master 没有真正重启，PID 仍为 $newMasterPid。"
+    }
+
+    $statusExe = Find-CondorExe 'condor_status.exe'
+    if (-not (Invoke-ExternalWithTimeout -FilePath $statusExe -Arguments '-af Name Machine State Activity' -Seconds 15)) {
+        throw 'Condor 服务已启动，但 condor_status 健康检查失败。'
+    }
+
+    $pingExe = Find-CondorExe 'condor_ping.exe'
+    if (-not (Invoke-ExternalWithTimeout -FilePath $pingExe -Arguments '-table WRITE' -Seconds 15)) {
+        throw 'Condor 服务已启动，但 WRITE 权限健康检查失败。'
+    }
 } catch {
     $warningText = ($warnings -join '; ')
     if ($warningText) {
@@ -1421,12 +1450,8 @@ try {{
 
 {restart_condor_script}
 
-    $statusText = ''
-    try {{
-        $statusText = & 'C:/Condor/bin/condor_status.exe' -af Name Machine State Activity 2>&1 | Out-String
-    }} catch {{
-        $statusText = $_.Exception.Message
-    }}
+    $statusText = 'condor_status 与 condor_ping WRITE 健康检查均已通过。'
+
 
     $result.success = $true
     $result.message = 'HTCondor 集群配置已写入，Condor 服务已重启。'
