@@ -9,7 +9,7 @@
   },
   {
     "username": "user",
-    "password_hash": "e606e38b0d8c19b24cf0ee3808183162ea7cd63ff7912dbb22b5e803286b4446",
+    "password_hash": "9b871512327c09ce91dd649b3f96a63b7408ef267c8cc5710114e629730cb61f",
     "role": "user",
     "enabled": true,
     "security_question": "默认用户账号",
@@ -30,5 +30,21 @@
     "enabled": true,
     "security_question": "",
     "security_answer_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "username": "33",
+    "password_hash": "c6f3ac57944a531490cd39902d0f777715fd005efac9a30622d5f5205e7f6894",
+    "role": "user",
+    "enabled": true,
+    "security_question": "你的学校是什么",
+    "security_answer_hash": "ff9ca42d9e8ee3a528584035e33c6973ed925d114957b662221cf7ea69a6ce1f"
+  },
+  {
+    "username": "wrl",
+    "password_hash": "4328675fd5a028d958c95161a94a758f712ef7ce903c6807065a4e4dba4e3b62",
+    "role": "user",
+    "enabled": true,
+    "security_question": "我的学校名",
+    "security_answer_hash": "ff9ca42d9e8ee3a528584035e33c6973ed925d114957b662221cf7ea69a6ce1f"
   }
 ]

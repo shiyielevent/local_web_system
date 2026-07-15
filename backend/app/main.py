@@ -178,10 +178,6 @@ class HTCondorJoinParentRequest(BaseModel):
     child_ip: str = ""
     low_port: int = 9700
     high_port: int = 9800
-    # 子节点加入父节点后，自动连接父节点共享目录。
-    auto_shared_io: bool = True
-    share_name: str = "LocalWebData"
-    shared_unc_root: str = ""
 
 
 class HTCondorSharedIORequest(BaseModel):
@@ -194,8 +190,6 @@ class HTCondorSharedIORequest(BaseModel):
 class HTCondorPrepareShareRequest(BaseModel):
     local_root: str = ""
     share_name: str = "LocalWebData"
-    # 用于生成子节点可访问的 UNC，通常填父节点绑定 IP。为空时后端使用本机名。
-    unc_host: str = ""
 
 
 class HTCondorDeleteShareRequest(BaseModel):
@@ -438,7 +432,7 @@ def _htcondor_node_weight_summary(status_data: Dict[str, Any]) -> Dict[str, Any]
 # =========================
 @app.get("/api/htcondor/status")
 def api_htcondor_status(authorization: str | None = Header(default=None)):
-    require_admin(authorization)
+    get_current_user(authorization)
     data = htcondor_cluster_manager.status()
     data["node_weight_plan"] = _htcondor_node_weight_summary(data)
     data["node_weight_config"] = data["node_weight_plan"]
@@ -447,7 +441,7 @@ def api_htcondor_status(authorization: str | None = Header(default=None)):
 
 @app.get("/api/htcondor/node-weights")
 def api_htcondor_node_weights(authorization: str | None = Header(default=None)):
-    require_admin(authorization)
+    get_current_user(authorization)
     data = htcondor_cluster_manager.status()
     return _htcondor_node_weight_summary(data)
 
@@ -541,13 +535,13 @@ def api_htcondor_smoke_test(authorization: str | None = Header(default=None)):
 
 @app.get("/api/htcondor/logs")
 def api_htcondor_logs(authorization: str | None = Header(default=None)):
-    require_admin(authorization)
+    get_current_user(authorization)
     return htcondor_cluster_manager.tail_logs()
 
 
 @app.get("/api/htcondor/shared-io")
 def api_htcondor_shared_io(authorization: str | None = Header(default=None)):
-    require_admin(authorization)
+    get_current_user(authorization)
     return htcondor_cluster_manager.shared_io_config()
 
 
@@ -578,7 +572,6 @@ def api_htcondor_prepare_shared_io(
         return htcondor_cluster_manager.prepare_local_share(
             local_root=payload.local_root,
             share_name=payload.share_name,
-            unc_host=payload.unc_host,
         )
     except HTCondorClusterError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
@@ -603,13 +596,13 @@ def api_htcondor_delete_shared_io(
 
 @app.post("/api/htcondor/shared-io/test")
 def api_htcondor_test_shared_io(authorization: str | None = Header(default=None)):
-    require_admin(authorization)
+    get_current_user(authorization)
     return htcondor_cluster_manager.test_shared_io()
 
 
 @app.get("/api/htcondor/nodes")
 def api_htcondor_nodes(authorization: str | None = Header(default=None)):
-    require_admin(authorization)
+    get_current_user(authorization)
     return htcondor_cluster_manager.node_status()
 
 
@@ -634,16 +627,13 @@ def api_htcondor_join_parent(
     payload: HTCondorJoinParentRequest,
     authorization: str | None = Header(default=None),
 ):
-    require_admin(authorization)
+    get_current_user(authorization)
     try:
         return htcondor_cluster_manager.join_parent_node(
             parent_ip=payload.parent_ip,
             child_ip=payload.child_ip,
             low_port=payload.low_port,
             high_port=payload.high_port,
-            auto_shared_io=payload.auto_shared_io,
-            share_name=payload.share_name,
-            shared_unc_root=payload.shared_unc_root,
         )
     except HTCondorClusterError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
@@ -651,7 +641,7 @@ def api_htcondor_join_parent(
 
 @app.post("/api/htcondor/leave-pool")
 def api_htcondor_leave_pool(authorization: str | None = Header(default=None)):
-    require_admin(authorization)
+    get_current_user(authorization)
     try:
         return htcondor_cluster_manager.leave_pool()
     except HTCondorClusterError as exc:

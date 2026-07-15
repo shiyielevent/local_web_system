@@ -1059,6 +1059,84 @@ function mergeTaskForWindow(previousTask, nextTask) {
 }
 
 
+function buildTaskDiagnosticAlert(task) {
+  const logs = Array.isArray(task?.logs) ? task.logs : [];
+  if (!logs.length) return null;
+
+  const recentText = logs.slice(-260).map((line) => String(line || '')).join('\n');
+  const lowerText = recentText.toLowerCase();
+
+  const hasMemoryError =
+    /memoryerror/i.test(recentText) ||
+    /arraymemoryerror/i.test(recentText) ||
+    /unable to allocate/i.test(recentText) ||
+    /could not allocate/i.test(recentText) ||
+    /cannot allocate/i.test(recentText) ||
+    /safe_realloc/i.test(recentText);
+
+  if (!hasMemoryError) return null;
+
+  const looksLikeHTCondor =
+    lowerText.includes('[htcondor]') ||
+    lowerText.includes('[child-failed]') ||
+    lowerText.includes('clusterid') ||
+    lowerText.includes('target_machine') ||
+    lowerText.includes('slot') ||
+    lowerText.includes('condor');
+
+  const looksLikeModelOrSklearn =
+    lowerText.includes('sklearn') ||
+    lowerText.includes('joblib') ||
+    lowerText.includes('randomforest') ||
+    lowerText.includes('predict_proba') ||
+    lowerText.includes('numpy_pickle') ||
+    lowerText.includes('cm_cth');
+
+  const taskId = String(task?.id || task?.task_id || task?.parent_id || 'unknown');
+  const title = String(task?.name || task?.task_name || task?.module_name || '当前任务');
+
+  if (looksLikeHTCondor && looksLikeModelOrSklearn) {
+    return {
+      key: `${taskId}:htcondor-memory-overload`,
+      message: [
+        '检测到分布式任务内存不足',
+        '',
+        `任务：${title}`,
+        '',
+        '系统已经识别到 HTCondor 分布式子任务出现 MemoryError / Unable to allocate。',
+        '这通常不是文件路径或节点连接问题，而是同一节点同时运行多个 EXE 时，模型加载和 sklearn/joblib 预测阶段的内存峰值叠加，超过了该节点可用内存。',
+        '',
+        '建议处理：',
+        '1. 先把该节点的“并发槽位”降低。例如 16GB 内存节点建议先设置为 1；高性能节点最多先试 2。',
+        '2. 启用远程 EXE 线程限制，避免多个 EXE × sklearn/joblib 内部多线程叠加。',
+        '   PowerShell 执行：setx LOCAL_WEB_HTCONDOR_THREAD_LIMIT 1',
+        '3. 适当提高单个 HTCondor 子任务的内存申请，避免系统把过多任务塞到同一节点。',
+        '   PowerShell 执行：setx LOCAL_WEB_HTCONDOR_REQUEST_MEMORY_MB 6144',
+        '4. 执行 setx 后需要关闭当前系统和 PowerShell，重新打开 PowerShell，再启动 start_system.bat。',
+        '5. 如果并发槽位降到 1 后可以成功，说明该 EXE 在当前内存条件下不适合节点内多进程；需要升级内存或改 EXE 内部分块预测。',
+        '',
+        '当前推荐稳定配置：',
+        'LAPTOP-40D4C67U：并发 1',
+        'LAPTOP-VBDFGQ6E：并发 1 或 2',
+      ].join('\n'),
+    };
+  }
+
+  return {
+    key: `${taskId}:memory-error`,
+    message: [
+      '检测到任务内存不足',
+      '',
+      `任务：${title}`,
+      '',
+      '运行日志中出现 MemoryError / Unable to allocate，说明程序在加载模型或处理数组时内存不足。',
+      '',
+      '建议：降低并发进程数，关闭其他占用内存的软件，或减少单次处理的数据量；如果是分布式任务，请优先降低节点并发槽位。',
+    ].join('\n'),
+  };
+}
+
+
 function TaskProgressPanel({ task, taskLogs }) {
   const status = normalizeTaskStatus(task?.status);
   const running = shouldTaskTimerRun(status);
@@ -2220,6 +2298,7 @@ const TASK_TRAY_RESERVED_BOTTOM = 150;
 
 
 function HTCondorPage({
+  isAdmin = false,
   status,
   busy,
   message,
@@ -2690,12 +2769,13 @@ function HTCondorPage({
               <div>
                 <div style={{ fontSize: 16, fontWeight: 900, color: '#12385f' }}>节点信息、任务分配比例与进程槽</div>
                 <div style={{ marginTop: 4, fontSize: 12, color: '#64748b', lineHeight: 1.45 }}>
-                  分配比例控制节点承担的预计输入工作量，所有节点合计必须为 100%；编辑任一节点时会自动调整其他节点。进程槽控制同一节点同时运行的 EXE 数量。
+                  默认按 CPU/内存生成建议权重；管理员可手动调整。权重只影响输入文件数量分配。
                 </div>
               </div>
               <select
                 style={{ ...styles.input, width: 128, minHeight: 38, fontSize: 13 }}
                 value={weightMode}
+                disabled={!isAdmin}
                 onChange={(e) => changeWeightMode(e.target.value)}
               >
                 <option value="weighted">按百分比分配</option>
@@ -2749,7 +2829,7 @@ function HTCondorPage({
                             type="button"
                             title="减少 1%"
                             aria-label={`${machine} 分配比例减少 1%`}
-                            disabled={weightMode === 'equal' || Number(draftValue) <= 0}
+                            disabled={!isAdmin || weightMode === 'equal' || Number(draftValue) <= 0}
                             onClick={() => setDraftWeight(machine, (Number(draftValue) || 0) - 1)}
                             style={{
                               width: 30,
@@ -2766,8 +2846,8 @@ function HTCondorPage({
                               display: 'inline-flex',
                               alignItems: 'center',
                               justifyContent: 'center',
-                              cursor: weightMode === 'equal' || Number(draftValue) <= 0 ? 'not-allowed' : 'pointer',
-                              opacity: weightMode === 'equal' || Number(draftValue) <= 0 ? 0.45 : 1,
+                              cursor: !isAdmin || weightMode === 'equal' || Number(draftValue) <= 0 ? 'not-allowed' : 'pointer',
+                              opacity: !isAdmin || weightMode === 'equal' || Number(draftValue) <= 0 ? 0.45 : 1,
                               userSelect: 'none',
                             }}
                           >
@@ -2788,14 +2868,14 @@ function HTCondorPage({
                               textAlign: 'center',
                             }}
                             value={draftValue}
-                            disabled={weightMode === 'equal'}
+                            disabled={!isAdmin || weightMode === 'equal'}
                             onChange={(e) => setDraftWeight(machine, e.target.value.replace(/\D/g, ''))}
                           />
                           <button
                             type="button"
                             title="增加 1%"
                             aria-label={`${machine} 分配比例增加 1%`}
-                            disabled={weightMode === 'equal' || Number(draftValue) >= 100}
+                            disabled={!isAdmin || weightMode === 'equal' || Number(draftValue) >= 100}
                             onClick={() => setDraftWeight(machine, (Number(draftValue) || 0) + 1)}
                             style={{
                               width: 30,
@@ -2812,8 +2892,8 @@ function HTCondorPage({
                               display: 'inline-flex',
                               alignItems: 'center',
                               justifyContent: 'center',
-                              cursor: weightMode === 'equal' || Number(draftValue) >= 100 ? 'not-allowed' : 'pointer',
-                              opacity: weightMode === 'equal' || Number(draftValue) >= 100 ? 0.45 : 1,
+                              cursor: !isAdmin || weightMode === 'equal' || Number(draftValue) >= 100 ? 'not-allowed' : 'pointer',
+                              opacity: !isAdmin || weightMode === 'equal' || Number(draftValue) >= 100 ? 0.45 : 1,
                               userSelect: 'none',
                             }}
                           >
@@ -2827,6 +2907,7 @@ function HTCondorPage({
                         <select
                           style={{ ...styles.input, minHeight: 36, padding: '0 8px', fontSize: 13 }}
                           value={draftProcessSlot}
+                          disabled={!isAdmin}
                           onChange={(e) => setDraftProcessSlot(machine, e.target.value)}
                         >
                           {processSlotOptions.map((value) => (
@@ -2857,12 +2938,12 @@ function HTCondorPage({
                     当前分配比例合计：{weightTotal}% {weightsValid ? '✓' : '（必须为100%）'}
                   </div>
                   <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-                    <button style={{ ...styles.whiteBtn, padding: '8px 12px' }} disabled={!!busy} onClick={resetWeightsToSuggested}>
+                    <button style={{ ...styles.whiteBtn, padding: '8px 12px' }} disabled={!!busy || !isAdmin} onClick={resetWeightsToSuggested}>
                       恢复建议比例/槽
                     </button>
                     <button
                       style={{ ...styles.blueBtn, padding: '8px 12px', opacity: weightsValid ? 1 : 0.55 }}
-                      disabled={!!busy || !weightsValid}
+                      disabled={!!busy || !isAdmin || !weightsValid}
                       onClick={saveWeights}
                     >
                       保存分配比例与进程槽
@@ -2879,9 +2960,9 @@ function HTCondorPage({
 
           <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 'auto', paddingTop: 14 }}>
             <button style={styles.blueBtn} disabled={!!busy} onClick={onRefresh}>刷新状态</button>
-            <button style={styles.whiteBtn} disabled={!!busy} onClick={() => onSetMode('htcondor')}>启用 HTCondor 执行</button>
-            <button style={styles.whiteBtn} disabled={!!busy} onClick={() => onSetMode('local')}>切回本机执行</button>
-            <button style={styles.whiteBtn} disabled={!!busy} onClick={onSmokeTest}>提交自检任务</button>
+            <button style={styles.whiteBtn} disabled={!!busy || !isAdmin} onClick={() => onSetMode('htcondor')}>启用 HTCondor 执行</button>
+            <button style={styles.whiteBtn} disabled={!!busy || !isAdmin} onClick={() => onSetMode('local')}>切回本机执行</button>
+            <button style={styles.whiteBtn} disabled={!!busy || !isAdmin} onClick={onSmokeTest}>提交自检任务</button>
           </div>
         </div>
 
@@ -2939,7 +3020,7 @@ function HTCondorPage({
               父节点点击“添加共享目录”后选择本地数据目录；系统会自动创建 Windows 共享。允许添加多个共享目录。
             </div>
             <div style={{ marginTop: 10, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-              <button style={styles.blueBtn} disabled={!!busy} onClick={onPrepareShare}>添加共享目录</button>
+              <button style={styles.blueBtn} disabled={!!busy || !isAdmin} onClick={onPrepareShare}>添加共享目录</button>
               <button style={styles.whiteBtn} disabled={!!busy} onClick={onShowShares}>查看当前配置的共享目录</button>
               <button style={styles.whiteBtn} disabled={!!busy || !sharedEnabled} onClick={onTestShare}>测试共享目录</button>
             </div>
@@ -2950,7 +3031,7 @@ function HTCondorPage({
           </div>
 
           <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 16 }}>
-            <button style={styles.blueBtn} disabled={!!busy} onClick={onCreateParent}>启动集群</button>
+            <button style={styles.blueBtn} disabled={!!busy || !isAdmin} onClick={onCreateParent}>启动集群</button>
             <button style={styles.whiteBtn} disabled={!!busy} onClick={onJoinParent}>加入集群</button>
             <button
               style={leaveButtonStyle}
@@ -3158,6 +3239,10 @@ function App() {
       })
       .forEach((t) => arr.push({ key: `tool:${t.key}`, label: t.label }));
 
+    if (!isAdmin) {
+      arr.push({ key: 'htcondor', label: '分布式' });
+    }
+
     if (isAdmin) {
       arr.push({ key: 'htcondor', label: '分布式' });
     }
@@ -3343,6 +3428,12 @@ useEffect(() => {
             try {
               const detail = await getTask(w.taskId);
               showMemoryWarningForTask(detail);
+
+              const diagnosticAlert = buildTaskDiagnosticAlert(detail);
+              if (diagnosticAlert && !taskDiagnosticAlertRef.current.has(diagnosticAlert.key)) {
+                taskDiagnosticAlertRef.current.add(diagnosticAlert.key);
+                window.alert(diagnosticAlert.message);
+              }
 
               const oldStatus = w.task?.status;
               const newStatus = detail?.status;
@@ -3887,7 +3978,17 @@ async function installModuleFolder() {
     }
   }
 
+  function blockNonAdminHTCondorAction() {
+    if (isAdmin) return false;
+    setHTCondorMessage({
+      type: 'error',
+      text: '普通用户可以查看分布式状态、加入或退出集群；全局执行模式、父节点、共享目录和节点权重配置需要管理员操作。',
+    });
+    return true;
+  }
+
   async function handleHTCondorSetMode(mode) {
+    if (blockNonAdminHTCondorAction()) return null;
     return runHTCondorAction(
       mode === 'htcondor' ? '启用 HTCondor 执行' : '切回本机执行',
       () => setHTCondorExecutionMode(mode),
@@ -3895,10 +3996,12 @@ async function installModuleFolder() {
   }
 
   async function handleHTCondorSmokeTest() {
+    if (blockNonAdminHTCondorAction()) return null;
     return runHTCondorAction('提交 HTCondor 自检任务', () => runHTCondorSmokeTest());
   }
 
   async function handleHTCondorCreateParent() {
+    if (blockNonAdminHTCondorAction()) return null;
     const payload = {
       bind_ip: htcondorClusterForm.bind_ip || '',
       low_port: Number(htcondorClusterForm.low_port || 9700),
@@ -3908,6 +4011,7 @@ async function installModuleFolder() {
   }
 
   async function handleHTCondorPrepareShare() {
+    if (blockNonAdminHTCondorAction()) return null;
     let selectedPath = '';
     try {
       const result = await chooseLocalDir();
@@ -3929,6 +4033,7 @@ async function installModuleFolder() {
   }
 
   async function confirmHTCondorPrepareShare() {
+    if (blockNonAdminHTCondorAction()) return null;
     if (!htcondorShareNameModal) return null;
     const selectedPath = String(htcondorShareNameModal.local_root || '').trim();
     if (!selectedPath) {
@@ -3973,6 +4078,7 @@ async function installModuleFolder() {
   }
 
   async function confirmHTCondorDeleteShare() {
+    if (blockNonAdminHTCondorAction()) return null;
     const item = htcondorShareDeleteModal?.item || {};
     const payload = {
       share_name: item.share_name || '',
@@ -4019,6 +4125,7 @@ async function installModuleFolder() {
   }
 
   async function handleHTCondorSaveWeights(payload) {
+    if (blockNonAdminHTCondorAction()) return null;
     return runHTCondorAction('保存节点任务分配比例与进程槽', () => saveHTCondorNodeWeights(payload));
   }
 
@@ -4057,7 +4164,29 @@ function addTaskWindow(task, title) {
   const timedTask = stampTaskTiming(null, task);
   showMemoryWarningForTask(timedTask);
   zRef.current += 1;
+  setTaskTrayMinimized(false);
   setWindows((prev) => {
+    const taskId = String(task?.id || task?.task_id || '');
+    const existingIndex = prev.findIndex((w) => {
+      const existingTaskId = String(w.taskId || w.task?.id || w.task?.task_id || '');
+      return taskId && existingTaskId === taskId;
+    });
+
+    if (existingIndex >= 0) {
+      return prev.map((w, index) => (
+        index === existingIndex
+          ? {
+              ...w,
+              taskId: taskId || w.taskId,
+              task: mergeTaskForWindow(w.task, timedTask),
+              title: title || w.title,
+              minimized: false,
+              zIndex: zRef.current,
+            }
+          : w
+      ));
+    }
+
     const offset = (prev.length % 4) * 24;
     const popupWidth = 420;
     const popupHeight = 520;
@@ -6394,8 +6523,9 @@ function renderTaskManagementPage() {
         {activeTab.startsWith('tool:') && renderToolPage(activeTab.slice('tool:'.length))}
         {activeTab === 'data_mgmt' && renderDataManagementPage()}
         {activeTab === 'tasks' && renderTaskManagementPage()}
-        {activeTab === 'htcondor' && isAdmin && (
+        {activeTab === 'htcondor' && (
           <HTCondorPage
+            isAdmin={isAdmin}
             status={htcondorStatus}
             busy={htcondorBusy}
             message={htcondorMessage}
@@ -6442,7 +6572,7 @@ function renderTaskManagementPage() {
         />
       )}
 
-      
+
       {windows.some((w) => w.minimized) && (
           <TaskTrayFloatingWindow
             count={windows.filter((w) => w.minimized).length}
@@ -6585,7 +6715,7 @@ function renderTaskManagementPage() {
                           fontSize: 12,
                           minWidth: 108,
                         }}
-                        disabled={!!htcondorBusy}
+                        disabled={!!htcondorBusy || !isAdmin}
                         onClick={() => handleHTCondorAskDeleteShare(item, idx)}
                       >
                         删除此共享目录
@@ -6632,7 +6762,7 @@ function renderTaskManagementPage() {
               删除操作只移除系统中的共享目录配置，并尝试删除 Windows 共享映射；不会删除本地目录和里面的数据文件。
             </div>
             <div style={{ display: 'flex', gap: 10, marginTop: 16, flexWrap: 'wrap' }}>
-              <button style={styles.redBtn} disabled={!!htcondorBusy} onClick={confirmHTCondorDeleteShare}>
+              <button style={styles.redBtn} disabled={!!htcondorBusy || !isAdmin} onClick={confirmHTCondorDeleteShare}>
                 确认删除
               </button>
               <button style={styles.whiteBtn} disabled={!!htcondorBusy} onClick={() => setHTCondorShareDeleteModal(null)}>

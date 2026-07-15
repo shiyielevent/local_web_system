@@ -1,8 +1,10 @@
 [
   {
     "id": "H8_CM_CTH_2_EXE",
-    "name": "葵花8号云类型与云相态反演",
-    "description": "读取H8 NetCDF目录，生成云掩膜和云相态反演结果。",
+    "name": "H8 Cloud Mask And Cloud Phase Retrieval",
+    "description": "Executable H8 cloud mask and cloud phase retrieval module. The system reads H8 NetCDF input files and writes cloud product GeoTIFF results.",
+    "runtime": "cpp_native",
+    "entry": "CM_CTH_2.exe",
     "executable": "backend/installed_modules/H8_CM_CTH_2_EXE/CM_CTH_2.exe",
     "working_dir": "backend/installed_modules/H8_CM_CTH_2_EXE",
     "config_mode": "json_file",
@@ -10,6 +12,32 @@
       "{executable}",
       "{config_json}"
     ],
+    "dependency_dirs": [
+      "deps"
+    ],
+    "dependency_search_dirs": [],
+    "resource_dirs": [
+      "resources"
+    ],
+    "parallel": {
+      "mode": "none",
+      "input_key": "",
+      "output_key": "",
+      "file_patterns": "*R21*.nc;*R21*.NC",
+      "output_suffix": ".tif",
+      "files_per_job": 1,
+      "chunk_multiplier": 1,
+      "output_naming": "source_stem"
+    },
+    "tags": [
+      "h8",
+      "cloud",
+      "cloud-mask",
+      "cloud-phase",
+      "executable"
+    ],
+    "tool_type": "cloud",
+    "enabled": true,
     "inputs": [
       {
         "key": "file",
@@ -36,12 +64,7 @@
         "admin_fixed": false,
         "path_mode": "absolute",
         "io_role": "input",
-        "default": "D:/H8/data/CM",
-        "batch_role": "output",
-        "match_mode": "each_file",
-        "file_patterns": "*R21*.nc;*R21*.NC",
-        "batch_allow_all_files": true,
-        "batch_allow_no_extension": true
+        "default": "D:/H8/data/CM"
       },
       {
         "key": "outpath",
@@ -53,44 +76,11 @@
         "path_mode": "absolute",
         "io_role": "output",
         "default": "D:/H8/data/output",
-        "batch_role": "output"
+        "batch_role": "OUTPUT_DIR"
       }
     ],
-    "tags": [
-      "h8",
-      "cloud",
-      "cloud-mask",
-      "cloud-phase",
-      "executable"
-    ],
-    "tool_type": "cloud",
-    "parallel": {
-      "mode": "none",
-      "input_key": "",
-      "output_key": "",
-      "file_patterns": "*R21*.nc;*R21*.NC",
-      "output_suffix": ".tif",
-      "files_per_job": 1,
-      "chunk_multiplier": 1
-    },
-    "enabled": true,
-    "runtime": "cpp_native",
-    "entry": "CM_CTH_2.exe",
-    "dependency_dirs": [],
-    "dependency_search_dirs": [],
-    "resource_dirs": [],
     "_manifest_format": "executable_module_json",
-    "_param_json_path": "D:\\NEPU\\H8\\CM_CTH_2\\CTH\\dist\\CM_CTH_2\\config.json",
-    "performance": {
-      "estimated_peak_memory_mb": 5200,
-      "request_memory_mb": 6144,
-      "preferred_threads": 8,
-      "min_threads_per_exe": 4,
-      "max_process_slots": 2,
-      "reserved_cpus": 4,
-      "reserved_memory_mb": 3072,
-      "memory_headroom_ratio": 1.15
-    }
+    "_param_json_path": "D:\\local_web_module_system\\backend\\installed_modules\\H8_CM_CTH_2_EXE\\config.json"
   },
   {
     "id": "h8aod",
@@ -348,5 +338,217 @@
     ],
     "_manifest_format": "executable_module_json",
     "_param_json_path": "D:\\local_module_web_system1\\parasol\\config.json"
+  },
+  {
+    "id": "CTH_FY",
+    "name": "FY CTH云顶高反演",
+    "description": "基于风云卫星数据的云顶高度反演可执行模块，系统读取 config.json 生成输入和输出参数表单，并在运行时将配置文件传递给 CTH_FY.exe。",
+    "runtime": "cpp_native",
+    "entry": "CTH_FY.exe",
+    "executable": "backend/installed_modules/CTH_FY/CTH_FY.exe",
+    "working_dir": "backend/installed_modules/CTH_FY",
+    "config_mode": "json_file",
+    "command_template": [
+      "{executable}",
+      "{config_json}"
+    ],
+    "dependency_dirs": [
+      "deps"
+    ],
+    "dependency_search_dirs": [],
+    "resource_dirs": [
+      "resources"
+    ],
+    "parallel": {
+      "mode": "batch_group",
+      "input_key": "",
+      "output_key": "",
+      "file_patterns": "*.hdf;*.h5;*.nc",
+      "output_suffix": ".tif",
+      "files_per_job": 1,
+      "chunk_multiplier": 1,
+      "output_naming": "source_stem",
+      "output_mode": "directory"
+    },
+    "tags": [
+      "fy",
+      "cth",
+      "cloud",
+      "executable"
+    ],
+    "tool_type": "cloud",
+    "enabled": true,
+    "inputs": [
+      {
+        "key": "file",
+        "label": "file",
+        "type": "dir_path",
+        "required": true,
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "input",
+        "default": ""
+      },
+      {
+        "key": "cm_files",
+        "label": "cm_files",
+        "type": "dir_path",
+        "required": true,
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "input",
+        "default": ""
+      }
+    ],
+    "_manifest_format": "executable_module_json",
+    "_param_json_path": "D:\\local_web_module_system_del\\backend\\installed_modules\\CTH_FY\\config.json"
+  },
+  {
+    "id": "H8_CM_2_EXE",
+    "name": "H8 Cloud Mask Retrieval",
+    "description": "Executable Himawari-8 cloud mask retrieval module. The system accepts an input folder and output folder, then runs one subtask for each matched input file during batch execution.",
+    "runtime": "cpp_native",
+    "entry": "CM_2.exe",
+    "executable": "backend/installed_modules/H8_CM_2_EXE/CM_2.exe",
+    "working_dir": "backend/installed_modules/H8_CM_2_EXE",
+    "config_mode": "json_file",
+    "command_template": [
+      "{executable}",
+      "{config_json}"
+    ],
+    "dependency_dirs": [
+      "_internal",
+      "deps"
+    ],
+    "dependency_search_dirs": [],
+    "resource_dirs": [
+      "resources"
+    ],
+    "parallel": {
+      "mode": "batch_group",
+      "input_key": "input_dir",
+      "output_key": "output_dir",
+      "file_patterns": "*.nc;*.NC;*.hdf;*.HDF;*.h5;*.H5",
+      "output_suffix": ".tif",
+      "files_per_job": 1,
+      "chunk_multiplier": 1,
+      "output_naming": "source_stem",
+      "output_mode": "directory"
+    },
+    "tags": [
+      "h8",
+      "cm",
+      "cloud-mask",
+      "executable"
+    ],
+    "tool_type": "cloud",
+    "enabled": true,
+    "inputs": [
+      {
+        "key": "input_dir",
+        "label": "input_dir",
+        "type": "dir_path",
+        "required": true,
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "input",
+        "default": "",
+        "batch_role": "input",
+        "match_mode": "each_file",
+        "file_patterns": "*.nc;*.NC;*.hdf;*.HDF;*.h5;*.H5",
+        "batch_allow_all_files": true,
+        "batch_allow_no_extension": true
+      },
+      {
+        "key": "output_dir",
+        "label": "output_dir",
+        "type": "dir_path",
+        "required": true,
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "output",
+        "default": "",
+        "batch_role": "OUTPUT_DIR"
+      }
+    ],
+    "_manifest_format": "executable_module_json",
+    "_param_json_path": "G:\\exe\\H8\\CM_2\\config.json"
+  },
+  {
+    "id": "H8_CTH_2_EXE",
+    "name": "H8 Cloud Top Height Retrieval",
+    "description": "Executable Himawari-8 cloud top height retrieval module. The system accepts an input folder and output folder, then runs one subtask for each matched input file during batch execution.",
+    "runtime": "cpp_native",
+    "entry": "CTH_2.exe",
+    "executable": "backend/installed_modules/H8_CTH_2_EXE/CTH_2.exe",
+    "working_dir": "backend/installed_modules/H8_CTH_2_EXE",
+    "config_mode": "json_file",
+    "command_template": [
+      "{executable}",
+      "{config_json}"
+    ],
+    "dependency_dirs": [
+      "_internal",
+      "deps"
+    ],
+    "dependency_search_dirs": [],
+    "resource_dirs": [
+      "resources"
+    ],
+    "parallel": {
+      "mode": "batch_group",
+      "input_key": "input_dir",
+      "output_key": "output_dir",
+      "file_patterns": "*.nc;*.NC;*.hdf;*.HDF;*.h5;*.H5",
+      "output_suffix": ".tif",
+      "files_per_job": 1,
+      "chunk_multiplier": 1,
+      "output_naming": "source_stem",
+      "output_mode": "directory"
+    },
+    "tags": [
+      "h8",
+      "cth",
+      "cloud-top-height",
+      "executable"
+    ],
+    "tool_type": "cloud",
+    "enabled": true,
+    "inputs": [
+      {
+        "key": "input_dir",
+        "label": "input_dir",
+        "type": "dir_path",
+        "required": true,
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "input",
+        "default": "",
+        "batch_role": "input",
+        "match_mode": "each_file",
+        "file_patterns": "*.nc;*.NC;*.hdf;*.HDF;*.h5;*.H5",
+        "batch_allow_all_files": true,
+        "batch_allow_no_extension": true
+      },
+      {
+        "key": "output_dir",
+        "label": "output_dir",
+        "type": "dir_path",
+        "required": true,
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "output",
+        "default": "",
+        "batch_role": "OUTPUT_DIR"
+      }
+    ],
+    "_manifest_format": "executable_module_json",
+    "_param_json_path": "G:\\exe\\H8\\CTH_2\\config.json"
   }
 ]
