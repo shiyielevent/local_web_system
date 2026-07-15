@@ -38,5 +38,13 @@
     "enabled": true,
     "security_question": "你的学校是什么",
     "security_answer_hash": "ff9ca42d9e8ee3a528584035e33c6973ed925d114957b662221cf7ea69a6ce1f"
+  },
+  {
+    "username": "wrl",
+    "password_hash": "4328675fd5a028d958c95161a94a758f712ef7ce903c6807065a4e4dba4e3b62",
+    "role": "user",
+    "enabled": true,
+    "security_question": "我的学校名",
+    "security_answer_hash": "ff9ca42d9e8ee3a528584035e33c6973ed925d114957b662221cf7ea69a6ce1f"
   }
 ]

@@ -404,5 +404,151 @@
     ],
     "_manifest_format": "executable_module_json",
     "_param_json_path": "D:\\local_web_module_system_del\\backend\\installed_modules\\CTH_FY\\config.json"
+  },
+  {
+    "id": "H8_CM_2_EXE",
+    "name": "H8 Cloud Mask Retrieval",
+    "description": "Executable Himawari-8 cloud mask retrieval module. The system accepts an input folder and output folder, then runs one subtask for each matched input file during batch execution.",
+    "runtime": "cpp_native",
+    "entry": "CM_2.exe",
+    "executable": "backend/installed_modules/H8_CM_2_EXE/CM_2.exe",
+    "working_dir": "backend/installed_modules/H8_CM_2_EXE",
+    "config_mode": "json_file",
+    "command_template": [
+      "{executable}",
+      "{config_json}"
+    ],
+    "dependency_dirs": [
+      "_internal",
+      "deps"
+    ],
+    "dependency_search_dirs": [],
+    "resource_dirs": [
+      "resources"
+    ],
+    "parallel": {
+      "mode": "batch_group",
+      "input_key": "input_dir",
+      "output_key": "output_dir",
+      "file_patterns": "*.nc;*.NC;*.hdf;*.HDF;*.h5;*.H5",
+      "output_suffix": ".tif",
+      "files_per_job": 1,
+      "chunk_multiplier": 1,
+      "output_naming": "source_stem",
+      "output_mode": "directory"
+    },
+    "tags": [
+      "h8",
+      "cm",
+      "cloud-mask",
+      "executable"
+    ],
+    "tool_type": "cloud",
+    "enabled": true,
+    "inputs": [
+      {
+        "key": "input_dir",
+        "label": "input_dir",
+        "type": "dir_path",
+        "required": true,
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "input",
+        "default": "",
+        "batch_role": "input",
+        "match_mode": "each_file",
+        "file_patterns": "*.nc;*.NC;*.hdf;*.HDF;*.h5;*.H5",
+        "batch_allow_all_files": true,
+        "batch_allow_no_extension": true
+      },
+      {
+        "key": "output_dir",
+        "label": "output_dir",
+        "type": "dir_path",
+        "required": true,
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "output",
+        "default": "",
+        "batch_role": "OUTPUT_DIR"
+      }
+    ],
+    "_manifest_format": "executable_module_json",
+    "_param_json_path": "G:\\exe\\H8\\CM_2\\config.json"
+  },
+  {
+    "id": "H8_CTH_2_EXE",
+    "name": "H8 Cloud Top Height Retrieval",
+    "description": "Executable Himawari-8 cloud top height retrieval module. The system accepts an input folder and output folder, then runs one subtask for each matched input file during batch execution.",
+    "runtime": "cpp_native",
+    "entry": "CTH_2.exe",
+    "executable": "backend/installed_modules/H8_CTH_2_EXE/CTH_2.exe",
+    "working_dir": "backend/installed_modules/H8_CTH_2_EXE",
+    "config_mode": "json_file",
+    "command_template": [
+      "{executable}",
+      "{config_json}"
+    ],
+    "dependency_dirs": [
+      "_internal",
+      "deps"
+    ],
+    "dependency_search_dirs": [],
+    "resource_dirs": [
+      "resources"
+    ],
+    "parallel": {
+      "mode": "batch_group",
+      "input_key": "input_dir",
+      "output_key": "output_dir",
+      "file_patterns": "*.nc;*.NC;*.hdf;*.HDF;*.h5;*.H5",
+      "output_suffix": ".tif",
+      "files_per_job": 1,
+      "chunk_multiplier": 1,
+      "output_naming": "source_stem",
+      "output_mode": "directory"
+    },
+    "tags": [
+      "h8",
+      "cth",
+      "cloud-top-height",
+      "executable"
+    ],
+    "tool_type": "cloud",
+    "enabled": true,
+    "inputs": [
+      {
+        "key": "input_dir",
+        "label": "input_dir",
+        "type": "dir_path",
+        "required": true,
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "input",
+        "default": "",
+        "batch_role": "input",
+        "match_mode": "each_file",
+        "file_patterns": "*.nc;*.NC;*.hdf;*.HDF;*.h5;*.H5",
+        "batch_allow_all_files": true,
+        "batch_allow_no_extension": true
+      },
+      {
+        "key": "output_dir",
+        "label": "output_dir",
+        "type": "dir_path",
+        "required": true,
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "output",
+        "default": "",
+        "batch_role": "OUTPUT_DIR"
+      }
+    ],
+    "_manifest_format": "executable_module_json",
+    "_param_json_path": "G:\\exe\\H8\\CTH_2\\config.json"
   }
 ]

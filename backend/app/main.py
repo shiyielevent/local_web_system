@@ -432,7 +432,7 @@ def _htcondor_node_weight_summary(status_data: Dict[str, Any]) -> Dict[str, Any]
 # =========================
 @app.get("/api/htcondor/status")
 def api_htcondor_status(authorization: str | None = Header(default=None)):
-    require_admin(authorization)
+    get_current_user(authorization)
     data = htcondor_cluster_manager.status()
     data["node_weight_plan"] = _htcondor_node_weight_summary(data)
     data["node_weight_config"] = data["node_weight_plan"]
@@ -441,7 +441,7 @@ def api_htcondor_status(authorization: str | None = Header(default=None)):
 
 @app.get("/api/htcondor/node-weights")
 def api_htcondor_node_weights(authorization: str | None = Header(default=None)):
-    require_admin(authorization)
+    get_current_user(authorization)
     data = htcondor_cluster_manager.status()
     return _htcondor_node_weight_summary(data)
 
@@ -535,13 +535,13 @@ def api_htcondor_smoke_test(authorization: str | None = Header(default=None)):
 
 @app.get("/api/htcondor/logs")
 def api_htcondor_logs(authorization: str | None = Header(default=None)):
-    require_admin(authorization)
+    get_current_user(authorization)
     return htcondor_cluster_manager.tail_logs()
 
 
 @app.get("/api/htcondor/shared-io")
 def api_htcondor_shared_io(authorization: str | None = Header(default=None)):
-    require_admin(authorization)
+    get_current_user(authorization)
     return htcondor_cluster_manager.shared_io_config()
 
 
@@ -596,13 +596,13 @@ def api_htcondor_delete_shared_io(
 
 @app.post("/api/htcondor/shared-io/test")
 def api_htcondor_test_shared_io(authorization: str | None = Header(default=None)):
-    require_admin(authorization)
+    get_current_user(authorization)
     return htcondor_cluster_manager.test_shared_io()
 
 
 @app.get("/api/htcondor/nodes")
 def api_htcondor_nodes(authorization: str | None = Header(default=None)):
-    require_admin(authorization)
+    get_current_user(authorization)
     return htcondor_cluster_manager.node_status()
 
 
@@ -627,7 +627,7 @@ def api_htcondor_join_parent(
     payload: HTCondorJoinParentRequest,
     authorization: str | None = Header(default=None),
 ):
-    require_admin(authorization)
+    get_current_user(authorization)
     try:
         return htcondor_cluster_manager.join_parent_node(
             parent_ip=payload.parent_ip,
@@ -641,7 +641,7 @@ def api_htcondor_join_parent(
 
 @app.post("/api/htcondor/leave-pool")
 def api_htcondor_leave_pool(authorization: str | None = Header(default=None)):
-    require_admin(authorization)
+    get_current_user(authorization)
     try:
         return htcondor_cluster_manager.leave_pool()
     except HTCondorClusterError as exc:
