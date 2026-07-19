@@ -2335,11 +2335,14 @@ function HTCondorPage({
     : 'not_applicable';
   const childConnected = childConnectionStatus === 'connected';
   const childDegraded = childConnectionStatus === 'degraded';
+  const childChecking = childConnectionStatus === 'checking';
   const writePermissionOk = poolRole === 'child' ? (childConnected && !!ping.ok) : !!ping.ok;
   const nodeRoleText = poolRole === 'parent'
     ? '父节点'
     : (poolRole === 'child'
-      ? (childConnected ? '子节点（已连接）' : (childDegraded ? '子节点（注册异常）' : '子节点（已断开）'))
+      ? (childConnected
+        ? '子节点（已连接）'
+        : (childChecking ? '子节点（连接确认中）' : (childDegraded ? '子节点（注册异常）' : '子节点（已断开）')))
       : '单机 / 未加入集群');
   const roleText = !isAdmin && poolRole === 'parent'
     ? '父节点（管理员配置）'
@@ -2351,13 +2354,13 @@ function HTCondorPage({
   const clusterStatusText = poolRole === 'child'
     ? (childConnected
       ? '已连接 / 正常'
-      : (childDegraded ? '可访问 / 注册异常' : '已断开 / 自动重连中'))
+      : (childChecking ? '连接确认中 / 保持监测' : (childDegraded ? '可访问 / 注册异常' : '已断开 / 自动重连中')))
     : (clusterHealthy ? '已组建 / 正常' : (clusterStarted ? '已组建 / 检查异常' : '未组建'));
   const clusterStatusTone = poolRole === 'child' && !childConnected
-    ? (childDegraded ? 'warning' : 'danger')
+    ? (childChecking || childDegraded ? 'warning' : 'danger')
     : 'normal';
   const roleTone = poolRole === 'child' && !childConnected
-    ? (childDegraded ? 'warning' : 'danger')
+    ? (childChecking || childDegraded ? 'warning' : 'danger')
     : 'normal';
   const nodeCount = uniqueMachines.length || nodeItems.length || 0;
   const parentAddress = info.parent_ip || info.bind_ip || '-';
@@ -2418,7 +2421,7 @@ function HTCondorPage({
       }
     : styles.redBtn;
 
-  const okBadge = (ok, yesText, noText) => (
+  const okBadge = (ok, yesText, noText, pending = false) => (
     <span style={{
       display: 'inline-flex',
       alignItems: 'center',
@@ -2427,15 +2430,15 @@ function HTCondorPage({
       borderRadius: 999,
       fontSize: 12,
       fontWeight: 800,
-      background: ok ? '#dcfce7' : '#fee2e2',
-      color: ok ? '#166534' : '#991b1b',
+      background: pending ? '#fef3c7' : (ok ? '#dcfce7' : '#fee2e2'),
+      color: pending ? '#92400e' : (ok ? '#166534' : '#991b1b'),
       whiteSpace: 'nowrap',
     }}>
       <span style={{
         width: 8,
         height: 8,
         borderRadius: '50%',
-        background: ok ? '#22c55e' : '#ef4444',
+        background: pending ? '#f59e0b' : (ok ? '#22c55e' : '#ef4444'),
       }} />
       {ok ? yesText : noText}
     </span>
@@ -2720,14 +2723,23 @@ function HTCondorPage({
             {poolRole === 'child' && okBadge(
               childConnected,
               '父节点连接正常',
-              childDegraded ? '子节点注册异常' : '父节点已断开',
+              childChecking ? '正在确认父节点连接' : (childDegraded ? '子节点注册异常' : '父节点已断开'),
+              childChecking,
             )}
             {okBadge(
               writePermissionOk,
               'WRITE 权限通过',
-              poolRole === 'child' && !childConnected ? '父节点断开，WRITE 不可用' : 'WRITE 权限失败',
+              poolRole === 'child' && childChecking
+                ? 'WRITE 权限确认中'
+                : (poolRole === 'child' && !childConnected ? '父节点断开，WRITE 不可用' : 'WRITE 权限失败'),
+              poolRole === 'child' && childChecking,
             )}
-            {okBadge(info.enabled, 'HTCondor 执行已启用', '当前未启用 HTCondor')}
+            {okBadge(
+              info.enabled,
+              'HTCondor 执行已启用',
+              childChecking ? 'HTCondor 状态确认中' : '当前未启用 HTCondor',
+              childChecking,
+            )}
             {okBadge(sharedEnabled, '共享目录已启用', '共享目录未启用')}
           </div>
         </div>
@@ -2737,23 +2749,25 @@ function HTCondorPage({
         <div style={{
           ...styles.card,
           padding: '16px 18px',
-          border: childDegraded ? '1px solid #f59e0b' : '1px solid #ef4444',
-          borderLeft: childDegraded ? '6px solid #f59e0b' : '6px solid #dc2626',
-          background: childDegraded ? '#fffbeb' : '#fff1f2',
-          color: childDegraded ? '#92400e' : '#991b1b',
+          border: childChecking || childDegraded ? '1px solid #f59e0b' : '1px solid #ef4444',
+          borderLeft: childChecking || childDegraded ? '6px solid #f59e0b' : '6px solid #dc2626',
+          background: childChecking || childDegraded ? '#fffbeb' : '#fff1f2',
+          color: childChecking || childDegraded ? '#92400e' : '#991b1b',
         }}>
           <div style={{ fontSize: 17, fontWeight: 900 }}>
-            {childDegraded ? '子节点注册异常' : '父节点连接已断开'}
+            {childChecking ? '父节点连接确认中' : (childDegraded ? '子节点注册异常' : '父节点连接已断开')}
           </div>
           <div style={{ marginTop: 6, lineHeight: 1.6, fontWeight: 700 }}>
             {parentConnection.message || '当前无法接收父节点下发的分布式任务，系统正在自动重连。'}
           </div>
-          <div style={{ marginTop: 5, color: childDegraded ? '#a16207' : '#b91c1c', fontSize: 13, lineHeight: 1.5 }}>
+          <div style={{ marginTop: 5, color: childChecking || childDegraded ? '#a16207' : '#b91c1c', fontSize: 13, lineHeight: 1.5 }}>
             父节点：{parentConnection.parent_ip || info.parent_ip || '未配置'}:{parentConnection.collector_port || info.collector_port || 9618}
             {parentConnection.reason ? `；诊断：${parentConnection.reason}` : ''}
           </div>
           <div style={{ marginTop: 5, color: '#64748b', fontSize: 12 }}>
-            本机仍保留“子节点”配置；父节点恢复后会自动重新连接，无需重新加入集群。
+            {childChecking
+              ? '单次响应变慢不会被直接判定为断线；系统会继续自动确认连接状态。'
+              : '本机仍保留“子节点”配置；父节点恢复后会自动重新连接，无需重新加入集群。'}
           </div>
         </div>
       )}

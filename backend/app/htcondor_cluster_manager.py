@@ -10,6 +10,7 @@ import re
 import shutil
 import socket
 import subprocess
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -62,14 +63,28 @@ class HTCondorClusterManager:
             self.job_poll_seconds = 1.5
         self.running_jobs = {}
         self.state = self._load_state()
+        self._parent_health_lock = threading.Lock()
+        self._parent_health: Dict[str, Any] = {
+            "endpoint": "",
+            "consecutive_failures": 0,
+            "last_failure_monotonic": 0.0,
+            "last_success_at": "",
+        }
 
         try:
             self.status_query_timeout_seconds = max(
-                3.0,
-                min(30.0, float(os.environ.get("LOCAL_WEB_HTCONDOR_STATUS_TIMEOUT", "6") or "6")),
+                15.0,
+                min(60.0, float(os.environ.get("LOCAL_WEB_HTCONDOR_STATUS_TIMEOUT", "15") or "15")),
             )
         except Exception:
-            self.status_query_timeout_seconds = 6.0
+            self.status_query_timeout_seconds = 15.0
+        try:
+            self.parent_failure_threshold = max(
+                2,
+                min(5, int(os.environ.get("LOCAL_WEB_HTCONDOR_FAILURE_THRESHOLD", "2") or "2")),
+            )
+        except Exception:
+            self.parent_failure_threshold = 2
 
     def _load_json(self, path: Path) -> Dict[str, Any]:
         if not path.is_file():
@@ -1080,6 +1095,9 @@ $result | ConvertTo-Json -Depth 8 | Set-Content -Path $resultPath -Encoding UTF8
             "collector_port": collector_port,
             "local_machine_visible": local_machine_visible,
             "checked_at": now_iso(),
+            "consecutive_failures": 0,
+            "failure_threshold": self.parent_failure_threshold,
+            "last_success_at": "",
             "reason": "",
             "message": "",
         }
@@ -1097,33 +1115,124 @@ $result | ConvertTo-Json -Depth 8 | Set-Content -Path $resultPath -Encoding UTF8
                 # remain available in nodes/queue/ping.
                 reason = "父节点无响应、网络不可达或连接认证失败（详细错误见右侧诊断）"
             endpoint = f"{parent_ip or '未配置'}:{collector_port}"
+            endpoint_key = endpoint.lower()
             if not service_ok:
                 parent_connection.update({
                     "status": "disconnected",
                     "reason": "本机 Condor 服务未运行",
                     "message": f"与父节点 {endpoint} 的连接已断开；本机 Condor 服务未运行，当前无法接收分布式任务。",
                 })
+            elif not parent_ip:
+                parent_connection.update({
+                    "status": "disconnected",
+                    "reason": "尚未配置父节点 IP",
+                    "message": "子节点配置不完整：尚未配置父节点 IP。",
+                })
             elif nodes.get("ok") and local_machine_visible:
+                with self._parent_health_lock:
+                    if self._parent_health.get("endpoint") != endpoint_key:
+                        self._parent_health.update({
+                            "endpoint": endpoint_key,
+                            "consecutive_failures": 0,
+                            "last_failure_monotonic": 0.0,
+                            "last_success_at": "",
+                        })
+                    self._parent_health.update({
+                        "consecutive_failures": 0,
+                        "last_failure_monotonic": 0.0,
+                        "last_success_at": now_iso(),
+                    })
+                    last_success_at = str(self._parent_health.get("last_success_at") or "")
                 parent_connection.update({
                     "status": "connected",
                     "connected": True,
+                    "last_success_at": last_success_at,
                     "reason": "父节点可访问，且本机已注册到集群",
                     "message": f"已连接父节点 {endpoint}，本机已注册并可接收分布式任务。",
                 })
             elif nodes.get("ok"):
+                with self._parent_health_lock:
+                    if self._parent_health.get("endpoint") != endpoint_key:
+                        self._parent_health.update({
+                            "endpoint": endpoint_key,
+                            "consecutive_failures": 0,
+                            "last_failure_monotonic": 0.0,
+                            "last_success_at": "",
+                        })
+                    self._parent_health.update({
+                        "consecutive_failures": 0,
+                        "last_failure_monotonic": 0.0,
+                    })
+                    last_success_at = str(self._parent_health.get("last_success_at") or "")
                 parent_connection.update({
                     "status": "degraded",
                     "reconnecting": True,
+                    "last_success_at": last_success_at,
                     "reason": "父节点可访问，但本机尚未出现在执行节点列表中",
                     "message": f"父节点 {endpoint} 可访问，但本机尚未注册到集群；当前无法接收分布式任务，系统将继续自动重连。",
                 })
-            else:
+            elif queue.get("ok") or ping.get("ok"):
+                # At least one authenticated Condor command reached the
+                # collector. A slow node-list query alone must not be treated
+                # as a disconnected parent.
+                with self._parent_health_lock:
+                    if self._parent_health.get("endpoint") != endpoint_key:
+                        self._parent_health.update({
+                            "endpoint": endpoint_key,
+                            "consecutive_failures": 0,
+                            "last_failure_monotonic": 0.0,
+                            "last_success_at": "",
+                        })
+                    self._parent_health.update({
+                        "consecutive_failures": 0,
+                        "last_failure_monotonic": 0.0,
+                    })
+                    last_success_at = str(self._parent_health.get("last_success_at") or "")
                 parent_connection.update({
-                    "status": "disconnected",
-                    "reconnecting": True,
-                    "reason": reason,
-                    "message": f"与父节点 {endpoint} 的连接已断开；当前无法接收分布式任务，系统将继续自动重连。",
+                    "status": "checking",
+                    "last_success_at": last_success_at,
+                    "reason": "父节点已有响应，正在等待执行节点列表",
+                    "message": f"父节点 {endpoint} 已有响应，正在确认本机节点注册状态；暂不判定为断开。",
                 })
+            else:
+                now_monotonic = time.monotonic()
+                minimum_failure_interval = min(10.0, max(2.0, self.status_query_timeout_seconds / 2.0))
+                with self._parent_health_lock:
+                    if self._parent_health.get("endpoint") != endpoint_key:
+                        self._parent_health.update({
+                            "endpoint": endpoint_key,
+                            "consecutive_failures": 0,
+                            "last_failure_monotonic": 0.0,
+                            "last_success_at": "",
+                        })
+                    last_failure = float(self._parent_health.get("last_failure_monotonic") or 0.0)
+                    if not last_failure or now_monotonic - last_failure >= minimum_failure_interval:
+                        self._parent_health["consecutive_failures"] = int(
+                            self._parent_health.get("consecutive_failures") or 0
+                        ) + 1
+                        self._parent_health["last_failure_monotonic"] = now_monotonic
+                    consecutive_failures = int(self._parent_health.get("consecutive_failures") or 0)
+                    last_success_at = str(self._parent_health.get("last_success_at") or "")
+
+                parent_connection.update({
+                    "consecutive_failures": consecutive_failures,
+                    "last_success_at": last_success_at,
+                    "reason": reason,
+                })
+                if consecutive_failures < self.parent_failure_threshold:
+                    parent_connection.update({
+                        "status": "checking",
+                        "message": (
+                            f"父节点 {endpoint} 本轮响应超时，正在再次确认连接状态；"
+                            f"连续 {self.parent_failure_threshold} 次失败后才会判定为断开。"
+                        ),
+                    })
+                else:
+                    parent_connection.update({
+                        "status": "disconnected",
+                        "reconnecting": True,
+                        "message": f"与父节点 {endpoint} 的连接已断开；当前无法接收分布式任务，系统将继续自动重连。",
+                    })
 
         enabled = bool(mode == "htcondor" and install_ok and service_ok and slot.get("ok") and ping.get("ok"))
         return {
