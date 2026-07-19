@@ -245,7 +245,7 @@ class TaskManager:
         return local_path, unc
 
     def _rewrite_output_paths_for_part_shared(self, data: Any, part_name: str, use_local_paths: bool = False):
-        """共享目录模式下重写输出路径。
+        r"""共享目录模式下重写输出路径。
 
         远程子节点必须写 UNC 路径，例如 \\192.168.x.x\H8data\...；
         父节点本机任务不要绕回 UNC，直接写父节点本地路径，例如 D:\H8\...。
@@ -289,7 +289,7 @@ class TaskManager:
         return names
 
     def _htcondor_target_uses_local_paths(self, machine: str) -> bool:
-        """判断某个 HTCondor 目标节点是否就是父节点本机。
+        r"""判断某个 HTCondor 目标节点是否就是父节点本机。
 
         父节点本机任务直接读写 D:\... 本地路径；
         远程子节点任务才读写 \\父节点IP\共享名\... UNC 路径。
@@ -300,7 +300,7 @@ class TaskManager:
         return target in self._htcondor_local_machine_names() or target.split(".")[0] in self._htcondor_local_machine_names()
 
     def _map_path_like_values_to_shared_target(self, value: Any, use_local_paths: bool = False) -> Any:
-        """按目标节点重写路径。
+        r"""按目标节点重写路径。
 
         use_local_paths=True：父节点本机任务保留 D:\... 本地路径。
         use_local_paths=False：远程子节点任务改写为 UNC 路径。
@@ -2922,6 +2922,12 @@ class TaskManager:
                 except ValueError:
                     continue
             if not allowed:
+                try:
+                    if p.name.startswith("batch_") and p.parent.name == ".localweb_batch_views":
+                        allowed = True
+                except Exception:
+                    pass
+            if not allowed:
                 continue
 
             key = str(p).lower()
@@ -3964,6 +3970,8 @@ class TaskManager:
         """
         requested_parallel = max(1, int(max_parallel or 1))
         job_count = len(jobs)
+        if job_count <= 0:
+            raise ValueError("批处理子任务数量为 0，请检查输入目录、batch_role 和 file_patterns 配置")
         effective_parallel = max(1, min(requested_parallel, max(1, job_count)))
 
         parent_inputs: Dict[str, Any] = {

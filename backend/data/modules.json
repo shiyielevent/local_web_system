@@ -29,7 +29,10 @@
       "output_naming": "source_stem",
       "output_mode": "directory",
       "files_per_job": 1,
-      "chunk_multiplier": 1
+      "chunk_multiplier": 1,
+      "input_pass_mode": "directory_view",
+      "batch_allow_all_files": false,
+      "batch_allow_no_extension": false
     },
     "tags": [
       "h8",
@@ -367,14 +370,18 @@
     ],
     "parallel": {
       "mode": "batch_group",
-      "input_key": "",
-      "output_key": "",
-      "file_patterns": "*.hdf;*.h5;*.nc",
+      "input_key": "fy4_path",
+      "output_key": "out_path",
+      "batch_role": "input",
+      "file_patterns": "*.HDF;*.hdf;*.H5;*.h5;*.NC;*.nc",
       "output_suffix": ".tif",
       "files_per_job": 1,
       "chunk_multiplier": 1,
       "output_naming": "source_stem",
-      "output_mode": "directory"
+      "output_mode": "directory",
+      "input_pass_mode": "directory_view",
+      "batch_allow_all_files": false,
+      "batch_allow_no_extension": false
     },
     "tags": [
       "fy",
@@ -386,26 +393,34 @@
     "enabled": true,
     "inputs": [
       {
-        "key": "file",
-        "label": "file",
+        "key": "fy4_path",
+        "label": "fy4_path",
         "type": "dir_path",
         "required": true,
         "visible_to_user": true,
         "admin_fixed": false,
         "path_mode": "absolute",
         "io_role": "input",
-        "default": ""
+        "default": "G:/FY_data",
+        "batch_role": "input",
+        "match_mode": "each_file",
+        "file_patterns": "*.HDF;*.hdf;*.H5;*.h5;*.NC;*.nc",
+        "batch_allow_all_files": false,
+        "batch_allow_no_extension": false,
+        "batch_pass_mode": "directory_view"
       },
       {
-        "key": "cm_files",
-        "label": "cm_files",
+        "key": "out_path",
+        "label": "out_path",
         "type": "dir_path",
         "required": true,
         "visible_to_user": true,
         "admin_fixed": false,
         "path_mode": "absolute",
-        "io_role": "input",
-        "default": ""
+        "io_role": "output",
+        "default": "D:/H8/fy_output",
+        "batch_role": "OUTPUT_DIR",
+        "output_mode": "directory"
       }
     ],
     "_manifest_format": "executable_module_json",
@@ -441,7 +456,11 @@
       "files_per_job": 1,
       "chunk_multiplier": 1,
       "output_naming": "source_stem",
-      "output_mode": "directory"
+      "output_mode": "directory",
+      "batch_role": "input",
+      "input_pass_mode": "directory_view",
+      "batch_allow_all_files": false,
+      "batch_allow_no_extension": false
     },
     "tags": [
       "h8",
@@ -465,8 +484,9 @@
         "batch_role": "input",
         "match_mode": "each_file",
         "file_patterns": "*.nc;*.NC;*.hdf;*.HDF;*.h5;*.H5",
-        "batch_allow_all_files": true,
-        "batch_allow_no_extension": true
+        "batch_allow_all_files": false,
+        "batch_allow_no_extension": false,
+        "batch_pass_mode": "directory_view"
       },
       {
         "key": "output_dir",
@@ -514,7 +534,11 @@
       "files_per_job": 1,
       "chunk_multiplier": 1,
       "output_naming": "source_stem",
-      "output_mode": "directory"
+      "output_mode": "directory",
+      "batch_role": "input",
+      "input_pass_mode": "directory_view",
+      "batch_allow_all_files": false,
+      "batch_allow_no_extension": false
     },
     "tags": [
       "h8",
@@ -538,8 +562,9 @@
         "batch_role": "input",
         "match_mode": "each_file",
         "file_patterns": "*.nc;*.NC;*.hdf;*.HDF;*.h5;*.H5",
-        "batch_allow_all_files": true,
-        "batch_allow_no_extension": true
+        "batch_allow_all_files": false,
+        "batch_allow_no_extension": false,
+        "batch_pass_mode": "directory_view"
       },
       {
         "key": "output_dir",

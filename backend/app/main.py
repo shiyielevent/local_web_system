@@ -1866,6 +1866,29 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
     # 6.1 C++/多输入目录批处理模式
     if run_mode == "batch_group":
         jobs, batch_output_paths = build_batch_jobs_for_module(module, inputs, workers)
+        if not jobs:
+            cfg = normalize_parallel_config(module)
+            input_key = str(cfg.get("input_key") or "").strip() or choose_parallel_input_key(module, inputs)
+            input_value = str(inputs.get(input_key) or "").strip() if input_key else ""
+            pattern_text = str(cfg.get("file_patterns") or DEFAULT_PARALLEL_PATTERNS)
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": "没有生成任何批处理子任务，请检查输入目录和文件匹配规则。",
+                    "errors": [
+                        {
+                            "field": input_key or "parallel.input_key",
+                            "message": f"输入目录未匹配到文件。当前路径: {input_value or '-'}；匹配规则: {pattern_text}",
+                            "suggestion": "确认模块 inputs 中的输入字段设置了 batch_role=input，并且 file_patterns 覆盖实际文件扩展名，例如 *.HDF;*.hdf;*.nc。",
+                        }
+                    ],
+                    "suggestions": [
+                        "输入目录必须真实存在并包含可匹配的数据文件。",
+                        "如果模块程序需要目录而不是单文件，请设置 batch_pass_mode=directory_view。",
+                        "输出目录字段应设置 io_role=output、batch_role=OUTPUT_DIR。",
+                    ],
+                },
+            )
         task = task_manager.submit_batch_group(
             module_id=module["id"],
             module_name=module.get("name", module["id"]),
@@ -3748,7 +3771,21 @@ def _infer_executable_inputs_from_config(param_json: dict, module_root: Path, mo
     parallel_patterns = parallel_cfg.get("file_patterns") or parallel_cfg.get("patterns") or "*"
     parallel_mode = str(parallel_cfg.get("mode") or "").strip()
     parallel_input_key = str(parallel_cfg.get("input_key") or "").strip()
+    parallel_input_pass_mode = str(
+        parallel_cfg.get("input_pass_mode")
+        or parallel_cfg.get("batch_pass_mode")
+        or parallel_cfg.get("pass_mode")
+        or ""
+    ).strip()
     module_id_lower = str(module_data.get("id") or module_data.get("module_id") or "").lower()
+
+    def parallel_bool(name: str, default: bool) -> bool:
+        if name not in parallel_cfg:
+            return default
+        value = parallel_cfg.get(name)
+        if isinstance(value, str):
+            return value.strip().lower() not in {"0", "false", "no", "off"}
+        return bool(value)
 
     for item in inputs:
         key = str(item.get("key") or "")
@@ -3803,8 +3840,10 @@ def _infer_executable_inputs_from_config(param_json: dict, module_root: Path, mo
                     item["batch_role"] = batch_role
                     item["match_mode"] = "each_file"
                     item["file_patterns"] = parallel_patterns
-                    item["batch_allow_all_files"] = True
-                    item["batch_allow_no_extension"] = True
+                    item["batch_allow_all_files"] = parallel_bool("batch_allow_all_files", True)
+                    item["batch_allow_no_extension"] = parallel_bool("batch_allow_no_extension", True)
+                    if key == parallel_input_key and parallel_input_pass_mode:
+                        item["batch_pass_mode"] = parallel_input_pass_mode
 
     return inputs
 
@@ -6650,6 +6689,22 @@ def _make_batch_output_value(module: dict, base_inputs: dict, slot: str, primary
     return job_inputs, out_path.resolve()
 
 
+def _batch_directory_view_parent(primary_files: list[Path]) -> Path:
+    """选择批处理目录视图的临时父目录。
+
+    优先放在输入文件同一个目录树下，保证 Windows hardlink 不跨盘；
+    如果输入目录不可写，再退回系统 runtime，由后续 symlink/报错处理。
+    """
+    if primary_files:
+        try:
+            base = Path(primary_files[0]).resolve().parent / ".localweb_batch_views"
+            base.mkdir(parents=True, exist_ok=True)
+            return base
+        except Exception:
+            pass
+    return RUNTIME_DIR
+
+
 def _format_batch_validation_error(message: str, missing: list[dict] | None = None, extras: list[dict] | None = None) -> str:
     parts = [message]
     if missing:
@@ -6745,7 +6800,8 @@ def build_batch_jobs_for_module(module: dict, inputs: dict, parallel_workers: in
     batch_view_root: Path | None = None
     if primary_uses_directory_view:
         safe_module_id = sanitize_filename(str(module.get("id") or "batch")).strip() or "batch"
-        batch_view_root = Path(tempfile.mkdtemp(prefix=f"batch_{safe_module_id}_", dir=str(RUNTIME_DIR)))
+        batch_view_parent = _batch_directory_view_parent(primary_files)
+        batch_view_root = Path(tempfile.mkdtemp(prefix=f"batch_{safe_module_id}_", dir=str(batch_view_parent)))
 
     for idx, primary_path in enumerate(primary_files, start=1):
         keys = _extract_datetime_keys(primary_path)
@@ -6773,15 +6829,35 @@ def build_batch_jobs_for_module(module: dict, inputs: dict, parallel_workers: in
                     os.symlink(str(primary_path.resolve()), str(view_file), target_is_directory=False)
                     job_link_modes.append("symlink")
                 except Exception as symlink_exc:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=(
-                            f"无法为批处理子任务创建输入目录视图: {primary_path}\n"
-                            f"hardlink失败: {type(hardlink_exc).__name__}: {hardlink_exc}\n"
-                            f"symlink失败: {type(symlink_exc).__name__}: {symlink_exc}\n"
-                            "请确认输入数据和系统 runtime 在同一 NTFS 磁盘，或以管理员身份运行后端。"
-                        ),
-                    )
+                    allow_copy = str(os.environ.get("LOCAL_WEB_ALLOW_DIRECTORY_VIEW_COPY", "1")).strip().lower() not in {"0", "false", "no", "off"}
+                    if allow_copy:
+                        try:
+                            if view_file.exists() or view_file.is_symlink():
+                                view_file.unlink()
+                            shutil.copy2(str(primary_path.resolve()), str(view_file))
+                            job_link_modes.append("copy")
+                        except Exception as copy_exc:
+                            raise HTTPException(
+                                status_code=400,
+                                detail=(
+                                    f"无法为批处理子任务创建输入目录视图: {primary_path}\n"
+                                    f"hardlink失败: {type(hardlink_exc).__name__}: {hardlink_exc}\n"
+                                    f"symlink失败: {type(symlink_exc).__name__}: {symlink_exc}\n"
+                                    f"copy失败: {type(copy_exc).__name__}: {copy_exc}\n"
+                                    "请确认输入目录可读、临时目录有足够磁盘空间，或把输入数据放到 NTFS 磁盘。"
+                                ),
+                            )
+                    else:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=(
+                                f"无法为批处理子任务创建输入目录视图: {primary_path}\n"
+                                f"hardlink失败: {type(hardlink_exc).__name__}: {hardlink_exc}\n"
+                                f"symlink失败: {type(symlink_exc).__name__}: {symlink_exc}\n"
+                                "当前已通过 LOCAL_WEB_ALLOW_DIRECTORY_VIEW_COPY=0 禁用 copy 兜底；"
+                                "请把输入数据放到 NTFS 磁盘，或以管理员身份运行后端/开启 Windows 开发者模式。"
+                            ),
+                        )
             job_inputs[primary_key] = str(view_dir.resolve())
         else:
             job_inputs[primary_key] = str(primary_path.resolve())
