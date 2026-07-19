@@ -2329,26 +2329,45 @@ function HTCondorPage({
   const nodeItems = Array.isArray(nodes.items) ? nodes.items : [];
   const uniqueMachines = Array.from(new Set(nodeItems.map((item) => item.machine).filter(Boolean)));
   const poolRole = info.pool_role || 'standalone';
-  const nodeRoleText = poolRole === 'parent' ? '父节点' : (poolRole === 'child' ? '子节点' : '单机 / 未加入集群');
+  const parentConnection = info.parent_connection || {};
+  const childConnectionStatus = poolRole === 'child'
+    ? (parentConnection.status || 'checking')
+    : 'not_applicable';
+  const childConnected = childConnectionStatus === 'connected';
+  const childDegraded = childConnectionStatus === 'degraded';
+  const writePermissionOk = poolRole === 'child' ? (childConnected && !!ping.ok) : !!ping.ok;
+  const nodeRoleText = poolRole === 'parent'
+    ? '父节点'
+    : (poolRole === 'child'
+      ? (childConnected ? '子节点（已连接）' : (childDegraded ? '子节点（注册异常）' : '子节点（已断开）'))
+      : '单机 / 未加入集群');
   const roleText = !isAdmin && poolRole === 'parent'
     ? '父节点（管理员配置）'
     : nodeRoleText;
   const clusterStarted = poolRole === 'parent' || poolRole === 'child';
-  const clusterHealthy = clusterStarted && !!info.service_running && !!nodes.ok;
-  const clusterStatusText = clusterHealthy
-    ? '已组建 / 正常'
-    : (clusterStarted
-      ? '已组建 / 检查异常'
-      : '未组建');
+  const clusterHealthy = poolRole === 'child'
+    ? childConnected
+    : (clusterStarted && !!info.service_running && !!nodes.ok);
+  const clusterStatusText = poolRole === 'child'
+    ? (childConnected
+      ? '已连接 / 正常'
+      : (childDegraded ? '可访问 / 注册异常' : '已断开 / 自动重连中'))
+    : (clusterHealthy ? '已组建 / 正常' : (clusterStarted ? '已组建 / 检查异常' : '未组建'));
+  const clusterStatusTone = poolRole === 'child' && !childConnected
+    ? (childDegraded ? 'warning' : 'danger')
+    : 'normal';
+  const roleTone = poolRole === 'child' && !childConnected
+    ? (childDegraded ? 'warning' : 'danger')
+    : 'normal';
   const nodeCount = uniqueMachines.length || nodeItems.length || 0;
   const parentAddress = info.parent_ip || info.bind_ip || '-';
   const sharedIo = info.shared_io || {};
   const sharedShares = Array.isArray(sharedIo.shares) ? sharedIo.shares : (sharedIo.unc_root ? [sharedIo] : []);
-  const sharedEnabled = !!sharedIo.enabled || sharedShares.length > 0;
+  const sharedEnabled = !!sharedIo.enabled && !sharedIo.stale;
   const sharedUnc = sharedIo.unc_root || '';
   const sharedRole = sharedIo.role || '';
   const autoChildUnc = clusterForm.parent_ip && clusterForm.shared_share_name
-    ? `\\${clusterForm.parent_ip}\${clusterForm.shared_share_name}`
+    ? `\\\\${clusterForm.parent_ip}\\${clusterForm.shared_share_name}`
     : '';
 
   const versionOutput = String(installedRuntime.version_output || '');
@@ -2429,13 +2448,17 @@ function HTCondorPage({
     </div>
   );
 
-  const statCard = (label, value) => (
+  const statCard = (label, value, tone = 'normal') => (
     <div style={{
       minHeight: 66,
       padding: '10px 12px',
       borderRadius: 14,
-      border: '1px solid #dce8f3',
-      background: '#fff',
+      border: tone === 'danger'
+        ? '1px solid #fecaca'
+        : (tone === 'warning' ? '1px solid #fde68a' : '1px solid #dce8f3'),
+      background: tone === 'danger'
+        ? '#fff1f2'
+        : (tone === 'warning' ? '#fffbeb' : '#fff'),
       boxSizing: 'border-box',
       display: 'flex',
       flexDirection: 'column',
@@ -2445,7 +2468,7 @@ function HTCondorPage({
       <div style={{
         marginTop: 5,
         fontWeight: 900,
-        color: '#173b61',
+        color: tone === 'danger' ? '#b91c1c' : (tone === 'warning' ? '#a16207' : '#173b61'),
         overflowWrap: 'anywhere',
         whiteSpace: 'pre-wrap',
         lineHeight: 1.35,
@@ -2694,12 +2717,46 @@ function HTCondorPage({
           <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
             {okBadge(info.install_validated, '一键安装已验证', '安装未完全验证')}
             {okBadge(info.service_running, 'Condor 服务运行中', 'Condor 服务未运行')}
-            {okBadge(ping.ok, 'WRITE 权限通过', 'WRITE 权限失败')}
+            {poolRole === 'child' && okBadge(
+              childConnected,
+              '父节点连接正常',
+              childDegraded ? '子节点注册异常' : '父节点已断开',
+            )}
+            {okBadge(
+              writePermissionOk,
+              'WRITE 权限通过',
+              poolRole === 'child' && !childConnected ? '父节点断开，WRITE 不可用' : 'WRITE 权限失败',
+            )}
             {okBadge(info.enabled, 'HTCondor 执行已启用', '当前未启用 HTCondor')}
             {okBadge(sharedEnabled, '共享目录已启用', '共享目录未启用')}
           </div>
         </div>
       </div>
+
+      {poolRole === 'child' && parentConnection.applicable && !childConnected && (
+        <div style={{
+          ...styles.card,
+          padding: '16px 18px',
+          border: childDegraded ? '1px solid #f59e0b' : '1px solid #ef4444',
+          borderLeft: childDegraded ? '6px solid #f59e0b' : '6px solid #dc2626',
+          background: childDegraded ? '#fffbeb' : '#fff1f2',
+          color: childDegraded ? '#92400e' : '#991b1b',
+        }}>
+          <div style={{ fontSize: 17, fontWeight: 900 }}>
+            {childDegraded ? '子节点注册异常' : '父节点连接已断开'}
+          </div>
+          <div style={{ marginTop: 6, lineHeight: 1.6, fontWeight: 700 }}>
+            {parentConnection.message || '当前无法接收父节点下发的分布式任务，系统正在自动重连。'}
+          </div>
+          <div style={{ marginTop: 5, color: childDegraded ? '#a16207' : '#b91c1c', fontSize: 13, lineHeight: 1.5 }}>
+            父节点：{parentConnection.parent_ip || info.parent_ip || '未配置'}:{parentConnection.collector_port || info.collector_port || 9618}
+            {parentConnection.reason ? `；诊断：${parentConnection.reason}` : ''}
+          </div>
+          <div style={{ marginTop: 5, color: '#64748b', fontSize: 12 }}>
+            本机仍保留“子节点”配置；父节点恢复后会自动重新连接，无需重新加入集群。
+          </div>
+        </div>
+      )}
 
       {message && (
         <div style={{
@@ -2737,9 +2794,9 @@ function HTCondorPage({
 
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 10 }}>
             {statCard('运行模式', mode === 'htcondor' ? 'HTCondor 分布式执行' : '本机 local')}
-            {statCard('集群状态', clusterStatusText)}
+            {statCard('集群状态', clusterStatusText, clusterStatusTone)}
             {statCard('节点数量', String(nodeCount))}
-            {statCard('当前节点角色', roleText)}
+            {statCard('当前节点角色', roleText, roleTone)}
           </div>
 
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginTop: 10 }}>

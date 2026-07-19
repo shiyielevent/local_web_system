@@ -65,11 +65,11 @@ class HTCondorClusterManager:
 
         try:
             self.status_query_timeout_seconds = max(
-                15.0,
-                min(120.0, float(os.environ.get("LOCAL_WEB_HTCONDOR_STATUS_TIMEOUT", "30") or "30")),
+                3.0,
+                min(30.0, float(os.environ.get("LOCAL_WEB_HTCONDOR_STATUS_TIMEOUT", "6") or "6")),
             )
         except Exception:
-            self.status_query_timeout_seconds = 30.0
+            self.status_query_timeout_seconds = 6.0
 
     def _load_json(self, path: Path) -> Dict[str, Any]:
         if not path.is_file():
@@ -1060,17 +1060,82 @@ $result | ConvertTo-Json -Depth 8 | Set-Content -Path $resultPath -Encoding UTF8
             ping = offline
             queue = offline
         mode = str(self.state.get("execution_mode") or "local")
+        local_machine = socket.gethostname()
+        pool_role = str(self.state.get("pool_role") or "standalone")
+        parent_ip = str(self.state.get("parent_ip") or "")
+        collector_port = int(self.state.get("collector_port") or 9618)
+        visible_machines = {
+            str(item.get("machine") or "").strip().lower()
+            for item in (nodes.get("items") or [])
+            if isinstance(item, dict)
+        }
+        local_machine_visible = local_machine.strip().lower() in visible_machines
+
+        parent_connection: Dict[str, Any] = {
+            "applicable": pool_role == "child",
+            "status": "not_applicable",
+            "connected": False,
+            "reconnecting": False,
+            "parent_ip": parent_ip,
+            "collector_port": collector_port,
+            "local_machine_visible": local_machine_visible,
+            "checked_at": now_iso(),
+            "reason": "",
+            "message": "",
+        }
+        if pool_role == "child":
+            diagnostic_text = "\n".join(
+                str(item.get("text") or "")
+                for item in (nodes, queue, ping)
+                if isinstance(item, dict) and item.get("text")
+            )
+            reason = next((line.strip() for line in diagnostic_text.splitlines() if line.strip()), "父节点暂时无响应")
+            if not nodes.get("ok"):
+                # Individual Condor commands can alternate between timeout,
+                # communication and authentication wording for the same
+                # outage. Keep the user-facing state stable; raw diagnostics
+                # remain available in nodes/queue/ping.
+                reason = "父节点无响应、网络不可达或连接认证失败（详细错误见右侧诊断）"
+            endpoint = f"{parent_ip or '未配置'}:{collector_port}"
+            if not service_ok:
+                parent_connection.update({
+                    "status": "disconnected",
+                    "reason": "本机 Condor 服务未运行",
+                    "message": f"与父节点 {endpoint} 的连接已断开；本机 Condor 服务未运行，当前无法接收分布式任务。",
+                })
+            elif nodes.get("ok") and local_machine_visible:
+                parent_connection.update({
+                    "status": "connected",
+                    "connected": True,
+                    "reason": "父节点可访问，且本机已注册到集群",
+                    "message": f"已连接父节点 {endpoint}，本机已注册并可接收分布式任务。",
+                })
+            elif nodes.get("ok"):
+                parent_connection.update({
+                    "status": "degraded",
+                    "reconnecting": True,
+                    "reason": "父节点可访问，但本机尚未出现在执行节点列表中",
+                    "message": f"父节点 {endpoint} 可访问，但本机尚未注册到集群；当前无法接收分布式任务，系统将继续自动重连。",
+                })
+            else:
+                parent_connection.update({
+                    "status": "disconnected",
+                    "reconnecting": True,
+                    "reason": reason,
+                    "message": f"与父节点 {endpoint} 的连接已断开；当前无法接收分布式任务，系统将继续自动重连。",
+                })
+
         enabled = bool(mode == "htcondor" and install_ok and service_ok and slot.get("ok") and ping.get("ok"))
         return {
             "backend": "htcondor",
             "execution_mode": mode,
             "enabled": enabled,
-            "machine": socket.gethostname(),
+            "machine": local_machine,
             "local_ips": self._local_ipv4_list(),
-            "pool_role": str(self.state.get("pool_role") or "standalone"),
-            "parent_ip": str(self.state.get("parent_ip") or ""),
+            "pool_role": pool_role,
+            "parent_ip": parent_ip,
             "bind_ip": str(self.state.get("bind_ip") or ""),
-            "collector_port": int(self.state.get("collector_port") or 9618),
+            "collector_port": collector_port,
             "low_port": int(self.state.get("low_port") or 9700),
             "high_port": int(self.state.get("high_port") or 9800),
             "state_file": str(self.state_file),
@@ -1084,7 +1149,12 @@ $result | ConvertTo-Json -Depth 8 | Set-Content -Path $resultPath -Encoding UTF8
             "nodes": nodes,
             "queue": queue,
             "ping": ping,
-            "message": "HTCondor 可用于任务执行" if enabled else "HTCondor 未启用或未完全通过检查",
+            "parent_connection": parent_connection,
+            "message": (
+                "HTCondor 可用于任务执行"
+                if enabled
+                else (parent_connection.get("message") or "HTCondor 未启用或未完全通过检查")
+            ),
         }
 
     def distributed_execution_requested(self) -> bool:
@@ -1643,19 +1713,32 @@ finally {{
         result = self._run(args, timeout=self.status_query_timeout_seconds)
         text = "\n".join(x for x in [result.get("stdout", ""), result.get("stderr", ""), result.get("error", "")] if x).strip()
         items = []
+        # condor_status may print authentication/communication errors using
+        # whitespace-separated words.  Do not mistake those messages for a
+        # valid slot row, otherwise the UI oscillates between 0 and 1 nodes.
+        valid_states = {"owner", "unclaimed", "matched", "claimed", "preempting", "drained", "backfill"}
+        valid_activities = {"idle", "busy", "retiring", "vacating", "suspended", "benchmarking", "killing"}
         for line in text.splitlines():
             parts = line.split()
-            if len(parts) >= 6:
-                items.append({
-                    "name": parts[0],
-                    "machine": parts[1],
-                    "state": parts[2],
-                    "activity": parts[3],
-                    "cpus": parts[4],
-                    "memory": parts[5],
-                    "slot_type": parts[6] if len(parts) >= 7 else "",
-                    "partitionable": str(parts[7]).lower() == "true" if len(parts) >= 8 else False,
-                })
+            if len(parts) < 6:
+                continue
+            if parts[2].lower() not in valid_states or parts[3].lower() not in valid_activities:
+                continue
+            try:
+                float(parts[4])
+                float(parts[5])
+            except (TypeError, ValueError):
+                continue
+            items.append({
+                "name": parts[0],
+                "machine": parts[1],
+                "state": parts[2],
+                "activity": parts[3],
+                "cpus": parts[4],
+                "memory": parts[5],
+                "slot_type": parts[6] if len(parts) >= 7 else "",
+                "partitionable": str(parts[7]).lower() == "true" if len(parts) >= 8 else False,
+            })
         return {"ok": bool(result.get("ok")), "text": text, "items": items}
 
     def _wait_machine_visible_in_pool(self, pool_ip: str, machine: str, timeout_seconds: int = 60) -> Dict[str, Any]:
