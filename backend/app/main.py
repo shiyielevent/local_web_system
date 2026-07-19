@@ -178,6 +178,9 @@ class HTCondorJoinParentRequest(BaseModel):
     child_ip: str = ""
     low_port: int = 9700
     high_port: int = 9800
+    auto_shared_io: bool = True
+    share_name: str = "LocalWebData"
+    shared_unc_root: str = ""
 
 
 class HTCondorSharedIORequest(BaseModel):
@@ -634,6 +637,9 @@ def api_htcondor_join_parent(
             child_ip=payload.child_ip,
             low_port=payload.low_port,
             high_port=payload.high_port,
+            auto_shared_io=payload.auto_shared_io,
+            share_name=payload.share_name,
+            shared_unc_root=payload.shared_unc_root,
         )
     except HTCondorClusterError as exc:
         raise HTTPException(status_code=500, detail=str(exc))

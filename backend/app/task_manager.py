@@ -3430,7 +3430,10 @@ class TaskManager:
             "disk_percent": disk_snapshot.get("percent"),
             "disk_free_gb": disk_snapshot.get("free_gb"),
             "active_tasks": active_tasks,
-            "execution_backend": "htcondor" if self._htcondor_execution_enabled() else "local",
+            # 这里展示的是用户选择的执行模式，不应为了渲染登录后的资源卡片
+            # 同步执行一次可能耗时数十秒的 HTCondor 网络健康检查。
+            # 真正提交任务前仍由 _htcondor_execution_enabled() 做完整校验。
+            "execution_backend": "htcondor" if self._htcondor_execution_requested() else "local",
         }
 
     def _can_start_queued_item_locked(self, item: Dict[str, Any]) -> tuple[bool, str]:

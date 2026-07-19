@@ -3265,19 +3265,23 @@ function App() {
         setCurrentUser(me);
         setActiveTab(getFirstActiveTabForUser(me));
 
-        const [toolbarList, mods, taskList, dataList, resources] = await Promise.all([
+        // 系统资源统计不是首屏关键数据，单独后台加载，避免其中的系统探测
+        // 把已经返回的工具栏、模块、任务和数据文件一起阻塞。
+        const resourcesPromise = getSystemResources().catch(() => defaultSystemResources);
+        const [toolbarList, mods, taskList, dataList] = await Promise.all([
           getToolbars(),
           me.role === 'admin' ? getAdminModules() : getModules(),
           getTasks(),
           listDataFiles(),
-          getSystemResources().catch(() => defaultSystemResources),
         ]);
 
         setDataFiles(Array.isArray(dataList) ? dataList : []);
         setToolbars(Array.isArray(toolbarList) ? toolbarList : DEFAULT_TOOLBARS);
         setModules(Array.isArray(mods) ? mods : []);
         setTasks(Array.isArray(taskList) ? taskList : []);
-        setSystemResources(normalizeSystemResources(resources));
+        resourcesPromise.then((resources) => {
+          setSystemResources(normalizeSystemResources(resources));
+        });
 
         if (me.role === 'admin') {
           const [userList, drop] = await Promise.all([getUsers(), listDropZips().catch(() => null)]);
@@ -3298,7 +3302,10 @@ function App() {
     if (!currentUser || activeTab !== 'htcondor') return undefined;
 
     let cancelled = false;
+    let inFlight = false;
     const refresh = async () => {
+      if (inFlight) return;
+      inFlight = true;
       try {
         const data = await getHTCondorStatus();
         if (!cancelled) setHTCondorStatus(data);
@@ -3306,11 +3313,15 @@ function App() {
         if (!cancelled) {
           setHTCondorMessage({ type: 'error', text: e?.message || '读取 HTCondor 状态失败' });
         }
+      } finally {
+        inFlight = false;
       }
     };
 
     refresh();
-    const timer = window.setInterval(refresh, 4000);
+    // 子节点跨网络查询 Collector 可能需要数秒；15 秒轮询并禁止重叠，
+    // 避免慢请求越积越多并拖慢登录与其他 API。
+    const timer = window.setInterval(refresh, 15000);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
@@ -3509,19 +3520,21 @@ useEffect(() => {
       setActiveTab(nextActiveTab);
       saveActiveTab(nextActiveTab);
 
-      const [toolbarList, mods, taskList, dataList, resources] = await Promise.all([
+      const resourcesPromise = getSystemResources().catch(() => defaultSystemResources);
+      const [toolbarList, mods, taskList, dataList] = await Promise.all([
         getToolbars(),
         data.user.role === 'admin' ? getAdminModules() : getModules(),
         getTasks(),
         listDataFiles(),
-        getSystemResources().catch(() => defaultSystemResources),
       ]);
 
       setToolbars(Array.isArray(toolbarList) ? toolbarList : DEFAULT_TOOLBARS);
       setModules(Array.isArray(mods) ? mods : []);
       setTasks(Array.isArray(taskList) ? taskList : []);
       setDataFiles(Array.isArray(dataList) ? dataList : []);
-      setSystemResources(normalizeSystemResources(resources));
+      resourcesPromise.then((resources) => {
+        setSystemResources(normalizeSystemResources(resources));
+      });
 
       if (data.user.role === 'admin') {
         const [userList, drop] = await Promise.all([getUsers(), listDropZips().catch(() => null)]);
@@ -4114,7 +4127,7 @@ async function installModuleFolder() {
       high_port: Number(htcondorClusterForm.high_port || 9800),
       auto_shared_io: htcondorClusterForm.auto_shared_io !== false,
       share_name: shareName,
-      shared_unc_root: parentIp && shareName ? `\\${parentIp}\${shareName}` : '',
+      shared_unc_root: parentIp && shareName ? `\\\\${parentIp}\\${shareName}` : '',
     };
     return runHTCondorAction('加入 HTCondor 父节点并自动连接共享目录', () => joinHTCondorParent(payload));
   }
