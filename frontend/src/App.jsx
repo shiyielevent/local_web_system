@@ -4406,14 +4406,11 @@ function addTaskWindow(task, title) {
       const isOutput =
         normalize(field.key) === 'output' || String(field.label || '').includes('输出');
 
-      if (field.type === 'dir_path') {
+      // 输出参数统一选择文件夹。后端会为每个单任务/子任务自动生成唯一的 TIFF 文件名。
+      if (isOutput) {
+        result = await chooseLocalDir({ title: `选择${field.label || field.key}文件夹` });
+      } else if (field.type === 'dir_path') {
         result = await chooseLocalDir({ title: `选择${field.label || field.key}` });
-      } else if (isOutput) {
-        result = await chooseSaveFile({
-          title: `选择${field.label || field.key}`,
-          defaultextension: '.tif',
-          filetypes: [['GeoTIFF', '*.tif'], ['All Files', '*.*']],
-        });
       } else {
         result = await chooseLocalFile({
           title: `选择${field.label || field.key}`,

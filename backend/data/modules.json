@@ -1,97 +1,5 @@
 [
   {
-    "id": "H8_CM_CTH_2_EXE",
-    "name": "H8 Cloud Mask And Cloud Phase Retrieval",
-    "description": "Executable H8 cloud mask and cloud phase retrieval module. The system reads H8 NetCDF input files and writes cloud product GeoTIFF results.",
-    "runtime": "cpp_native",
-    "entry": "CM_CTH_2.exe",
-    "executable": "backend/installed_modules/H8_CM_CTH_2_EXE/CM_CTH_2.exe",
-    "working_dir": "backend/installed_modules/H8_CM_CTH_2_EXE",
-    "config_mode": "json_file",
-    "command_template": [
-      "{executable}",
-      "{config_json}"
-    ],
-    "dependency_dirs": [
-      "deps"
-    ],
-    "dependency_search_dirs": [],
-    "resource_dirs": [
-      "resources"
-    ],
-    "parallel": {
-      "mode": "batch_group",
-      "input_key": "file",
-      "output_key": "outpath",
-      "batch_role": "input",
-      "file_patterns": "*R21*.nc;*R21*.NC",
-      "output_suffix": ".tif",
-      "output_naming": "source_stem",
-      "output_mode": "directory",
-      "files_per_job": 1,
-      "chunk_multiplier": 1,
-      "input_pass_mode": "directory_view",
-      "batch_allow_all_files": false,
-      "batch_allow_no_extension": false
-    },
-    "tags": [
-      "h8",
-      "cloud",
-      "cloud-mask",
-      "cloud-phase",
-      "executable"
-    ],
-    "tool_type": "cloud",
-    "enabled": true,
-    "inputs": [
-      {
-        "key": "file",
-        "label": "file",
-        "type": "dir_path",
-        "required": true,
-        "visible_to_user": true,
-        "admin_fixed": false,
-        "path_mode": "absolute",
-        "io_role": "input",
-        "default": "D:/H8/data1/input2",
-        "batch_role": "input",
-        "match_mode": "each_file",
-        "file_patterns": "*R21*.nc;*R21*.NC",
-        "batch_allow_all_files": false,
-        "batch_allow_no_extension": false,
-        "batch_pass_mode": "directory_view"
-      },
-      {
-        "key": "cm_files",
-        "label": "cm_files",
-        "type": "dir_path",
-        "required": true,
-        "visible_to_user": true,
-        "admin_fixed": false,
-        "path_mode": "absolute",
-        "io_role": "output",
-        "default": "D:/H8/data1/CM",
-        "batch_role": "OUTPUT_DIR",
-        "output_mode": "directory"
-      },
-      {
-        "key": "outpath",
-        "label": "outpath",
-        "type": "dir_path",
-        "required": true,
-        "visible_to_user": true,
-        "admin_fixed": false,
-        "path_mode": "absolute",
-        "io_role": "output",
-        "default": "D:/H8/data1/output",
-        "batch_role": "OUTPUT_DIR",
-        "output_mode": "directory"
-      }
-    ],
-    "_manifest_format": "executable_module_json",
-    "_param_json_path": "D:\\local_web_module_system\\backend\\installed_modules\\H8_CM_CTH_2_EXE\\config.json"
-  },
-  {
     "id": "h8aod",
     "name": "H8 AOD Retrieval",
     "description": "Executable H8 AOD retrieval module. The system reads config.json to generate input and output fields, then passes a runtime config file to AOD_AHI.exe.",
@@ -349,84 +257,6 @@
     "_param_json_path": "D:\\local_module_web_system1\\parasol\\config.json"
   },
   {
-    "id": "CTH_FY",
-    "name": "FY CTH云顶高反演",
-    "description": "基于风云卫星数据的云顶高度反演可执行模块，系统读取 config.json 生成输入和输出参数表单，并在运行时将配置文件传递给 CTH_FY.exe。",
-    "runtime": "cpp_native",
-    "entry": "CTH_FY.exe",
-    "executable": "backend/installed_modules/CTH_FY/CTH_FY.exe",
-    "working_dir": "backend/installed_modules/CTH_FY",
-    "config_mode": "json_file",
-    "command_template": [
-      "{executable}",
-      "{config_json}"
-    ],
-    "dependency_dirs": [
-      "deps"
-    ],
-    "dependency_search_dirs": [],
-    "resource_dirs": [
-      "resources"
-    ],
-    "parallel": {
-      "mode": "batch_group",
-      "input_key": "fy4_path",
-      "output_key": "out_path",
-      "batch_role": "input",
-      "file_patterns": "*.HDF;*.hdf;*.H5;*.h5;*.NC;*.nc",
-      "output_suffix": ".tif",
-      "files_per_job": 1,
-      "chunk_multiplier": 1,
-      "output_naming": "source_stem",
-      "output_mode": "directory",
-      "input_pass_mode": "directory_view",
-      "batch_allow_all_files": false,
-      "batch_allow_no_extension": false
-    },
-    "tags": [
-      "fy",
-      "cth",
-      "cloud",
-      "executable"
-    ],
-    "tool_type": "cloud",
-    "enabled": true,
-    "inputs": [
-      {
-        "key": "fy4_path",
-        "label": "fy4_path",
-        "type": "dir_path",
-        "required": true,
-        "visible_to_user": true,
-        "admin_fixed": false,
-        "path_mode": "absolute",
-        "io_role": "input",
-        "default": "G:/FY_data",
-        "batch_role": "input",
-        "match_mode": "each_file",
-        "file_patterns": "*.HDF;*.hdf;*.H5;*.h5;*.NC;*.nc",
-        "batch_allow_all_files": false,
-        "batch_allow_no_extension": false,
-        "batch_pass_mode": "directory_view"
-      },
-      {
-        "key": "out_path",
-        "label": "out_path",
-        "type": "dir_path",
-        "required": true,
-        "visible_to_user": true,
-        "admin_fixed": false,
-        "path_mode": "absolute",
-        "io_role": "output",
-        "default": "D:/H8/fy_output",
-        "batch_role": "OUTPUT_DIR",
-        "output_mode": "directory"
-      }
-    ],
-    "_manifest_format": "executable_module_json",
-    "_param_json_path": "D:\\local_web_module_system_del\\backend\\installed_modules\\CTH_FY\\config.json"
-  },
-  {
     "id": "H8_CM_2_EXE",
     "name": "H8 Cloud Mask Retrieval",
     "description": "Executable Himawari-8 cloud mask retrieval module. The system accepts an input folder and output folder, then runs one subtask for each matched input file during batch execution.",
@@ -456,11 +286,7 @@
       "files_per_job": 1,
       "chunk_multiplier": 1,
       "output_naming": "source_stem",
-      "output_mode": "directory",
-      "batch_role": "input",
-      "input_pass_mode": "directory_view",
-      "batch_allow_all_files": false,
-      "batch_allow_no_extension": false
+      "output_mode": "directory"
     },
     "tags": [
       "h8",
@@ -534,11 +360,7 @@
       "files_per_job": 1,
       "chunk_multiplier": 1,
       "output_naming": "source_stem",
-      "output_mode": "directory",
-      "batch_role": "input",
-      "input_pass_mode": "directory_view",
-      "batch_allow_all_files": false,
-      "batch_allow_no_extension": false
+      "output_mode": "directory"
     },
     "tags": [
       "h8",
@@ -581,5 +403,70 @@
     ],
     "_manifest_format": "executable_module_json",
     "_param_json_path": "G:\\exe\\H8\\CTH_2\\config.json"
+  },
+  {
+    "id": "CTH_FY",
+    "name": "FY CTH云顶高反演",
+    "description": "基于风云卫星数据的云顶高度反演可执行模块。系统读取 config.json 生成输入和输出参数表单，并在运行时将配置文件传递给 CTH_FY.exe。",
+    "runtime": "cpp_native",
+    "entry": "CTH_FY.exe",
+    "executable": "backend/installed_modules/CTH_FY/CTH_FY.exe",
+    "working_dir": "backend/installed_modules/CTH_FY",
+    "config_mode": "json_file",
+    "command_template": [
+      "{executable}",
+      "{config_json}"
+    ],
+    "dependency_dirs": [
+      "_internal"
+    ],
+    "dependency_search_dirs": [],
+    "resource_dirs": [],
+    "parallel": {
+      "mode": "batch_group",
+      "input_key": "fy4_path",
+      "output_key": "out_path",
+      "file_patterns": "*.HDF;*.hdf;*.H5;*.h5;*.NC;*.nc",
+      "output_suffix": ".tif",
+      "files_per_job": 1,
+      "chunk_multiplier": 1,
+      "output_naming": "source_stem",
+      "output_mode": "directory"
+    },
+    "tags": [
+      "fy",
+      "cth",
+      "cloud",
+      "executable"
+    ],
+    "tool_type": "cloud",
+    "enabled": true,
+    "inputs": [
+      {
+        "key": "fy4_path",
+        "label": "fy4_path",
+        "type": "dir_path",
+        "required": true,
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "input",
+        "default": "D:/NEPU/FY4_CTH/data"
+      },
+      {
+        "key": "out_path",
+        "label": "out_path",
+        "type": "dir_path",
+        "required": true,
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "output",
+        "default": "D:/NEPU/FY4_CTH/output",
+        "batch_role": "OUTPUT_DIR"
+      }
+    ],
+    "_manifest_format": "executable_module_json",
+    "_param_json_path": "G:\\exe\\FY\\CTH_FY\\config.json"
   }
 ]
