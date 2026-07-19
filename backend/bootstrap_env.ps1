@@ -66,6 +66,23 @@ function Write-Warn([string]$Text) {
     Write-Host "[WARN] $Text" -ForegroundColor Yellow
 }
 
+function Test-SystemServerReady {
+    try {
+        $response = Invoke-WebRequest `
+            -Uri $SystemUrl `
+            -UseBasicParsing `
+            -TimeoutSec 3
+
+        return (
+            $response.StatusCode -eq 200 -and
+            [string]$response.Content -match "本地模块 Web 系统|<div id=`"root`""
+        )
+    }
+    catch {
+        return $false
+    }
+}
+
 function Set-DefaultProcessEnvironment {
     param(
         [Parameter(Mandatory = $true)]
@@ -1494,8 +1511,8 @@ function Set-BackendRuntimeEnvironment {
     Set-DefaultProcessEnvironment "LOCAL_WEB_UTIL_SCHEDULER" "1"
     Set-DefaultProcessEnvironment "LOCAL_WEB_UTIL_CPU_LOW" "60"
     Set-DefaultProcessEnvironment "LOCAL_WEB_UTIL_CPU_HIGH" "92"
-    Set-DefaultProcessEnvironment "LOCAL_WEB_UTIL_MEMORY_SOFT" "78"
-    Set-DefaultProcessEnvironment "LOCAL_WEB_UTIL_MEMORY_HARD" "88"
+    Set-DefaultProcessEnvironment "LOCAL_WEB_UTIL_MEMORY_SOFT" "92"
+    Set-DefaultProcessEnvironment "LOCAL_WEB_UTIL_MEMORY_HARD" "98"
     Set-DefaultProcessEnvironment `
         "LOCAL_WEB_UTIL_IO_READ_SOFT_MB_S" `
         "120"
@@ -1523,10 +1540,10 @@ function Set-BackendRuntimeEnvironment {
         "55"
     Set-DefaultProcessEnvironment `
         "LOCAL_WEB_IO_MEMORY_THRESHOLD" `
-        "80"
+        "95"
     Set-DefaultProcessEnvironment `
         "LOCAL_WEB_IO_MIN_AVAILABLE_MEMORY_GB" `
-        "3"
+        "0.8"
     Set-DefaultProcessEnvironment `
         "LOCAL_WEB_IO_READ_MB_S_THRESHOLD" `
         "120"
@@ -1539,16 +1556,16 @@ function Set-BackendRuntimeEnvironment {
 
     Set-DefaultProcessEnvironment `
         "LOCAL_WEB_CHILD_START_STAGGER_SECONDS" `
-        "6"
+        "1"
     Set-DefaultProcessEnvironment `
         "LOCAL_WEB_CHILD_START_WAIT_SECONDS" `
-        "3"
+        "1"
     Set-DefaultProcessEnvironment `
         "LOCAL_WEB_CHILD_START_CPU_THRESHOLD" `
-        "96"
+        "99"
     Set-DefaultProcessEnvironment `
         "LOCAL_WEB_CHILD_START_MEMORY_THRESHOLD" `
-        "88"
+        "99"
     Set-DefaultProcessEnvironment `
         "LOCAL_WEB_CHILD_START_MIN_MEMORY_GB" `
         "0.8"
@@ -1560,17 +1577,17 @@ function Set-BackendRuntimeEnvironment {
         "99.8"
     Set-DefaultProcessEnvironment `
         "LOCAL_WEB_CHILD_START_MIN_DISK_FREE_GB" `
-        "10"
+        "0.5"
 
     Set-DefaultProcessEnvironment `
         "LOCAL_WEB_ADAPTIVE_CHILD_START" `
         "1"
     Set-DefaultProcessEnvironment `
         "LOCAL_WEB_ADAPTIVE_CHILD_START_MIN_SECONDS" `
-        "5"
+        "1"
     Set-DefaultProcessEnvironment `
         "LOCAL_WEB_ADAPTIVE_CHILD_START_MAX_SECONDS" `
-        "60"
+        "8"
     Set-DefaultProcessEnvironment `
         "LOCAL_WEB_ADAPTIVE_CHILD_START_SAMPLE_SECONDS" `
         "1.5"
@@ -1582,16 +1599,16 @@ function Set-BackendRuntimeEnvironment {
         "3"
     Set-DefaultProcessEnvironment `
         "LOCAL_WEB_ADAPTIVE_CHILD_START_MAX_PROBE_SECONDS" `
-        "90"
+        "10"
     Set-DefaultProcessEnvironment `
         "LOCAL_WEB_ADAPTIVE_CHILD_START_MIN_PEAK_CPU" `
         "60"
     Set-DefaultProcessEnvironment `
         "LOCAL_WEB_ADAPTIVE_CHILD_START_MEMORY_THRESHOLD" `
-        "90"
+        "99"
     Set-DefaultProcessEnvironment `
         "LOCAL_WEB_ADAPTIVE_CHILD_START_MIN_MEMORY_GB" `
-        "1"
+        "0.5"
 
     Set-DefaultProcessEnvironment "OPENBLAS_NUM_THREADS" "1"
     Set-DefaultProcessEnvironment "OMP_NUM_THREADS" "1"
@@ -1710,6 +1727,14 @@ function Start-BackendServer {
         Write-Step "Start local_web_module_system backend"
         Write-Info "Python: $VenvPython"
         Write-Info "URL: $SystemUrl"
+
+        if (Test-SystemServerReady) {
+            Write-Warn "System is already running at $SystemUrl; reusing the existing server."
+            if (-not $NoBrowser) {
+                Start-Process $SystemUrl
+            }
+            return 0
+        }
 
         if (-not $NoBrowser) {
             Start-Process $SystemUrl

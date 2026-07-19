@@ -2144,7 +2144,7 @@ else {
         return paths
 
     def _grant_one_path_for_job(self, path: Path):
-        """给 HTCondor 作业能访问的账号加权限。
+        r"""给 HTCondor 作业能访问的账号加权限。
 
         这里不让用户手动修权限。平台生成的 config.json、输出目录、运行目录，
         都由系统在提交作业前自动放开给本机 Users 组和 LocalWebCondor。
@@ -2538,26 +2538,32 @@ else {
             request_cpus = 1
 
         try:
+            default_request_memory_raw = (
+                (env or {}).get("LOCAL_WEB_HTCONDOR_DEFAULT_PEAK_MEMORY_MB")
+                or os.environ.get("LOCAL_WEB_HTCONDOR_DEFAULT_PEAK_MEMORY_MB")
+                or "4096"
+            )
             request_memory_raw = (
                 (env or {}).get("LOCAL_WEB_HTCONDOR_REQUEST_MEMORY_MB")
-                or os.environ.get("LOCAL_WEB_HTCONDOR_REQUEST_MEMORY_MB", "16384")
-                or "16384"
+                or os.environ.get("LOCAL_WEB_HTCONDOR_REQUEST_MEMORY_MB")
+                or default_request_memory_raw
+                or "4096"
             )
-            request_memory_mb = int(request_memory_raw)
+            request_memory_mb = int(float(request_memory_raw))
         except Exception:
-            request_memory_mb = 8192
-        request_memory_mb = max(1024, request_memory_mb)
+            request_memory_mb = 4096
+        request_memory_mb = max(1024, min(262144, request_memory_mb))
 
-        # 共享目录模式优先让作业按提交用户 LocalWebCondor 运行。
-        # 当前系统提交 condor_submit 时已经切换到了 LocalWebCondor，
-        # 因此 run_as_owner=true 可避免 HTCondor 默认 slot 账号无法访问 SMB 共享的问题。
+        # 默认不启用 run_as_owner：Windows HTCondor 没有配置 CREDD_HOST 时，
+        # condor_submit 会直接拒绝 run_as_owner=true。需要该模式时可显式设置
+        # LOCAL_WEB_HTCONDOR_RUN_AS_OWNER=1，并完成 HTCondor CREDD 配置。
         run_as_owner_env = str(os.environ.get("LOCAL_WEB_HTCONDOR_RUN_AS_OWNER", "")).strip().lower()
         if run_as_owner_env in {"1", "true", "yes", "on"}:
             run_as_owner_value = "true"
         elif run_as_owner_env in {"0", "false", "no", "off"}:
             run_as_owner_value = "false"
         else:
-            run_as_owner_value = "true" if shared_io_enabled else "false"
+            run_as_owner_value = "false"
 
         sub_text = f"""universe = vanilla
 executable = C:/Windows/System32/cmd.exe

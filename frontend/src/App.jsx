@@ -2329,7 +2329,10 @@ function HTCondorPage({
   const nodeItems = Array.isArray(nodes.items) ? nodes.items : [];
   const uniqueMachines = Array.from(new Set(nodeItems.map((item) => item.machine).filter(Boolean)));
   const poolRole = info.pool_role || 'standalone';
-  const roleText = poolRole === 'parent' ? '父节点' : (poolRole === 'child' ? '子节点' : '单机 / 未加入集群');
+  const nodeRoleText = poolRole === 'parent' ? '父节点' : (poolRole === 'child' ? '子节点' : '单机 / 未加入集群');
+  const roleText = !isAdmin && poolRole === 'parent'
+    ? '父节点（管理员配置）'
+    : nodeRoleText;
   const clusterStarted = poolRole === 'parent' || poolRole === 'child';
   const clusterHealthy = clusterStarted && !!info.service_running && !!nodes.ok;
   const clusterStatusText = clusterHealthy
@@ -2384,6 +2387,7 @@ function HTCondorPage({
     : (poolRole === 'parent' ? '暂无子节点接入' : '-');
 
   const leaveDisabled = !!busy || !clusterStarted;
+  const joinDisabled = !!busy || (!isAdmin && poolRole === 'parent');
   const leaveButtonStyle = leaveDisabled
     ? {
         ...styles.whiteBtn,
@@ -2735,7 +2739,7 @@ function HTCondorPage({
             {statCard('运行模式', mode === 'htcondor' ? 'HTCondor 分布式执行' : '本机 local')}
             {statCard('集群状态', clusterStatusText)}
             {statCard('节点数量', String(nodeCount))}
-            {statCard('当前角色', roleText)}
+            {statCard('当前节点角色', roleText)}
           </div>
 
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginTop: 10 }}>
@@ -3025,14 +3029,24 @@ function HTCondorPage({
               <button style={styles.whiteBtn} disabled={!!busy || !sharedEnabled} onClick={onTestShare}>测试共享目录</button>
             </div>
             <div style={{ marginTop: 10, fontSize: 12, color: '#475569', lineHeight: 1.55, overflowWrap: 'anywhere' }}>
-              <div><strong>当前状态：</strong>{sharedEnabled ? `已配置 ${sharedShares.length || 1} 个共享目录` : '未配置共享目录'}{sharedRole ? ` / ${sharedRole}` : ''}</div>
-              {sharedIo.connect_message && <div><strong>最近结果：</strong>{sharedIo.connect_message}</div>}
-            </div>
+            <div><strong>当前状态：</strong>{sharedEnabled ? `已配置 ${sharedShares.length || 1} 个共享目录` : '未配置共享目录'}{sharedRole ? ` / ${sharedRole}` : ''}</div>
+            {sharedIo.connect_message && <div><strong>最近结果：</strong>{sharedIo.connect_message}</div>}
+              {!isAdmin && poolRole === 'parent' && (
+                <div><strong>权限说明：</strong>当前电脑已由管理员配置为父节点；普通用户不能创建或修改父节点，只能查看状态或在子节点电脑加入父节点。</div>
+              )}
+          </div>
           </div>
 
           <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 16 }}>
             <button style={styles.blueBtn} disabled={!!busy || !isAdmin} onClick={onCreateParent}>启动集群</button>
-            <button style={styles.whiteBtn} disabled={!!busy} onClick={onJoinParent}>加入集群</button>
+            <button
+              style={styles.whiteBtn}
+              disabled={joinDisabled}
+              onClick={joinDisabled ? undefined : onJoinParent}
+              title={!isAdmin && poolRole === 'parent' ? '当前电脑已经是父节点，普通用户不能把父节点改成子节点' : '加入指定父节点'}
+            >
+              加入集群
+            </button>
             <button
               style={leaveButtonStyle}
               disabled={leaveDisabled}

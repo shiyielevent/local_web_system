@@ -245,7 +245,7 @@ class TaskManager:
         return local_path, unc
 
     def _rewrite_output_paths_for_part_shared(self, data: Any, part_name: str, use_local_paths: bool = False):
-        """共享目录模式下重写输出路径。
+        r"""共享目录模式下重写输出路径。
 
         远程子节点必须写 UNC 路径，例如 \\192.168.x.x\H8data\...；
         父节点本机任务不要绕回 UNC，直接写父节点本地路径，例如 D:\H8\...。
@@ -289,7 +289,7 @@ class TaskManager:
         return names
 
     def _htcondor_target_uses_local_paths(self, machine: str) -> bool:
-        """判断某个 HTCondor 目标节点是否就是父节点本机。
+        r"""判断某个 HTCondor 目标节点是否就是父节点本机。
 
         父节点本机任务直接读写 D:\... 本地路径；
         远程子节点任务才读写 \\父节点IP\共享名\... UNC 路径。
@@ -300,7 +300,7 @@ class TaskManager:
         return target in self._htcondor_local_machine_names() or target.split(".")[0] in self._htcondor_local_machine_names()
 
     def _map_path_like_values_to_shared_target(self, value: Any, use_local_paths: bool = False) -> Any:
-        """按目标节点重写路径。
+        r"""按目标节点重写路径。
 
         use_local_paths=True：父节点本机任务保留 D:\... 本地路径。
         use_local_paths=False：远程子节点任务改写为 UNC 路径。
@@ -369,6 +369,44 @@ class TaskManager:
             safe_env.setdefault(key, value)
 
         return safe_env
+
+    def _make_htcondor_job_env(
+        self,
+        env: Dict[str, str] | None = None,
+        target_machine: str = "",
+        process_slots: int = 1,
+        resource_plan: Dict[str, Any] | None = None,
+    ) -> Dict[str, str]:
+        """给单个 HTCondor 子任务补齐提交资源参数，避免默认申请过大导致任务一直 Idle。"""
+        job_env = dict(env or {})
+        plan = resource_plan if isinstance(resource_plan, dict) else {}
+
+        request_cpus = plan.get("request_cpus") or plan.get("threads_per_exe") or 1
+        try:
+            request_cpus = max(1, min(128, int(request_cpus)))
+        except Exception:
+            request_cpus = 1
+        job_env.setdefault("LOCAL_WEB_HTCONDOR_REQUEST_CPUS", str(request_cpus))
+
+        request_memory_mb = plan.get("request_memory_mb")
+        try:
+            request_memory_mb = int(request_memory_mb or 0)
+        except Exception:
+            request_memory_mb = 0
+        if request_memory_mb <= 0:
+            request_memory_mb = self._htcondor_request_memory_mb_for_target(
+                target_machine,
+                process_slots=process_slots,
+            )
+        job_env.setdefault("LOCAL_WEB_HTCONDOR_REQUEST_MEMORY_MB", str(max(1024, int(request_memory_mb))))
+
+        threads_per_exe = plan.get("threads_per_exe") or request_cpus
+        try:
+            threads_per_exe = max(1, int(threads_per_exe))
+        except Exception:
+            threads_per_exe = request_cpus
+        job_env.setdefault("LOCAL_WEB_HTCONDOR_THREADS_PER_EXE", str(threads_per_exe))
+        return job_env
 
 
     def _htcondor_execution_requested(self) -> bool:
@@ -2445,10 +2483,32 @@ class TaskManager:
             )
             for machine in machines
         }
+        requested_max_workers = max(1, min(int(max_workers or 1), max(1, total)))
+        per_target_limits: Dict[str, int] = {}
         if machines:
-            # 默认最多同时提交“节点数”个任务，并且下面会按 target_machine 做单节点互斥。
-            # 这样既能让不同节点并行，也避免同一节点同时启动多个 EXE 造成资源争抢。
-            max_workers = min(len(machines), max(1, total))
+            per_machine_requested = max(1, math.ceil(requested_max_workers / max(1, len(machines))))
+            try:
+                explicit_per_node_cap = int(os.environ.get("LOCAL_WEB_HTCONDOR_MAX_EXE_PER_NODE", "0") or 0)
+            except Exception:
+                explicit_per_node_cap = 0
+
+            for machine in machines:
+                configured_slots = self._clamp_htcondor_node_process_slot(
+                    process_slots_map.get(machine, 1),
+                    default=1,
+                )
+                limit = max(1, configured_slots, per_machine_requested)
+                if len(machines) == 1:
+                    limit = max(limit, requested_max_workers)
+                if explicit_per_node_cap > 0:
+                    limit = min(limit, explicit_per_node_cap)
+                per_target_limits[machine] = max(1, limit)
+        if machines:
+            # 最多同时提交用户选择的并发数；单个节点可按进程槽/本次并发上限承接多个 EXE。
+            # 这样单节点可做多进程，多个节点时也能按 target_machine 分散调度。
+            max_workers = min(requested_max_workers, max(1, sum(per_target_limits.values())), max(1, total))
+        else:
+            max_workers = requested_max_workers
         max_workers = max(1, min(int(max_workers or 1), max(1, total)))
 
         manager = self.htcondor_manager
@@ -2475,7 +2535,11 @@ class TaskManager:
             self.append_log(parent_id, "[HTCONDOR] 未启用远程 EXE 线程限制，优先保证节点计算性能。")
         self.append_log(parent_id, "[HTCONDOR] 系统会为每个子任务写入 target_machine，尽量让不同节点同时运行。")
         if total > max(1, len(machines)):
-            self.append_log(parent_id, "[HTCONDOR] 已启用节点互斥调度：同一执行节点同一时间最多运行 1 个 EXE，避免资源峰值叠加。")
+            node_limit_text = ", ".join(
+                f"{machine}:{per_target_limits.get(machine, 1)}"
+                for machine in machines
+            )
+            self.append_log(parent_id, f"[HTCONDOR] 已启用节点并发上限：{node_limit_text}；同一执行节点按上限同时运行 EXE。")
 
         shared_count = 0
         for entry in entries:
@@ -2508,7 +2572,7 @@ class TaskManager:
         done_count = 0
         failures = 0
         future_map: Dict[Any, Dict[str, Any]] = {}
-        active_targets: set[str] = set()
+        active_target_counts: Dict[str, int] = {}
         submitted_count = 0
         pending_entries: List[tuple[int, Dict[str, Any]]] = list(enumerate(entries))
 
@@ -2616,7 +2680,18 @@ class TaskManager:
                 job_id=child_id,
                 command=spec.get("command") or [],
                 working_dir=spec.get("working_dir"),
-                env=self._make_htcondor_safe_env(spec.get("env") or {}),
+                env=self._make_htcondor_safe_env(
+                    self._make_htcondor_job_env(
+                        spec.get("env") or {},
+                        target_machine=target_machine,
+                        process_slots=max(
+                            process_slots_map.get(target_machine, 1),
+                            per_target_limits.get(target_machine, 1),
+                        ),
+                        resource_plan=resource_plans.get(target_machine) or {},
+                    ),
+                    thread_limit=(resource_plans.get(target_machine) or {}).get("threads_per_exe"),
+                ),
                 timeout_seconds=self.htcondor_job_timeout_seconds,
                 on_update=make_on_update(child_id, label, target_machine),
                 should_cancel=make_should_cancel(child_id),
@@ -2629,7 +2704,7 @@ class TaskManager:
                 "spec": spec,
             }
             if target_machine:
-                active_targets.add(target_machine)
+                active_target_counts[target_machine] = active_target_counts.get(target_machine, 0) + 1
                 self.append_log(parent_id, f"[HTCONDOR] 已提交 {submitted_count + 1}/{total}: {label} -> {target_machine}")
             else:
                 self.append_log(parent_id, f"[HTCONDOR] 已提交 {submitted_count + 1}/{total}: {label}")
@@ -2643,7 +2718,8 @@ class TaskManager:
                 for pos, (entry_index, entry) in enumerate(pending_entries):
                     spec = entry.get("spec") if isinstance(entry, dict) else {}
                     target_machine = str((spec or {}).get("target_machine") or "").strip()
-                    if not target_machine or target_machine not in active_targets:
+                    target_limit = per_target_limits.get(target_machine, max_workers)
+                    if not target_machine or active_target_counts.get(target_machine, 0) < target_limit:
                         selected_pos = pos
                         break
                 if selected_pos is None:
@@ -2678,7 +2754,11 @@ class TaskManager:
                         label = meta["label"]
                         target_machine = str(meta.get("target_machine") or "")
                         if target_machine:
-                            active_targets.discard(target_machine)
+                            next_count = max(0, active_target_counts.get(target_machine, 0) - 1)
+                            if next_count:
+                                active_target_counts[target_machine] = next_count
+                            else:
+                                active_target_counts.pop(target_machine, None)
                         try:
                             result = future.result()
                             status = self._apply_htcondor_result(child_id, result)
@@ -2841,6 +2921,12 @@ class TaskManager:
                     break
                 except ValueError:
                     continue
+            if not allowed:
+                try:
+                    if p.name.startswith("batch_") and p.parent.name == ".localweb_batch_views":
+                        allowed = True
+                except Exception:
+                    pass
             if not allowed:
                 continue
 
@@ -3887,6 +3973,8 @@ class TaskManager:
         """
         requested_parallel = max(1, int(max_parallel or 1))
         job_count = len(jobs)
+        if job_count <= 0:
+            raise ValueError("批处理子任务数量为 0，请检查输入目录、batch_role 和 file_patterns 配置")
         effective_parallel = max(1, min(requested_parallel, max(1, job_count)))
 
         parent_inputs: Dict[str, Any] = {
@@ -3896,6 +3984,21 @@ class TaskManager:
             "_requested_parallel_workers": requested_parallel,
             "_effective_parallel_workers": effective_parallel,
         }
+        cleanup_roots = sorted({
+            str(job.get("cleanup_root") or "")
+            for job in jobs
+            if str(job.get("cleanup_root") or "").strip()
+        })
+        input_link_modes = sorted({
+            str(mode)
+            for job in jobs
+            for mode in (job.get("link_modes") or [])
+            if str(mode).strip()
+        })
+        if cleanup_roots:
+            parent_inputs["_parallel_cleanup_roots"] = cleanup_roots
+        if input_link_modes:
+            parent_inputs["_parallel_chunk_link_modes"] = input_link_modes
         if requested_parallel != effective_parallel:
             parent_inputs["_parallel_worker_note"] = (
                 f"用户选择 {requested_parallel} 个进程，但本次只有 {job_count} 个子任务，"
@@ -3915,6 +4018,7 @@ class TaskManager:
                 "max_workers": effective_parallel,
                 "requested_workers": requested_parallel,
                 "owner_username": str(owner_username or ""),
+                "cleanup_roots": cleanup_roots,
             },
         )
 
