@@ -2336,6 +2336,7 @@ function HTCondorPage({
   const childConnected = childConnectionStatus === 'connected';
   const childDegraded = childConnectionStatus === 'degraded';
   const childChecking = childConnectionStatus === 'checking';
+  const writePermissionPending = !!ping.pending || (poolRole === 'child' && childChecking);
   const writePermissionOk = poolRole === 'child' ? (childConnected && !!ping.ok) : !!ping.ok;
   const nodeRoleText = poolRole === 'parent'
     ? '父节点'
@@ -2440,7 +2441,7 @@ function HTCondorPage({
         borderRadius: '50%',
         background: pending ? '#f59e0b' : (ok ? '#22c55e' : '#ef4444'),
       }} />
-      {ok ? yesText : noText}
+      {pending ? noText : (ok ? yesText : noText)}
     </span>
   );
 
@@ -2729,16 +2730,16 @@ function HTCondorPage({
             {okBadge(
               writePermissionOk,
               'WRITE 权限通过',
-              poolRole === 'child' && childChecking
+              writePermissionPending
                 ? 'WRITE 权限确认中'
                 : (poolRole === 'child' && !childConnected ? '父节点断开，WRITE 不可用' : 'WRITE 权限失败'),
-              poolRole === 'child' && childChecking,
+              writePermissionPending,
             )}
             {okBadge(
               info.enabled,
               'HTCondor 执行已启用',
-              childChecking ? 'HTCondor 状态确认中' : '当前未启用 HTCondor',
-              childChecking,
+              childChecking || ping.pending ? 'HTCondor 状态确认中' : '当前未启用 HTCondor',
+              childChecking || !!ping.pending,
             )}
             {okBadge(sharedEnabled, '共享目录已启用', '共享目录未启用')}
           </div>

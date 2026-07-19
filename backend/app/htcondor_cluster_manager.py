@@ -70,14 +70,22 @@ class HTCondorClusterManager:
             "last_failure_monotonic": 0.0,
             "last_success_at": "",
         }
+        self._write_health_lock = threading.Lock()
+        self._write_health: Dict[str, Any] = {
+            "endpoint": "",
+            "state": "unknown",
+            "consecutive_timeouts": 0,
+            "last_timeout_monotonic": 0.0,
+            "last_success_at": "",
+        }
 
         try:
             self.status_query_timeout_seconds = max(
-                15.0,
-                min(60.0, float(os.environ.get("LOCAL_WEB_HTCONDOR_STATUS_TIMEOUT", "15") or "15")),
+                30.0,
+                min(90.0, float(os.environ.get("LOCAL_WEB_HTCONDOR_STATUS_TIMEOUT", "30") or "30")),
             )
         except Exception:
-            self.status_query_timeout_seconds = 15.0
+            self.status_query_timeout_seconds = 30.0
         try:
             self.parent_failure_threshold = max(
                 2,
@@ -1010,13 +1018,16 @@ $result | ConvertTo-Json -Depth 8 | Set-Content -Path $resultPath -Encoding UTF8
                 command,
                 timeout=self.status_query_timeout_seconds,
             )
-            text = "\n".join(x for x in [result.get("stdout", ""), result.get("stderr", "")] if x)
+            text = "\n".join(
+                x for x in [result.get("stdout", ""), result.get("stderr", ""), result.get("error", "")] if x
+            )
             upper = text.upper()
 
             allow = "ALLOW" in upper
             has_ntsspi = "NTSSPI" in upper
             is_unauthenticated = "UNAUTHENTICATED" in upper or "UNMAPPED" in upper
-            ok = result.get("returncode") == 0 and allow
+            raw_ok = result.get("returncode") == 0 and allow
+            timed_out = "TIMEOUTEXPIRED" in upper or "TIMED OUT AFTER" in upper
 
             if has_ntsspi:
                 auth_mode = "NTSSPI"
@@ -1031,13 +1042,74 @@ $result | ConvertTo-Json -Depth 8 | Set-Content -Path $resultPath -Encoding UTF8
                 auth_mode = "denied"
                 message = "WRITE 权限未通过。"
 
+            endpoint = f"{pool_ip or socket.gethostname()}:9618".lower()
+            now_monotonic = time.monotonic()
+            minimum_timeout_interval = min(10.0, max(2.0, self.status_query_timeout_seconds / 2.0))
+            with self._write_health_lock:
+                if self._write_health.get("endpoint") != endpoint:
+                    self._write_health.update({
+                        "endpoint": endpoint,
+                        "state": "unknown",
+                        "consecutive_timeouts": 0,
+                        "last_timeout_monotonic": 0.0,
+                        "last_success_at": "",
+                        "last_auth_mode": "",
+                    })
+
+                if raw_ok:
+                    self._write_health.update({
+                        "state": "allowed",
+                        "consecutive_timeouts": 0,
+                        "last_timeout_monotonic": 0.0,
+                        "last_success_at": now_iso(),
+                        "last_auth_mode": auth_mode,
+                    })
+                    ok = True
+                    pending = False
+                elif timed_out:
+                    last_timeout = float(self._write_health.get("last_timeout_monotonic") or 0.0)
+                    if not last_timeout or now_monotonic - last_timeout >= minimum_timeout_interval:
+                        self._write_health["consecutive_timeouts"] = int(
+                            self._write_health.get("consecutive_timeouts") or 0
+                        ) + 1
+                        self._write_health["last_timeout_monotonic"] = now_monotonic
+                    timeout_count = int(self._write_health.get("consecutive_timeouts") or 0)
+                    pending = timeout_count < 2
+                    ok = bool(pending and self._write_health.get("state") == "allowed")
+                    if pending:
+                        auth_mode = str(self._write_health.get("last_auth_mode") or "checking")
+                        message = (
+                            "WRITE 权限本轮检查超时，正在再次确认；"
+                            + ("暂时沿用最后一次通过结果。" if ok else "暂不判定为权限失败。")
+                        )
+                    else:
+                        self._write_health["state"] = "timeout"
+                        auth_mode = "timeout"
+                        message = "WRITE 权限连续两次检查超时，暂时标记为不可用。"
+                else:
+                    self._write_health.update({
+                        "state": "denied",
+                        "consecutive_timeouts": 0,
+                        "last_timeout_monotonic": 0.0,
+                    })
+                    ok = False
+                    pending = False
+
+                consecutive_timeouts = int(self._write_health.get("consecutive_timeouts") or 0)
+                last_success_at = str(self._write_health.get("last_success_at") or "")
+
             return {
                 "ok": ok,
                 "text": text,
                 "returncode": result.get("returncode"),
                 "auth_mode": auth_mode,
                 "has_ntsspi": has_ntsspi,
-                "allow": allow,
+                "allow": ok,
+                "raw_allow": allow,
+                "pending": pending,
+                "timed_out": timed_out,
+                "consecutive_timeouts": consecutive_timeouts,
+                "last_success_at": last_success_at,
                 "message": message,
             }
         except Exception as exc:
@@ -1048,6 +1120,11 @@ $result | ConvertTo-Json -Depth 8 | Set-Content -Path $resultPath -Encoding UTF8
                 "auth_mode": "error",
                 "has_ntsspi": False,
                 "allow": False,
+                "raw_allow": False,
+                "pending": False,
+                "timed_out": False,
+                "consecutive_timeouts": 0,
+                "last_success_at": "",
                 "message": f"{type(exc).__name__}: {exc}",
             }
 
