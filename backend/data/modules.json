@@ -221,7 +221,7 @@
         "admin_fixed": false,
         "path_mode": "absolute",
         "io_role": "input",
-        "default": "D:/yan1study/AOD_test/AOD_model/ParasolAOD/test_data",
+        "default": "",
         "batch_role": "input",
         "match_mode": "each_file",
         "file_patterns": "*JD;*jd",
@@ -538,13 +538,13 @@
     }
   },
   {
-    "id": "dpc_aod_fake_polder",
+    "id": "dpc_aod",
     "name": "DPC AOD气溶胶反演",
-    "description": "DPC AOD反演外壳模块。模块名称和显示信息使用 DPC 命名，内部仍调用原 POLDER/PARASOL AOD 可执行算法，运行时输入仍需使用 POLDER Level-1 成对数据文件。",
+    "description": "DPC AOD气溶胶反演模块。系统面向DPC多角度偏振卫星观测数据，接收Level-1输入目录、输出目录和固定XML资源文件，支持按观测文件批量拆分，并生成气溶胶光学厚度反演产品。",
     "runtime": "cpp_native",
     "entry": "DpcAod.exe",
-    "executable": "backend/installed_modules/dpc_aod_fake_polder/DpcAod.exe",
-    "working_dir": "backend/installed_modules/dpc_aod_fake_polder",
+    "executable": "backend/installed_modules/dpc_aod/DpcAod.exe",
+    "working_dir": "backend/installed_modules/dpc_aod",
     "config_mode": "json_file",
     "command_template": [
       "{executable}",
@@ -577,7 +577,7 @@
       "dpc",
       "aod",
       "aerosol",
-      "polder-compatible",
+      "polarization",
       "executable"
     ],
     "tool_type": "aerosol",
@@ -592,12 +592,13 @@
         "admin_fixed": false,
         "path_mode": "absolute",
         "io_role": "input",
-        "default": "D:/yan1study/AOD_test/AOD_model/ParasolAOD/test_data",
+        "default": "",
         "batch_role": "input",
         "match_mode": "each_file",
         "file_patterns": "*MD;*JD;*md;*jd",
         "batch_allow_all_files": true,
-        "batch_allow_no_extension": true
+        "batch_allow_no_extension": true,
+        "help_text": "请选择DPC Level-1多角度偏振观测数据目录，目录中应包含主观测文件及配套几何或辅助文件。"
       },
       {
         "key": "output_dir",
@@ -608,7 +609,7 @@
         "admin_fixed": false,
         "path_mode": "absolute",
         "io_role": "output",
-        "default": "D:/yan1study/AOD_test/AOD_model/ParasolAOD/dpc_fake_web_test_out",
+        "default": "",
         "batch_role": "OUTPUT_DIR"
       },
       {
