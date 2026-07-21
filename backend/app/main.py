@@ -49,7 +49,7 @@ RUNTIME_DIR = BASE_DIR / "runtime"
 RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 FRONTEND_DIST_DIR = PROJECT_ROOT / "frontend" / "dist"
 
-app = FastAPI(title="云和气溶胶反演系统API")
+app = FastAPI(title="云和气溶胶卫星遥感反演系统API")
 app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_credentials=True,allow_methods=["*"],allow_headers=["*"],)
 htcondor_cluster_manager = HTCondorClusterManager(BASE_DIR, project_root=PROJECT_ROOT)
 task_manager = TaskManager(TASKS_FILE)
@@ -1105,6 +1105,20 @@ def normalize_module_record(module: dict) -> dict:
     ]:
         copied.pop(key, None)
     return copied
+
+
+def resolve_module_tool_type(module_data: dict, requested_tool_type: str | None = None) -> str:
+    """Choose the toolbar for installed modules.
+
+    Manifest/config metadata must win over the UI default. The upload page may
+    still send tool_type=cloud as a default value, but an executable module that
+    declares tool_type=aerosol should not be moved to the cloud toolbar.
+    """
+    manifest_tool_type = normalize_tool_key(
+        str(module_data.get("tool_type") or module_data.get("category") or "")
+    )
+    requested = normalize_tool_key(str(requested_tool_type or ""))
+    return manifest_tool_type or requested or guess_module_tool_type(module_data)
 
 
 def ensure_modules_file():
@@ -3978,7 +3992,7 @@ def _normalize_new_executable_manifest(module_root: Path, manifest_path: Path, r
         "resource_dirs": resource_dirs,
         "parallel": parallel_cfg,
         "tags": raw_data.get("tags") if isinstance(raw_data.get("tags"), list) else ["executable", "native"],
-        "tool_type": tool_type or "气溶胶反演",
+        "tool_type": tool_type,
         "enabled": bool(raw_data.get("enabled", True)),
         "inputs": inputs,
         "_manifest_format": "executable_module_json",
@@ -4341,10 +4355,7 @@ def validate_cpp_module_folder(folder_path: Path, tool_type: str | None = None, 
 
     module_data = _normalize_new_executable_manifest(module_root, module_json_path, module_data, report)
 
-    selected_tool_type = (
-        normalize_tool_key(tool_type or module_data.get("tool_type") or "")
-        or guess_module_tool_type(module_data)
-    )
+    selected_tool_type = resolve_module_tool_type(module_data, tool_type)
     module_data["tool_type"] = selected_tool_type
     if str(module_data.get("runtime") or "").strip() == "":
         module_data["runtime"] = "cpp_native"
@@ -4450,10 +4461,7 @@ def install_uploaded_zip(zip_path: Path, tool_type: str | None = None, collect_d
 
         module_data = validation["module"]
         module_root = Path(validation["module_root"])
-        selected_tool_type = (
-            normalize_tool_key(tool_type or module_data.get("tool_type") or "")
-            or guess_module_tool_type(module_data)
-        )
+        selected_tool_type = resolve_module_tool_type(module_data, tool_type)
         module_data["tool_type"] = selected_tool_type
         ensure_toolbar_exists(selected_tool_type)
 
@@ -4802,10 +4810,7 @@ def install_module_from_folder(
 
     module_data = validation["module"]
     module_root = Path(validation["module_root"])
-    selected_tool_type = (
-        normalize_tool_key(tool_type or module_data.get("tool_type") or "")
-        or guess_module_tool_type(module_data)
-    )
+    selected_tool_type = resolve_module_tool_type(module_data, tool_type)
     module_data["tool_type"] = selected_tool_type
     ensure_toolbar_exists(selected_tool_type)
 
@@ -4951,10 +4956,7 @@ def api_upload_python_module(
                 "inputs": [],
             }
 
-        selected_tool_type = (
-            normalize_tool_key(tool_type or module_data.get("tool_type") or "")
-            or guess_module_tool_type(module_data)
-        )
+        selected_tool_type = resolve_module_tool_type(module_data, tool_type)
 
         module_data["id"] = safe_module_id
         module_data["name"] = module_name or module_data.get("name") or safe_module_id
@@ -7729,7 +7731,10 @@ if FRONTEND_DIST_DIR.exists():
         index_file = FRONTEND_DIST_DIR / "index.html"
         if not index_file.exists():
             raise HTTPException(status_code=404, detail="前端未构建")
-        return FileResponse(str(index_file))
+        return FileResponse(
+            str(index_file),
+            headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
+        )
 
     @app.get("/{full_path:path}")
     def spa_fallback(full_path: str):
@@ -7739,6 +7744,8 @@ if FRONTEND_DIST_DIR.exists():
 
         index_file = FRONTEND_DIST_DIR / "index.html"
         if index_file.exists():
-            return FileResponse(str(index_file))
+            return FileResponse(
+                str(index_file),
+                headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
+            )
         raise HTTPException(status_code=404, detail="前端未构建")
-

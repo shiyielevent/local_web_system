@@ -1883,7 +1883,7 @@ function LoginPage(props) {
               </div>
 
               <h1 style={{fontSize: 42, lineHeight: 1.25, margin: 0, fontWeight: 800}}>
-                云和气溶胶反演系统
+                云和气溶胶卫星遥感反演系统
               </h1>
 
               <p
@@ -1911,8 +1911,8 @@ function LoginPage(props) {
               <span>H8</span>
               <span>FY</span>
               <span>AOD</span>
-              <span>Cloud Mask</span>
-              <span>Remote Sensing</span>
+              <span>云掩膜</span>
+              <span>卫星遥感</span>
             </div>
           </div>
 
@@ -6125,7 +6125,7 @@ function renderTaskManagementPage() {
     <div style={styles.page}>
       <div style={styles.topbar}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 18, flexWrap: 'wrap', minWidth: 0, flex: '1 1 auto' }}>
-          <div style={{ fontSize: 26, fontWeight: 900, whiteSpace: 'nowrap', flexShrink: 0 }}>云和气溶胶反演系统</div>
+          <div style={{ fontSize: 26, fontWeight: 900, whiteSpace: 'nowrap', flexShrink: 0 }}>云和气溶胶卫星遥感反演系统</div>
           <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', minWidth: 0 }}>
             {navItems.map((item) => (
                 <button
