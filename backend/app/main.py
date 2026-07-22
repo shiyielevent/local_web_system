@@ -49,7 +49,7 @@ RUNTIME_DIR = BASE_DIR / "runtime"
 RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 FRONTEND_DIST_DIR = PROJECT_ROOT / "frontend" / "dist"
 
-app = FastAPI(title="云和气溶胶反演系统API")
+app = FastAPI(title="云和气溶胶卫星遥感反演系统API")
 app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_credentials=True,allow_methods=["*"],allow_headers=["*"],)
 htcondor_cluster_manager = HTCondorClusterManager(BASE_DIR, project_root=PROJECT_ROOT)
 task_manager = TaskManager(TASKS_FILE)
@@ -1107,6 +1107,20 @@ def normalize_module_record(module: dict) -> dict:
     return copied
 
 
+def resolve_module_tool_type(module_data: dict, requested_tool_type: str | None = None) -> str:
+    """Choose the toolbar for installed modules.
+
+    Manifest/config metadata must win over the UI default. The upload page may
+    still send tool_type=cloud as a default value, but an executable module that
+    declares tool_type=aerosol should not be moved to the cloud toolbar.
+    """
+    manifest_tool_type = normalize_tool_key(
+        str(module_data.get("tool_type") or module_data.get("category") or "")
+    )
+    requested = normalize_tool_key(str(requested_tool_type or ""))
+    return manifest_tool_type or requested or guess_module_tool_type(module_data)
+
+
 def ensure_modules_file():
     if not MODULES_FILE.exists():
         MODULES_FILE.write_text("[]", encoding="utf-8")
@@ -1839,7 +1853,8 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
             if key:
                 inputs.pop(key, None)
 
-    # 4. 输出目录只创建，不改写用户路径
+    # 4. 输出参数在界面中统一填写“输出文件夹”。
+    # 平台后续会为每个子任务自动生成唯一的 TIFF 文件名；这里先确保目录存在。
     for field in module.get("inputs", []) or []:
         key = field.get("key")
         if not key or not is_output_field(field):
@@ -1849,12 +1864,10 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
         if not value:
             continue
 
-        field_type = str(field.get("type", "")).lower()
         p = Path(value)
-
-        if field_type == "dir_path":
+        if _output_directory_passthrough(module, field) or is_probably_dir_output(module, str(key), value):
             p.mkdir(parents=True, exist_ok=True)
-        elif field_type == "file_path" and p.parent:
+        elif p.parent:
             p.parent.mkdir(parents=True, exist_ok=True)
 
     # 5. 根据 CPU/内存/磁盘做临界保护；默认尽量尊重用户选择的进程数
@@ -1867,6 +1880,12 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
 
     # 6. 统一决定运行方式
     run_mode = resolve_run_parallel_mode(module, inputs, workers)
+
+    # 普通单任务或模块内部并行同样遵循“用户选文件夹，平台生成 TIFF 文件名”。
+    # batch_group/platform_split 会在各自生成子任务时逐个映射，不能在这里提前改写。
+    if run_mode in {"none", "module_internal"}:
+        inputs = map_single_run_output_directory(module, inputs)
+
     output_paths = collect_output_paths_from_inputs(module, inputs)
 
     # 6.1 C++/多输入目录批处理模式
@@ -1918,7 +1937,7 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
     if run_mode == "platform_split":
         jobs = prepare_parallel_jobs(module, inputs, workers)
 
-        if len(jobs) > 1:
+        if jobs:
             task_inputs = dict(inputs)
             task_inputs["parallel_workers"] = workers
             task_inputs["_parallel_workers"] = workers
@@ -1930,7 +1949,7 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
                 module_name=module.get("name", module["id"]),
                 jobs=jobs,
                 inputs=task_inputs,
-                max_workers=workers,
+                max_workers=max(1, workers),
                 owner_username=username,
             )
 
@@ -3973,7 +3992,7 @@ def _normalize_new_executable_manifest(module_root: Path, manifest_path: Path, r
         "resource_dirs": resource_dirs,
         "parallel": parallel_cfg,
         "tags": raw_data.get("tags") if isinstance(raw_data.get("tags"), list) else ["executable", "native"],
-        "tool_type": tool_type or "气溶胶反演",
+        "tool_type": tool_type,
         "enabled": bool(raw_data.get("enabled", True)),
         "inputs": inputs,
         "_manifest_format": "executable_module_json",
@@ -4336,10 +4355,7 @@ def validate_cpp_module_folder(folder_path: Path, tool_type: str | None = None, 
 
     module_data = _normalize_new_executable_manifest(module_root, module_json_path, module_data, report)
 
-    selected_tool_type = (
-        normalize_tool_key(tool_type or module_data.get("tool_type") or "")
-        or guess_module_tool_type(module_data)
-    )
+    selected_tool_type = resolve_module_tool_type(module_data, tool_type)
     module_data["tool_type"] = selected_tool_type
     if str(module_data.get("runtime") or "").strip() == "":
         module_data["runtime"] = "cpp_native"
@@ -4445,10 +4461,7 @@ def install_uploaded_zip(zip_path: Path, tool_type: str | None = None, collect_d
 
         module_data = validation["module"]
         module_root = Path(validation["module_root"])
-        selected_tool_type = (
-            normalize_tool_key(tool_type or module_data.get("tool_type") or "")
-            or guess_module_tool_type(module_data)
-        )
+        selected_tool_type = resolve_module_tool_type(module_data, tool_type)
         module_data["tool_type"] = selected_tool_type
         ensure_toolbar_exists(selected_tool_type)
 
@@ -4797,10 +4810,7 @@ def install_module_from_folder(
 
     module_data = validation["module"]
     module_root = Path(validation["module_root"])
-    selected_tool_type = (
-        normalize_tool_key(tool_type or module_data.get("tool_type") or "")
-        or guess_module_tool_type(module_data)
-    )
+    selected_tool_type = resolve_module_tool_type(module_data, tool_type)
     module_data["tool_type"] = selected_tool_type
     ensure_toolbar_exists(selected_tool_type)
 
@@ -4946,10 +4956,7 @@ def api_upload_python_module(
                 "inputs": [],
             }
 
-        selected_tool_type = (
-            normalize_tool_key(tool_type or module_data.get("tool_type") or "")
-            or guess_module_tool_type(module_data)
-        )
+        selected_tool_type = resolve_module_tool_type(module_data, tool_type)
 
         module_data["id"] = safe_module_id
         module_data["name"] = module_name or module_data.get("name") or safe_module_id
@@ -5719,16 +5726,24 @@ def resolve_run_parallel_mode(module: dict, inputs: dict, workers: int) -> str:
     if mode == "batch_group":
         return "batch_group"
 
-    # 显式平台拆分。
+    # 显式平台拆分：即使 workers=1，也要拆成子任务后顺序执行。
+    # 这样用户选择 1 个进程时仍然是“一个输入文件对应一个输出 TIFF”，
+    # 而不是把整个输入文件夹和输出文件夹直接传给黑盒 EXE。
     if mode in {"single_file", "folder_chunks"}:
-        return "platform_split" if workers > 1 else "none"
+        return "platform_split"
 
     # auto 模式：
-    # 1. 如果配置了 batch_role，例如 B01/B03/B06/SOLAR，走批处理；
-    # 2. 否则 workers > 1 才走平台拆分；
-    # 3. workers == 1 就普通运行。
+    # 1. 配置了 batch_role（例如 B01/B03/B06/SOLAR）时，始终走批处理；
+    # 2. 普通输入字段指向目录时，始终由平台拆分，workers=1 表示顺序执行；
+    # 3. 单文件输入在 workers>1 时可走平台拆分，否则普通运行。
     if _is_batch_request(module, inputs):
         return "batch_group"
+
+    input_key = choose_parallel_input_key(module, inputs)
+    if input_key:
+        input_value = str(inputs.get(input_key) or "").strip()
+        if input_value and Path(input_value).is_dir():
+            return "platform_split"
 
     if workers > 1:
         return "platform_split"
@@ -6142,47 +6157,221 @@ def filter_parasol_jd_files_for_jobs(module: dict, files: list[Path]) -> list[Pa
     return primary_files
 
 def is_probably_dir_output(module: dict, output_key: str, output_value: str) -> bool:
+    """判断用户填写的输出值是否应被视为“输出文件夹”。
+
+    平台页面统一让用户选择输出文件夹。即使旧模块把输出字段声明为 file_path，
+    只要用户给出的值没有文件扩展名、已经是目录，或者模块配置为 directory，
+    都按目录处理，由平台为当前子任务自动拼接唯一的结果文件名。
+    """
     meta = field_meta(module, output_key)
     k = output_key.lower()
     label = str(meta.get("label") or "").lower()
-    if meta.get("type") == "dir_path":
+    output_mode = str(
+        (module.get("parallel") or {}).get("output_mode")
+        or meta.get("output_mode")
+        or ""
+    ).strip().lower()
+
+    if output_mode in {
+        "directory", "dir", "keep_dir", "keep_directory",
+        "job_directory", "job_dir", "subdir", "subdirectory", "directory_per_job",
+    }:
+        return True
+    if str(meta.get("type") or "").lower() == "dir_path":
         return True
     if "dir" in k or "folder" in k or "目录" in label or "文件夹" in label:
         return True
+
     p = Path(output_value)
-    return bool(output_value) and (p.exists() and p.is_dir())
+    if p.exists() and p.is_dir():
+        return True
+    return bool(output_value) and not bool(p.suffix)
 
 
-def apply_single_file_output_mapping(module: dict, base_inputs: dict, input_file: Path) -> dict:
+def _output_directory_passthrough(module: dict, output_field: dict) -> bool:
+    """只有显式配置 passthrough_directory 时，才把目录原样传给算法。
+
+    directory/output_mode 的新语义是：用户选择目录，平台生成唯一 TIFF 文件路径。
+    如果某个算法本身明确要求接收目录而不是文件，需在 module.json 中写：
+        "output_mode": "passthrough_directory"
+    """
+    mode = str(
+        (module.get("parallel") or {}).get("output_mode")
+        or output_field.get("output_mode")
+        or ""
+    ).strip().lower()
+    return mode in {
+        "passthrough_directory", "directory_passthrough", "raw_directory",
+        "module_directory", "algorithm_directory",
+    }
+
+
+def _normalise_output_extension(module: dict, output_field: dict) -> str:
+    ext = str(
+        output_field.get("output_ext")
+        or output_field.get("suffix")
+        or (module.get("parallel") or {}).get("output_suffix")
+        or ".tif"
+    ).strip()
+    if not ext:
+        ext = ".tif"
+    if not ext.startswith("."):
+        ext = "." + ext
+    return ext
+
+
+def _safe_output_stem(value: Any, fallback: str = "result") -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"[<>:\"/\\|?*]+", "_", text)
+    text = re.sub(r"\s+", "_", text).strip("._ ")
+    return text or fallback
+
+
+def _unique_output_path(
+    output_dir: Path,
+    base_name: str,
+    extension: str,
+    used_paths: set[str] | None = None,
+) -> Path:
+    """在输出文件夹中生成不重复的结果文件路径。"""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    extension = extension if extension.startswith(".") else "." + extension
+    safe_base = _safe_output_stem(base_name)
+    candidate = output_dir / f"{safe_base}{extension}"
+
+    used_paths = used_paths if used_paths is not None else set()
+    index = 2
+    while candidate.exists() or str(candidate.resolve()).lower() in used_paths:
+        candidate = output_dir / f"{safe_base}_{index}{extension}"
+        index += 1
+
+    used_paths.add(str(candidate.resolve()).lower())
+    return candidate.resolve()
+
+
+def _first_output_field(module: dict) -> dict | None:
+    for field in module.get("inputs", []) or []:
+        if field.get("control_only") is True:
+            continue
+        if is_output_field(field):
+            return field
+    return None
+
+
+def _choose_output_base_name(
+    module: dict,
+    output_field: dict,
+    primary_file: Path | None = None,
+    slot: str = "",
+    job_index: int = 0,
+) -> str:
+    naming = str(
+        (module.get("parallel") or {}).get("output_naming")
+        or output_field.get("output_naming")
+        or "source_stem"
+    ).strip().lower()
+
+    if naming in {"source_stem", "input_stem", "primary_stem", "file_stem"} and primary_file is not None:
+        base = primary_file.stem
+    elif slot:
+        base = slot
+    elif primary_file is not None:
+        base = primary_file.stem
+    else:
+        module_id = str(module.get("id") or module.get("name") or "result")
+        base = f"{module_id}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+
+    # 同一批次出现相同输入名时，job_index 用于避免子任务输出互相覆盖。
+    if job_index > 0 and not slot and primary_file is None:
+        base = f"{base}_{job_index:04d}"
+    return _safe_output_stem(base)
+
+
+def apply_single_file_output_mapping(
+    module: dict,
+    base_inputs: dict,
+    input_file: Path,
+    job_index: int = 0,
+    used_output_paths: set[str] | None = None,
+) -> dict:
+    """把用户选择的输出文件夹映射为当前单文件子任务的唯一 TIFF 路径。"""
     new_inputs = dict(base_inputs)
-    output_key = str(normalize_parallel_config(module).get("output_key") or "").strip()
+    output_field = _first_output_field(module)
+    cfg_output_key = str(normalize_parallel_config(module).get("output_key") or "").strip()
+    output_key = cfg_output_key or str((output_field or {}).get("key") or "").strip()
     if not output_key or output_key not in new_inputs:
         return new_inputs
 
+    output_field = output_field or field_meta(module, output_key)
     output_value = str(new_inputs.get(output_key) or "").strip()
     if not output_value:
         return new_inputs
 
-    if is_probably_dir_output(module, output_key, output_value):
-        # 输出字段本身就是目录时，不改字段值，让模块自己在目录里生成结果。
+    if _output_directory_passthrough(module, output_field):
         Path(output_value).mkdir(parents=True, exist_ok=True)
+        new_inputs[output_key] = str(Path(output_value).resolve())
         return new_inputs
 
-    out_path = Path(output_value)
-    suffix = str(normalize_parallel_config(module).get("output_suffix") or ".tif")
-    if not suffix.startswith("."):
-        suffix = "." + suffix
+    extension = _normalise_output_extension(module, output_field)
+    p = Path(output_value)
 
-    if out_path.suffix:
-        mapped = out_path.with_name(f"{out_path.stem}_{input_file.stem}{out_path.suffix}")
+    if is_probably_dir_output(module, output_key, output_value):
+        output_dir = p
+        base_name = _choose_output_base_name(
+            module, output_field, primary_file=input_file, job_index=job_index
+        )
+        mapped = _unique_output_path(output_dir, base_name, extension, used_output_paths)
     else:
-        out_path.mkdir(parents=True, exist_ok=True)
-        mapped = out_path / f"{input_file.stem}{suffix}"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        base_name = _safe_output_stem(f"{p.stem}_{input_file.stem}")
+        mapped = _unique_output_path(p.parent, base_name, p.suffix or extension, used_output_paths)
 
-    mapped.parent.mkdir(parents=True, exist_ok=True)
-    new_inputs[output_key] = str(mapped.resolve())
+    new_inputs[output_key] = str(mapped)
     return new_inputs
 
+
+def _find_primary_input_file(module: dict, inputs: dict) -> Path | None:
+    for field in module.get("inputs", []) or []:
+        if field.get("control_only") is True or is_output_field(field):
+            continue
+        key = field.get("key")
+        value = str(inputs.get(key) or "").strip() if key else ""
+        if not value:
+            continue
+        path = Path(value)
+        if path.is_file():
+            return path.resolve()
+    return None
+
+
+def map_single_run_output_directory(module: dict, inputs: dict) -> dict:
+    """普通单任务/模块内部并行时，也把输出文件夹改写为一个 TIFF 文件路径。"""
+    output_field = _first_output_field(module)
+    if not output_field:
+        return dict(inputs)
+    key = str(output_field.get("key") or "").strip()
+    if not key:
+        return dict(inputs)
+    raw = str(inputs.get(key) or "").strip()
+    if not raw:
+        return dict(inputs)
+
+    result = dict(inputs)
+    if _output_directory_passthrough(module, output_field):
+        Path(raw).mkdir(parents=True, exist_ok=True)
+        result[key] = str(Path(raw).resolve())
+        return result
+
+    if not is_probably_dir_output(module, key, raw):
+        Path(raw).parent.mkdir(parents=True, exist_ok=True)
+        result[key] = str(Path(raw).resolve())
+        return result
+
+    primary_file = _find_primary_input_file(module, inputs)
+    extension = _normalise_output_extension(module, output_field)
+    base_name = _choose_output_base_name(module, output_field, primary_file=primary_file)
+    result[key] = str(_unique_output_path(Path(raw), base_name, extension))
+    return result
 
 def infer_parallel_mode(module: dict, inputs: dict, input_key: str) -> str:
     mode = str(normalize_parallel_config(module).get("mode") or "auto").strip() or "auto"
@@ -6204,9 +6393,8 @@ def infer_parallel_mode(module: dict, inputs: dict, input_key: str) -> str:
 
 
 def prepare_parallel_jobs(module: dict, inputs: dict, parallel_workers: int) -> list[dict]:
-    workers = clamp_parallel_workers(parallel_workers)
-    if workers <= 1:
-        return []
+    # workers=1 仍生成全部子任务，由 TaskManager 以单槽稳定进程池顺序执行。
+    workers = max(1, clamp_parallel_workers(parallel_workers))
 
     input_key = choose_parallel_input_key(module, inputs)
     mode = infer_parallel_mode(module, inputs, input_key) if input_key else "none"
@@ -6242,9 +6430,12 @@ def prepare_parallel_jobs(module: dict, inputs: dict, parallel_workers: int) -> 
             )
 
     jobs: list[dict] = []
+    used_output_paths: set[str] = set()
     if mode == "single_file":
         for idx, file_path in enumerate(files, start=1):
-            job_inputs = apply_single_file_output_mapping(module, inputs, file_path)
+            job_inputs = apply_single_file_output_mapping(
+                module, inputs, file_path, job_index=idx, used_output_paths=used_output_paths
+            )
             job_inputs[input_key] = str(file_path)
 
             # 平台已经负责并发，单个子任务内部默认只处理当前文件。
@@ -6325,6 +6516,15 @@ def prepare_parallel_jobs(module: dict, inputs: dict, parallel_workers: int) -> 
             job_inputs["_parallel_total"] = len(job_units)
             job_inputs["_parallel_chunk_file_count"] = len(chunk)
             job_inputs["_parallel_pool_size"] = workers
+
+            # 输出参数在界面中始终是文件夹；为当前 chunk 自动生成唯一 TIFF 文件。
+            job_inputs = apply_single_file_output_mapping(
+                module,
+                job_inputs,
+                chunk[0],
+                job_index=idx,
+                used_output_paths=used_output_paths,
+            )
             command, working_dir, runtime_env = build_runtime_for_module(module, job_inputs)
             if len(chunk) == 1:
                 label = f"{idx}/{len(job_units)} {chunk[0].name}"
@@ -6630,13 +6830,25 @@ def _get_output_dir_field_for_batch(module: dict) -> Optional[dict]:
     return None
 
 
-def _make_batch_output_value(module: dict, base_inputs: dict, slot: str, primary_file: Path) -> tuple[dict, Optional[Path]]:
+def _make_batch_output_value(
+    module: dict,
+    base_inputs: dict,
+    slot: str,
+    primary_file: Path,
+    job_index: int = 0,
+    used_output_paths: set[str] | None = None,
+) -> tuple[dict, Optional[Path]]:
+    """为多输入批处理子任务生成唯一输出 TIFF。
+
+    用户始终只选择输出文件夹；平台把当前子任务的完整 TIFF 路径写入 config.json。
+    因此无论并发数为 1、2 或更多，所有结果都会保存到用户指定文件夹，且不会互相覆盖。
+    """
     job_inputs = dict(base_inputs)
     output_field = _get_output_dir_field_for_batch(module)
     if not output_field:
         return job_inputs, None
 
-    key = output_field.get("key")
+    key = str(output_field.get("key") or "").strip()
     if not key:
         return job_inputs, None
 
@@ -6644,12 +6856,13 @@ def _make_batch_output_value(module: dict, base_inputs: dict, slot: str, primary
     if not raw_value:
         return job_inputs, None
 
-    output_ext = str(output_field.get("output_ext") or output_field.get("suffix") or ".tif")
-    if output_ext and not output_ext.startswith("."):
-        output_ext = "." + output_ext
-    if not output_ext:
-        output_ext = ".tif"
+    if _output_directory_passthrough(module, output_field):
+        output_dir = Path(raw_value)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        job_inputs[key] = str(output_dir.resolve())
+        return job_inputs, output_dir.resolve()
 
+    output_ext = _normalise_output_extension(module, output_field)
     p = Path(raw_value)
     field_type = str(output_field.get("type") or "").lower()
     output_mode = str(
@@ -6658,42 +6871,35 @@ def _make_batch_output_value(module: dict, base_inputs: dict, slot: str, primary
         or ""
     ).strip().lower()
 
-    if output_mode in {"directory", "dir", "keep_dir", "keep_directory"}:
-        p.mkdir(parents=True, exist_ok=True)
-        job_inputs[key] = str(p.resolve())
-        return job_inputs, p.resolve()
+    is_directory_value = (
+        field_type == "dir_path"
+        or not p.suffix
+        or (p.exists() and p.is_dir())
+        or output_mode in {
+            "directory", "dir", "keep_dir", "keep_directory",
+            "job_directory", "job_dir", "subdir", "subdirectory", "directory_per_job",
+        }
+    )
 
-    if output_mode in {"job_directory", "job_dir", "subdir", "subdirectory", "directory_per_job"}:
-        p.mkdir(parents=True, exist_ok=True)
-        safe_slot = str(primary_file.stem).replace(":", "_").replace("/", "_").replace("\\", "_")
-        out_dir = p / safe_slot
-        out_dir.mkdir(parents=True, exist_ok=True)
-        job_inputs[key] = str(out_dir.resolve())
-        return job_inputs, out_dir.resolve()
-
-    # 批处理时，输出目录类型默认生成每个 job 一个文件。
-    if field_type == "dir_path" or (not p.suffix):
-        p.mkdir(parents=True, exist_ok=True)
-        output_naming = str(
-            (module.get("parallel") or {}).get("output_naming")
-            or output_field.get("output_naming")
-            or "source_stem"
-        ).strip().lower()
-
-        if output_naming in {"source_stem", "input_stem", "primary_stem", "file_stem"}:
-            base_name = primary_file.stem
-        else:
-            base_name = str(slot or primary_file.stem)
-
-        safe_slot = str(base_name).replace(":", "_").replace("/", "_").replace("\\", "_")
-        out_path = p / f"{safe_slot}{output_ext}"
+    if is_directory_value:
+        output_dir = p
+        if output_mode in {"job_directory", "job_dir", "subdir", "subdirectory", "directory_per_job"}:
+            output_dir = p / _safe_output_stem(slot or primary_file.stem)
+        base_name = _choose_output_base_name(
+            module,
+            output_field,
+            primary_file=primary_file,
+            slot=slot,
+            job_index=job_index,
+        )
+        out_path = _unique_output_path(output_dir, base_name, output_ext, used_output_paths)
     else:
         p.parent.mkdir(parents=True, exist_ok=True)
-        out_path = p.with_name(f"{p.stem}_{primary_file.stem}{p.suffix}")
+        base_name = _safe_output_stem(f"{p.stem}_{slot or primary_file.stem}")
+        out_path = _unique_output_path(p.parent, base_name, p.suffix or output_ext, used_output_paths)
 
-    job_inputs[key] = str(out_path.resolve())
-    return job_inputs, out_path.resolve()
-
+    job_inputs[key] = str(out_path)
+    return job_inputs, out_path
 
 def _batch_directory_view_parent(primary_files: list[Path]) -> Path:
     """选择批处理目录视图的临时父目录。
@@ -6771,6 +6977,7 @@ def build_batch_jobs_for_module(module: dict, inputs: dict, parallel_workers: in
 
     jobs: list[dict] = []
     output_paths: list[Path] = []
+    used_output_paths: set[str] = set()
     missing: list[dict] = []
     used_by_role: dict[str, set[str]] = {role: set() for role in role_files}
 
@@ -6913,7 +7120,14 @@ def build_batch_jobs_for_module(module: dict, inputs: dict, parallel_workers: in
         if not ok:
             continue
 
-        job_inputs, out_path = _make_batch_output_value(module, job_inputs, slot, primary_path)
+        job_inputs, out_path = _make_batch_output_value(
+            module,
+            job_inputs,
+            slot,
+            primary_path,
+            job_index=idx,
+            used_output_paths=used_output_paths,
+        )
         if out_path is not None:
             output_paths.append(out_path)
 
@@ -7517,7 +7731,10 @@ if FRONTEND_DIST_DIR.exists():
         index_file = FRONTEND_DIST_DIR / "index.html"
         if not index_file.exists():
             raise HTTPException(status_code=404, detail="前端未构建")
-        return FileResponse(str(index_file))
+        return FileResponse(
+            str(index_file),
+            headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
+        )
 
     @app.get("/{full_path:path}")
     def spa_fallback(full_path: str):
@@ -7527,6 +7744,8 @@ if FRONTEND_DIST_DIR.exists():
 
         index_file = FRONTEND_DIST_DIR / "index.html"
         if index_file.exists():
-            return FileResponse(str(index_file))
+            return FileResponse(
+                str(index_file),
+                headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
+            )
         raise HTTPException(status_code=404, detail="前端未构建")
-

@@ -1,100 +1,8 @@
 [
   {
-    "id": "H8_CM_CTH_2_EXE",
-    "name": "H8 Cloud Mask And Cloud Phase Retrieval",
-    "description": "Executable H8 cloud mask and cloud phase retrieval module. The system reads H8 NetCDF input files and writes cloud product GeoTIFF results.",
-    "runtime": "cpp_native",
-    "entry": "CM_CTH_2.exe",
-    "executable": "backend/installed_modules/H8_CM_CTH_2_EXE/CM_CTH_2.exe",
-    "working_dir": "backend/installed_modules/H8_CM_CTH_2_EXE",
-    "config_mode": "json_file",
-    "command_template": [
-      "{executable}",
-      "{config_json}"
-    ],
-    "dependency_dirs": [
-      "deps"
-    ],
-    "dependency_search_dirs": [],
-    "resource_dirs": [
-      "resources"
-    ],
-    "parallel": {
-      "mode": "batch_group",
-      "input_key": "file",
-      "output_key": "outpath",
-      "batch_role": "input",
-      "file_patterns": "*R21*.nc;*R21*.NC",
-      "output_suffix": ".tif",
-      "output_naming": "source_stem",
-      "output_mode": "directory",
-      "files_per_job": 1,
-      "chunk_multiplier": 1,
-      "input_pass_mode": "directory_view",
-      "batch_allow_all_files": false,
-      "batch_allow_no_extension": false
-    },
-    "tags": [
-      "h8",
-      "cloud",
-      "cloud-mask",
-      "cloud-phase",
-      "executable"
-    ],
-    "tool_type": "cloud",
-    "enabled": true,
-    "inputs": [
-      {
-        "key": "file",
-        "label": "file",
-        "type": "dir_path",
-        "required": true,
-        "visible_to_user": true,
-        "admin_fixed": false,
-        "path_mode": "absolute",
-        "io_role": "input",
-        "default": "D:/H8/data1/input2",
-        "batch_role": "input",
-        "match_mode": "each_file",
-        "file_patterns": "*R21*.nc;*R21*.NC",
-        "batch_allow_all_files": false,
-        "batch_allow_no_extension": false,
-        "batch_pass_mode": "directory_view"
-      },
-      {
-        "key": "cm_files",
-        "label": "cm_files",
-        "type": "dir_path",
-        "required": true,
-        "visible_to_user": true,
-        "admin_fixed": false,
-        "path_mode": "absolute",
-        "io_role": "output",
-        "default": "D:/H8/data1/CM",
-        "batch_role": "OUTPUT_DIR",
-        "output_mode": "directory"
-      },
-      {
-        "key": "outpath",
-        "label": "outpath",
-        "type": "dir_path",
-        "required": true,
-        "visible_to_user": true,
-        "admin_fixed": false,
-        "path_mode": "absolute",
-        "io_role": "output",
-        "default": "D:/H8/data1/output",
-        "batch_role": "OUTPUT_DIR",
-        "output_mode": "directory"
-      }
-    ],
-    "_manifest_format": "executable_module_json",
-    "_param_json_path": "D:\\local_web_module_system\\backend\\installed_modules\\H8_CM_CTH_2_EXE\\config.json"
-  },
-  {
     "id": "h8aod",
-    "name": "H8 AOD Retrieval",
-    "description": "Executable H8 AOD retrieval module. The system reads config.json to generate input and output fields, then passes a runtime config file to AOD_AHI.exe.",
+    "name": "H8 AOD气溶胶反演",
+    "description": "基于葵花8号卫星数据的气溶胶光学厚度反演可执行模块。系统读取 config.json 生成输入和输出参数表单，并在运行时将配置文件传递给 AOD_AHI.exe。",
     "runtime": "cpp_native",
     "entry": "AOD_AHI.exe",
     "executable": "backend/installed_modules/h8aod/AOD_AHI.exe",
@@ -133,7 +41,7 @@
     "inputs": [
       {
         "key": "B01_file",
-        "label": "B01_file",
+        "label": "B01波段目录",
         "type": "dir_path",
         "required": true,
         "visible_to_user": true,
@@ -149,7 +57,7 @@
       },
       {
         "key": "B03_file",
-        "label": "B03_file",
+        "label": "B03波段目录",
         "type": "dir_path",
         "required": true,
         "visible_to_user": true,
@@ -165,7 +73,7 @@
       },
       {
         "key": "B06_file",
-        "label": "B06_file",
+        "label": "B06波段目录",
         "type": "dir_path",
         "required": true,
         "visible_to_user": true,
@@ -181,7 +89,7 @@
       },
       {
         "key": "SOLAR_file",
-        "label": "SOLAR_file",
+        "label": "太阳角度数据目录",
         "type": "dir_path",
         "required": true,
         "visible_to_user": true,
@@ -197,7 +105,7 @@
       },
       {
         "key": "GEO1_file",
-        "label": "GEO1_file",
+        "label": "经纬度角度文件",
         "type": "file_path",
         "required": true,
         "visible_to_user": false,
@@ -209,7 +117,7 @@
       },
       {
         "key": "al_igbp",
-        "label": "al_igbp",
+        "label": "地表类型文件",
         "type": "file_path",
         "required": true,
         "visible_to_user": false,
@@ -221,7 +129,7 @@
       },
       {
         "key": "al_lut",
-        "label": "al_lut",
+        "label": "查找表文件",
         "type": "file_path",
         "required": true,
         "visible_to_user": false,
@@ -233,7 +141,7 @@
       },
       {
         "key": "al_dem",
-        "label": "al_dem",
+        "label": "DEM高程文件",
         "type": "file_path",
         "required": true,
         "visible_to_user": false,
@@ -245,7 +153,7 @@
       },
       {
         "key": "output",
-        "label": "output",
+        "label": "输出目录",
         "type": "dir_path",
         "required": true,
         "visible_to_user": true,
@@ -261,8 +169,8 @@
   },
   {
     "id": "parasol_aod",
-    "name": "PARASOL AOD Retrieval",
-    "description": "Executable PARASOL AOD retrieval module. The system accepts a PARASOL Level-1 input folder, output folder, and fixed XML resource file.",
+    "name": "PARASOL AOD气溶胶反演",
+    "description": "基于 PARASOL Level-1 数据的气溶胶光学厚度反演可执行模块。系统接收输入文件夹、输出文件夹和固定 XML 资源文件，并支持按文件批量反演。",
     "runtime": "cpp_native",
     "entry": "ParasolAOD.exe",
     "executable": "backend/installed_modules/parasol_aod/ParasolAOD.exe",
@@ -306,14 +214,14 @@
     "inputs": [
       {
         "key": "input_dir",
-        "label": "input_dir",
+        "label": "输入目录",
         "type": "dir_path",
         "required": true,
         "visible_to_user": true,
         "admin_fixed": false,
         "path_mode": "absolute",
         "io_role": "input",
-        "default": "D:/yan1study/AOD_test/AOD_model/ParasolAOD/test_data",
+        "default": "",
         "batch_role": "input",
         "match_mode": "each_file",
         "file_patterns": "*JD;*jd",
@@ -322,7 +230,7 @@
       },
       {
         "key": "output_dir",
-        "label": "output_dir",
+        "label": "输出目录",
         "type": "dir_path",
         "required": true,
         "visible_to_user": true,
@@ -334,7 +242,7 @@
       },
       {
         "key": "config_xml",
-        "label": "config_xml",
+        "label": "配置XML文件",
         "type": "file_path",
         "required": true,
         "visible_to_user": false,
@@ -349,87 +257,9 @@
     "_param_json_path": "D:\\local_module_web_system1\\parasol\\config.json"
   },
   {
-    "id": "CTH_FY",
-    "name": "FY CTH云顶高反演",
-    "description": "基于风云卫星数据的云顶高度反演可执行模块，系统读取 config.json 生成输入和输出参数表单，并在运行时将配置文件传递给 CTH_FY.exe。",
-    "runtime": "cpp_native",
-    "entry": "CTH_FY.exe",
-    "executable": "backend/installed_modules/CTH_FY/CTH_FY.exe",
-    "working_dir": "backend/installed_modules/CTH_FY",
-    "config_mode": "json_file",
-    "command_template": [
-      "{executable}",
-      "{config_json}"
-    ],
-    "dependency_dirs": [
-      "deps"
-    ],
-    "dependency_search_dirs": [],
-    "resource_dirs": [
-      "resources"
-    ],
-    "parallel": {
-      "mode": "batch_group",
-      "input_key": "fy4_path",
-      "output_key": "out_path",
-      "batch_role": "input",
-      "file_patterns": "*.HDF;*.hdf;*.H5;*.h5;*.NC;*.nc",
-      "output_suffix": ".tif",
-      "files_per_job": 1,
-      "chunk_multiplier": 1,
-      "output_naming": "source_stem",
-      "output_mode": "directory",
-      "input_pass_mode": "directory_view",
-      "batch_allow_all_files": false,
-      "batch_allow_no_extension": false
-    },
-    "tags": [
-      "fy",
-      "cth",
-      "cloud",
-      "executable"
-    ],
-    "tool_type": "cloud",
-    "enabled": true,
-    "inputs": [
-      {
-        "key": "fy4_path",
-        "label": "fy4_path",
-        "type": "dir_path",
-        "required": true,
-        "visible_to_user": true,
-        "admin_fixed": false,
-        "path_mode": "absolute",
-        "io_role": "input",
-        "default": "G:/FY_data",
-        "batch_role": "input",
-        "match_mode": "each_file",
-        "file_patterns": "*.HDF;*.hdf;*.H5;*.h5;*.NC;*.nc",
-        "batch_allow_all_files": false,
-        "batch_allow_no_extension": false,
-        "batch_pass_mode": "directory_view"
-      },
-      {
-        "key": "out_path",
-        "label": "out_path",
-        "type": "dir_path",
-        "required": true,
-        "visible_to_user": true,
-        "admin_fixed": false,
-        "path_mode": "absolute",
-        "io_role": "output",
-        "default": "D:/H8/fy_output",
-        "batch_role": "OUTPUT_DIR",
-        "output_mode": "directory"
-      }
-    ],
-    "_manifest_format": "executable_module_json",
-    "_param_json_path": "D:\\local_web_module_system_del\\backend\\installed_modules\\CTH_FY\\config.json"
-  },
-  {
     "id": "H8_CM_2_EXE",
-    "name": "H8 Cloud Mask Retrieval",
-    "description": "Executable Himawari-8 cloud mask retrieval module. The system accepts an input folder and output folder, then runs one subtask for each matched input file during batch execution.",
+    "name": "H8云掩膜反演",
+    "description": "基于葵花8号卫星数据的云掩膜反演可执行模块。系统接收输入文件夹和输出文件夹，并在批处理运行时按匹配输入文件生成子任务。",
     "runtime": "cpp_native",
     "entry": "CM_2.exe",
     "executable": "backend/installed_modules/H8_CM_2_EXE/CM_2.exe",
@@ -456,11 +286,7 @@
       "files_per_job": 1,
       "chunk_multiplier": 1,
       "output_naming": "source_stem",
-      "output_mode": "directory",
-      "batch_role": "input",
-      "input_pass_mode": "directory_view",
-      "batch_allow_all_files": false,
-      "batch_allow_no_extension": false
+      "output_mode": "directory"
     },
     "tags": [
       "h8",
@@ -473,7 +299,7 @@
     "inputs": [
       {
         "key": "input_dir",
-        "label": "input_dir",
+        "label": "输入目录",
         "type": "dir_path",
         "required": true,
         "visible_to_user": true,
@@ -490,7 +316,7 @@
       },
       {
         "key": "output_dir",
-        "label": "output_dir",
+        "label": "输出目录",
         "type": "dir_path",
         "required": true,
         "visible_to_user": true,
@@ -506,8 +332,8 @@
   },
   {
     "id": "H8_CTH_2_EXE",
-    "name": "H8 Cloud Top Height Retrieval",
-    "description": "Executable Himawari-8 cloud top height retrieval module. The system accepts an input folder and output folder, then runs one subtask for each matched input file during batch execution.",
+    "name": "H8云顶高度反演",
+    "description": "基于葵花8号卫星数据的云顶高度反演可执行模块。系统接收输入文件夹和输出文件夹，并在批处理运行时按匹配输入文件生成子任务。",
     "runtime": "cpp_native",
     "entry": "CTH_2.exe",
     "executable": "backend/installed_modules/H8_CTH_2_EXE/CTH_2.exe",
@@ -534,11 +360,7 @@
       "files_per_job": 1,
       "chunk_multiplier": 1,
       "output_naming": "source_stem",
-      "output_mode": "directory",
-      "batch_role": "input",
-      "input_pass_mode": "directory_view",
-      "batch_allow_all_files": false,
-      "batch_allow_no_extension": false
+      "output_mode": "directory"
     },
     "tags": [
       "h8",
@@ -551,7 +373,7 @@
     "inputs": [
       {
         "key": "input_dir",
-        "label": "input_dir",
+        "label": "输入目录",
         "type": "dir_path",
         "required": true,
         "visible_to_user": true,
@@ -568,7 +390,7 @@
       },
       {
         "key": "output_dir",
-        "label": "output_dir",
+        "label": "输出目录",
         "type": "dir_path",
         "required": true,
         "visible_to_user": true,
@@ -581,5 +403,229 @@
     ],
     "_manifest_format": "executable_module_json",
     "_param_json_path": "G:\\exe\\H8\\CTH_2\\config.json"
+  },
+  {
+    "id": "CTH_FY",
+    "name": "FY-4云顶高度反演",
+    "description": "基于风云4号卫星数据的云顶高度反演可执行模块。系统读取 config.json 生成输入和输出参数表单，并在运行时将配置文件传递给 CTH_FY.exe。",
+    "runtime": "cpp_native",
+    "entry": "CTH_FY.exe",
+    "executable": "backend/installed_modules/CTH_FY/CTH_FY.exe",
+    "working_dir": "backend/installed_modules/CTH_FY",
+    "config_mode": "json_file",
+    "command_template": [
+      "{executable}",
+      "{config_json}"
+    ],
+    "dependency_dirs": [
+      "_internal"
+    ],
+    "dependency_search_dirs": [],
+    "resource_dirs": [],
+    "parallel": {
+      "mode": "batch_group",
+      "input_key": "fy4_path",
+      "output_key": "out_path",
+      "file_patterns": "*.HDF;*.hdf;*.H5;*.h5;*.NC;*.nc",
+      "output_suffix": ".tif",
+      "files_per_job": 1,
+      "chunk_multiplier": 1,
+      "output_naming": "source_stem",
+      "output_mode": "directory"
+    },
+    "tags": [
+      "fy",
+      "cth",
+      "cloud",
+      "executable"
+    ],
+    "tool_type": "cloud",
+    "enabled": true,
+    "inputs": [
+      {
+        "key": "fy4_path",
+        "label": "FY-4输入目录",
+        "type": "dir_path",
+        "required": true,
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "input",
+        "default": "D:/NEPU/FY4_CTH/data"
+      },
+      {
+        "key": "out_path",
+        "label": "输出目录",
+        "type": "dir_path",
+        "required": true,
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "output",
+        "default": "D:/NEPU/FY4_CTH/output",
+        "batch_role": "OUTPUT_DIR"
+      }
+    ],
+    "_manifest_format": "executable_module_json",
+    "_param_json_path": "G:\\exe\\FY\\CTH_FY\\config.json"
+  },
+  {
+    "id": "H8_CM_CTH_2_PY_UPLOAD",
+    "name": "H8云掩膜与云相态反演Python版",
+    "description": "Python 源码上传模块，用于葵花8号云掩膜和云相态反演。系统读取 H8 NetCDF 输入文件夹，输出云掩膜结果到 cm_output_dir，并输出云相态结果到 cp_output_dir。",
+    "enabled": true,
+    "tool_type": "cloud",
+    "runtime_type": "python_venv",
+    "python_env_mode": "create_venv",
+    "base_python_executable": "",
+    "install_release": "20260720_085225",
+    "config_mode": "config_json",
+    "command_template": [
+      "{executable}",
+      "{entry_script}",
+      "{config_json}"
+    ],
+    "inputs": [
+      {
+        "key": "input_dir",
+        "label": "输入目录",
+        "type": "dir_path",
+        "required": true,
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "input",
+        "default": "D:/H8/data/input"
+      },
+      {
+        "key": "cm_output_dir",
+        "label": "云掩膜输出目录",
+        "type": "dir_path",
+        "required": true,
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "output",
+        "default": "D:/H8/data/CM"
+      },
+      {
+        "key": "cp_output_dir",
+        "label": "云相态输出目录",
+        "type": "dir_path",
+        "required": true,
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "output",
+        "default": "D:/H8/data/output"
+      }
+    ],
+    "param_template": "backend/installed_modules/H8_CM_CTH_2_PY_UPLOAD/releases/20260720_085225/param_template.json",
+    "source_dir": "backend/installed_modules/H8_CM_CTH_2_PY_UPLOAD/releases/20260720_085225/source",
+    "entry_file": "CM_CTH_2.py",
+    "entry_script": "backend/installed_modules/H8_CM_CTH_2_PY_UPLOAD/releases/20260720_085225/source/CM_CTH_2.py",
+    "python_env_dir": "backend/module_envs/H8_CM_CTH_2_PY_UPLOAD_20260720_085225",
+    "executable": "backend/module_envs/H8_CM_CTH_2_PY_UPLOAD_20260720_085225/Scripts/python.exe",
+    "working_dir": "backend/installed_modules/H8_CM_CTH_2_PY_UPLOAD/releases/20260720_085225/source",
+    "parallel": {
+      "mode": "auto",
+      "input_key": "",
+      "output_key": "",
+      "file_patterns": "*.tif;*.tiff;*.nc;*.hdf;*.h5",
+      "output_suffix": ".tif",
+      "files_per_job": 1,
+      "chunk_multiplier": 1
+    }
+  },
+  {
+    "id": "dpc_aod",
+    "name": "DPC AOD气溶胶反演",
+    "description": "DPC AOD气溶胶反演模块。系统面向DPC多角度偏振卫星观测数据，接收Level-1输入目录、输出目录和固定XML资源文件，支持按观测文件批量拆分，并生成气溶胶光学厚度反演产品。",
+    "runtime": "cpp_native",
+    "entry": "DpcAod.exe",
+    "executable": "backend/installed_modules/dpc_aod/DpcAod.exe",
+    "working_dir": "backend/installed_modules/dpc_aod",
+    "config_mode": "json_file",
+    "command_template": [
+      "{executable}",
+      "{input_dir}",
+      "{output_dir}",
+      "{config_xml}"
+    ],
+    "dependency_dirs": [
+      "deps"
+    ],
+    "dependency_search_dirs": [],
+    "resource_dirs": [
+      "resources"
+    ],
+    "parallel": {
+      "mode": "batch_group",
+      "input_key": "input_dir",
+      "output_key": "output_dir",
+      "file_patterns": "*MD;*JD;*md;*jd",
+      "output_suffix": ".tif",
+      "files_per_job": 1,
+      "chunk_multiplier": 1,
+      "output_naming": "source_stem",
+      "pair_mode": "auto",
+      "pair_suffixes": "MD:ML;JD:JL;md:ml;jd:jl",
+      "primary_suffixes": "MD;JD",
+      "output_mode": "job_directory"
+    },
+    "tags": [
+      "dpc",
+      "aod",
+      "aerosol",
+      "polarization",
+      "executable"
+    ],
+    "tool_type": "aerosol",
+    "enabled": true,
+    "inputs": [
+      {
+        "key": "input_dir",
+        "label": "输入目录",
+        "type": "dir_path",
+        "required": true,
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "input",
+        "default": "",
+        "batch_role": "input",
+        "match_mode": "each_file",
+        "file_patterns": "*MD;*JD;*md;*jd",
+        "batch_allow_all_files": true,
+        "batch_allow_no_extension": true,
+        "help_text": "请选择DPC Level-1多角度偏振观测数据目录，目录中应包含主观测文件及配套几何或辅助文件。"
+      },
+      {
+        "key": "output_dir",
+        "label": "输出目录",
+        "type": "dir_path",
+        "required": true,
+        "visible_to_user": true,
+        "admin_fixed": false,
+        "path_mode": "absolute",
+        "io_role": "output",
+        "default": "",
+        "batch_role": "OUTPUT_DIR"
+      },
+      {
+        "key": "config_xml",
+        "label": "配置XML文件",
+        "type": "file_path",
+        "required": true,
+        "visible_to_user": false,
+        "admin_fixed": true,
+        "path_mode": "relative_to_module",
+        "io_role": "input",
+        "default": "resources/ConfigXMLFile.xml",
+        "batch_role": ""
+      }
+    ],
+    "_manifest_format": "executable_module_json",
+    "_param_json_path": "G:\\exe\\DPC_AOD\\config.json"
   }
 ]
