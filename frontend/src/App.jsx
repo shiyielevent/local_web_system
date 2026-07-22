@@ -1882,8 +1882,16 @@ function LoginPage(props) {
                 遥感反演 · 本地运行平台
               </div>
 
-              <h1 style={{fontSize: 42, lineHeight: 1.25, margin: 0, fontWeight: 800}}>
-                云和气溶胶反演系统
+              <h1
+                style={{
+                  fontSize: 32,
+                  lineHeight: 1.25,
+                  margin: 0,
+                  fontWeight: 800,
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                云和气溶胶卫星遥感反演系统
               </h1>
 
               <p
@@ -5424,12 +5432,37 @@ async function uploadPythonFolder() {
           minHeight: 'calc(100vh - 98px)',
         }}
       >
-        <div style={{ ...styles.card, padding: 18 }}>
-          <div style={{ fontSize: 22, fontWeight: 900, color: '#0b2d51', marginBottom: 16 }}>
+        <div
+          style={{
+            ...styles.card,
+            height: 'calc(100vh - 98px)',
+            minHeight: 0,
+            padding: 18,
+            display: 'flex',
+            flexDirection: 'column',
+            overflow: 'hidden',
+            alignSelf: 'start',
+          }}
+        >
+          <div style={{ fontSize: 22, fontWeight: 900, color: '#0b2d51', marginBottom: 16, flexShrink: 0 }}>
             {toolbar.label}模块
           </div>
 
-          <div style={{ display: 'grid', gap: 12 }}>
+          <div
+            className="tool-module-scroll"
+            style={{
+              display: 'grid',
+              gap: 12,
+              alignContent: 'start',
+              flex: '1 1 auto',
+              minHeight: 0,
+              overflowY: 'auto',
+              overflowX: 'hidden',
+              overscrollBehaviorY: 'contain',
+              scrollbarGutter: 'stable',
+              paddingRight: 6,
+            }}
+          >
             {list.length === 0 && (
               <div style={{ color: '#8998a8', lineHeight: 1.8 }}>
                 这个工具栏下还没有模块。管理员可以在“模块管理”中选择该工具类型后安装或手工添加模块。
@@ -6128,7 +6161,7 @@ function renderTaskManagementPage() {
     <div style={styles.page}>
       <div style={styles.topbar}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 18, flexWrap: 'wrap', minWidth: 0, flex: '1 1 auto' }}>
-          <div style={{ fontSize: 26, fontWeight: 900, whiteSpace: 'nowrap', flexShrink: 0 }}>云和气溶胶反演系统</div>
+          <div style={{ fontSize: 26, fontWeight: 900, whiteSpace: 'nowrap', flexShrink: 0 }}>云和气溶胶卫星遥感反演系统</div>
           <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', minWidth: 0 }}>
             {navItems.map((item) => (
                 <button
