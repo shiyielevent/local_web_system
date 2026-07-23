@@ -1060,12 +1060,13 @@ class TaskManager:
     def _split_items_by_machine_weight(self, items: List[Any], machines: List[str]) -> List[List[Any]]:
         """按节点百分比划分输入工作量，所有节点比例总和固定为 100%。
 
-        默认启用“节点级大小感知”：
-        - 百分比表示目标输入字节占比，而不只是文件数量占比；
-        - 大文件优先分配给当前相对负载最低的节点；
-        - 结果仍保持每个节点内部的原始文件顺序。
+        默认严格按文件数量划分：
+        - 使用最大余数法把百分比换算成整数文件数；
+        - 例如 45 个文件按 28%/72% 分配为 13/32；
+        - 结果保持每个节点内部的原始文件顺序。
 
-        可设置 LOCAL_WEB_HTCONDOR_NODE_SIZE_AWARE_SPLIT=0 退回按文件数量百分比分配。
+        如确实需要按输入字节数平衡，可显式设置
+        LOCAL_WEB_HTCONDOR_NODE_SIZE_AWARE_SPLIT=1。
         进程槽不会参与这里的节点比例计算，只在下一阶段决定子任务数量。
         """
         machines = [str(x).strip() for x in machines if str(x).strip()]
@@ -1097,8 +1098,8 @@ class TaskManager:
                 for machine in machines
             ]
 
-        enabled = str(os.environ.get("LOCAL_WEB_HTCONDOR_NODE_SIZE_AWARE_SPLIT", "1")).strip().lower()
-        size_aware = enabled not in {"0", "false", "no", "off"}
+        enabled = str(os.environ.get("LOCAL_WEB_HTCONDOR_NODE_SIZE_AWARE_SPLIT", "0")).strip().lower()
+        size_aware = enabled in {"1", "true", "yes", "on"}
 
         if size_aware:
             weighted_items = [
@@ -2102,10 +2103,9 @@ class TaskManager:
                 return []
 
             max_files_per_job = self._htcondor_max_files_per_job()
-            job_chunks = self._split_items_by_machine_weight_and_job_limit(
+            job_chunks = self._split_items_by_machine_weight_and_process_slots(
                 original_list,
                 machines,
-                max_items_per_job=max_files_per_job,
             )
             if not job_chunks:
                 return []
@@ -2122,6 +2122,7 @@ class TaskManager:
 
                 part_config = copy.deepcopy(config_data)
                 shared_io = self._htcondor_shared_io_enabled()
+                use_local_paths = bool(shared_io and self._htcondor_target_uses_local_paths(machine))
                 if shared_io:
                     chunk_values = self._map_path_like_values_to_shared_target(chunk_values, use_local_paths=use_local_paths)
                 self._set_by_path(part_config, list_path, chunk_values)
@@ -2155,6 +2156,8 @@ class TaskManager:
                             "part_index": index + 1,
                             "part_total": total_parts,
                             "machine_part_index": int(job_chunk.get("machine_job_index") or 1),
+                            "machine_process_slots": int(job_chunk.get("machine_process_slots") or 1),
+                            "estimated_input_bytes": int(job_chunk.get("estimated_input_bytes") or 0),
                             "htcondor_max_files_per_job": max_files_per_job,
                             "shared_io": bool(self._htcondor_shared_io_enabled()),
                         },
@@ -2180,10 +2183,9 @@ class TaskManager:
                 return []
 
             max_files_per_job = self._htcondor_max_files_per_job()
-            job_chunks = self._split_items_by_machine_weight_and_job_limit(
+            job_chunks = self._split_items_by_machine_weight_and_process_slots(
                 files,
                 machines,
-                max_items_per_job=max_files_per_job,
             )
             if not job_chunks:
                 return []
@@ -2260,6 +2262,8 @@ class TaskManager:
                             "part_index": index + 1,
                             "part_total": total_parts,
                             "machine_part_index": int(job_chunk.get("machine_job_index") or 1),
+                            "machine_process_slots": int(job_chunk.get("machine_process_slots") or 1),
+                            "estimated_input_bytes": int(job_chunk.get("estimated_input_bytes") or 0),
                             "htcondor_max_files_per_job": max_files_per_job,
                             "shared_io": bool(shared_io and shared_input_unc),
                             "shared_input_dir_unc": shared_input_unc,
@@ -2328,14 +2332,24 @@ class TaskManager:
                 self.append_log(task_id, f"[HTCONDOR] 检测到 {len(machines)} 个可用执行节点：{', '.join(machines)}")
                 weight_text = ', '.join([f"{m}={self._htcondor_machine_weights(machines).get(m, 1)}" for m in machines])
                 module_item = self._find_module_item(str((self.get_task(task_id) or {}).get("module_id") or ""))
+                process_slots_map = self._htcondor_machine_process_slots(machines, module_item=module_item)
+                process_slots_text = ", ".join(
+                    f"{machine}={process_slots_map.get(machine, 1)}"
+                    for machine in machines
+                )
+                group_max_workers = min(
+                    len(entries),
+                    max(1, sum(process_slots_map.get(machine, 1) for machine in machines)),
+                )
                 small_batch_enabled = self._htcondor_small_batch_enabled(module_item)
                 max_files_per_job = self._htcondor_max_files_per_job(module_item)
                 if small_batch_enabled:
                     self.append_log(task_id, f"[HTCONDOR] 节点任务权重：{weight_text}。系统先按 文件总数 * 节点权重 / 权重总和 计算各节点文件数，再按小批次拆成多个 HTCondor 子任务。")
                     if len(entries) > len(machines):
-                        self.append_log(task_id, f"[HTCONDOR] 已启用小批次拆分：每个 HTCondor 子任务最多处理 {max_files_per_job} 个文件；每个节点同一时间最多运行 1 个 EXE。")
+                        self.append_log(task_id, f"[HTCONDOR] 已启用小批次拆分：每个 HTCondor 子任务最多处理 {max_files_per_job} 个文件。")
                 else:
-                    self.append_log(task_id, f"[HTCONDOR] 节点任务权重：{weight_text}。系统按 文件总数 * 节点权重 / 权重总和 分配文件；当前默认不启用小批次拆分，每个节点直接运行一个完整子任务。")
+                    self.append_log(task_id, f"[HTCONDOR] 节点任务权重：{weight_text}。系统严格按 文件总数 * 节点百分比 分配文件，再按各节点进程槽拆分子任务。")
+                self.append_log(task_id, f"[HTCONDOR] 节点进程槽：{process_slots_text}；本次最多同时提交={group_max_workers}。")
                 distribution_text = self._htcondor_entries_distribution_text(entries)
                 if distribution_text:
                     self.append_log(task_id, f"[HTCONDOR] 实际文件分配：{distribution_text}")
@@ -2349,10 +2363,10 @@ class TaskManager:
                     parallel_total=len(entries),
                     parallel_done=0,
                     parallel_failed=0,
-                    max_workers=min(len(machines), len(entries)),
+                    max_workers=group_max_workers,
                     execution_backend="htcondor",
                 )
-                self._run_htcondor_job_group(task_id, entries, min(len(machines), len(entries)), "自动多节点任务")
+                self._run_htcondor_job_group(task_id, entries, group_max_workers, "自动多节点任务")
                 return
 
             self.append_log(
@@ -2496,7 +2510,6 @@ class TaskManager:
         requested_max_workers = max(1, min(int(max_workers or 1), max(1, total)))
         per_target_limits: Dict[str, int] = {}
         if machines:
-            per_machine_requested = max(1, math.ceil(requested_max_workers / max(1, len(machines))))
             try:
                 explicit_per_node_cap = int(os.environ.get("LOCAL_WEB_HTCONDOR_MAX_EXE_PER_NODE", "0") or 0)
             except Exception:
@@ -2507,9 +2520,9 @@ class TaskManager:
                     process_slots_map.get(machine, 1),
                     default=1,
                 )
-                limit = max(1, configured_slots, per_machine_requested)
-                if len(machines) == 1:
-                    limit = max(limit, requested_max_workers)
+                # 节点进程槽是该节点的硬并发上限。全局 max_workers 只能进一步
+                # 降低并发，不能把某个节点配置的 1 槽擅自扩大成多个 EXE。
+                limit = configured_slots
                 if explicit_per_node_cap > 0:
                     limit = min(limit, explicit_per_node_cap)
                 per_target_limits[machine] = max(1, limit)
