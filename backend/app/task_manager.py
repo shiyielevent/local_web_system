@@ -1773,8 +1773,13 @@ class TaskManager:
             allow_shared_input_copy = str(os.environ.get("LOCAL_WEB_ALLOW_SHARED_INPUT_COPY", "0")).strip().lower() in {"1", "true", "yes", "on"}
             allow_copy_for_inputs = (not shared_io) or allow_shared_input_copy
             used_modes = []
+            failed_refs = []
             for source in chunk_items:
-                mode = self._link_or_copy_file(source, part_input_dir / source.name)
+                mode = self._link_or_copy_file(
+                    source,
+                    part_input_dir / source.name,
+                    allow_copy=allow_copy_for_inputs,
+                )
                 used_modes.append(mode)
                 if shared_io and str(mode).startswith("failed"):
                     failed_refs.append(str(source))
@@ -2198,8 +2203,13 @@ class TaskManager:
                 allow_shared_input_copy = str(os.environ.get("LOCAL_WEB_ALLOW_SHARED_INPUT_COPY", "0")).strip().lower() in {"1", "true", "yes", "on"}
                 allow_copy_for_inputs = (not shared_io) or allow_shared_input_copy
                 used_modes = []
+                failed_refs = []
                 for source in chunk_items:
-                    mode = self._link_or_copy_file(source, part_input_dir / source.name)
+                    mode = self._link_or_copy_file(
+                        source,
+                        part_input_dir / source.name,
+                        allow_copy=allow_copy_for_inputs,
+                    )
                     used_modes.append(mode)
                     if shared_io and str(mode).startswith("failed"):
                         failed_refs.append(str(source))
