@@ -3314,9 +3314,9 @@ function App() {
   const navItems = useMemo(() => {
     const arr = [];
 
-    // 顶部导航固定顺序：模块管理 → 云反演 → 气溶胶反演 → 分布式 → 任务管理 → 数据管理 → 用户管理。
+    // 顶部导航固定顺序：集成管理 → 云反演 → 气溶胶反演 → 分布式 → 任务管理 → 数据管理 → 用户管理。
     if (isAdmin) {
-      arr.push({ key: 'module_mgmt', label: '模块管理' });
+      arr.push({ key: 'module_mgmt', label: '集成管理' });
     }
 
     const toolRank = (key) => {
@@ -3452,7 +3452,7 @@ useEffect(() => {
 useEffect(() => {
   if (!currentUser) return;
 
-  // 工具栏还没加载完成时，不要把 tool:cloud 错误切到任务管理或模块管理
+  // 工具栏还没加载完成时，不要把 tool:cloud 错误切到任务管理或集成管理
   if (visibleToolbars.length === 0) return;
 
   const hasTool = (key) => visibleToolbars.some((tb) => tb.key === key);
@@ -5465,7 +5465,7 @@ async function uploadPythonFolder() {
           >
             {list.length === 0 && (
               <div style={{ color: '#8998a8', lineHeight: 1.8 }}>
-                这个工具栏下还没有模块。管理员可以在“模块管理”中选择该工具类型后安装或手工添加模块。
+                这个工具栏下还没有模块。管理员可以在“集成管理”中选择该工具类型后安装或手工添加模块。
               </div>
             )}
             {list.map((m) => (
@@ -6217,7 +6217,7 @@ function renderTaskManagementPage() {
             >
               <div style={{ ...styles.card, padding: 16 }}>
                 <div style={{ fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 16 }}>
-                  模块管理功能
+                  集成管理功能
                 </div>
 
                 <div style={{ display: 'grid', gap: 12 }}>

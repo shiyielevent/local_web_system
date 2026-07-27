@@ -140,7 +140,7 @@ class ParseParamJsonRequest(BaseModel):
 class InstallModuleFolderRequest(BaseModel):
     folder_path: str
     tool_type: str = "cloud"
-    # C++ 模块按本地可执行文件安装，只需要 module.json、exe、resources 和运行时 deps。
+    # C++ 模块按本地可执行文件安装，新规范只需要 executable_module.json、config.json、exe、resources 和运行时 deps。
     # 这里保留 runtime 字段，兼容旧前端调用。
     runtime: str = "cpp_native"
     auto_collect_dependencies: bool = True
@@ -1129,7 +1129,7 @@ def ensure_modules_file():
 def recover_modules_from_installed_modules() -> List[dict]:
     recovered: List[dict] = []
     seen: set[str] = set()
-    manifest_names = ["module.json", "executable_module.json", "python_module.json"]
+    manifest_names = ["executable_module.json", "python_module.json", "module.json"]
 
     for module_dir in sorted(INSTALLED_MODULES_DIR.iterdir(), key=lambda p: p.name.lower()):
         if not module_dir.is_dir():
@@ -2305,7 +2305,8 @@ def is_python_source_runtime_module(module: dict, exe_path: Path) -> bool:
         return True
     if module.get("python_env_dir"):
         return True
-    if module.get("source_dir") and (module.get("entry_file") or module.get("entry_script")):
+    entry_hint = str(module.get("entry_script") or module.get("entry_file") or "").strip().lower()
+    if module.get("source_dir") and entry_hint.endswith(".py"):
         return True
     try:
         name = exe_path.name.lower()
@@ -3802,6 +3803,8 @@ def _infer_executable_inputs_from_config(param_json: dict, module_root: Path, mo
         or parallel_cfg.get("pass_mode")
         or ""
     ).strip()
+    if not parallel_input_pass_mode and str(parallel_cfg.get("pair_suffixes") or "").strip():
+        parallel_input_pass_mode = "primary_file"
     module_id_lower = str(module_data.get("id") or module_data.get("module_id") or "").lower()
 
     def parallel_bool(name: str, default: bool) -> bool:
@@ -4334,7 +4337,7 @@ def validate_cpp_module_folder(folder_path: Path, tool_type: str | None = None, 
         return report
 
     if not folder_path.exists() or not folder_path.is_dir():
-        _add_error(report, "folder_path", f"模块文件夹不存在：{folder_path}", "请选择包含 module.json 的模块根目录。")
+        _add_error(report, "folder_path", f"模块文件夹不存在：{folder_path}", "请选择包含 executable_module.json 和 config.json 的模块根目录。")
         _add_missing(report, folder_path, "选择的模块文件夹不存在", "重新选择正确的本地文件夹路径。")
         _dedupe_report_items(report)
         return report
@@ -4404,7 +4407,7 @@ def validate_cpp_module_folder(folder_path: Path, tool_type: str | None = None, 
 def install_validated_cpp_module(module_root: Path, module_data: dict, collect_dependencies: bool = True) -> dict:
     module_id = str(module_data.get("id") or "").strip()
     if not module_id:
-        raise HTTPException(status_code=400, detail="module.json 缺少 id")
+        raise HTTPException(status_code=400, detail="模块配置缺少 id/module_id")
 
     target_dir = INSTALLED_MODULES_DIR / module_id
     if target_dir.exists():
@@ -4798,7 +4801,7 @@ def install_module_from_folder(
     tool_type: str | None = None,
     collect_dependencies: bool = True,
 ) -> dict:
-    """安装本地 C++/可执行模块文件夹，并在复制前校验 module.json 和缺失文件。"""
+    """安装本地 C++/可执行模块文件夹，并在复制前校验 executable_module.json/config.json 和缺失文件。"""
     validation = validate_cpp_module_folder(
         folder_path,
         tool_type=tool_type,
@@ -6053,6 +6056,12 @@ def is_parasol_jd_pair_module(module: dict) -> bool:
     parallel_cfg = module.get("parallel") if isinstance(module.get("parallel"), dict) else {}
     if parallel_cfg.get("jd_jl_pair") is True or parallel_cfg.get("jd_only") is True:
         return True
+    if str(parallel_cfg.get("pair_suffixes") or "").strip():
+        return True
+    if str(parallel_cfg.get("pair_mode") or "").strip().lower() in {
+        "auto", "pair", "paired", "companion", "required", "strict",
+    }:
+        return True
 
     tags = module.get("tags") or []
     text = " ".join([
@@ -6871,6 +6880,18 @@ def _make_batch_output_value(
         or ""
     ).strip().lower()
 
+    if output_mode in {
+        "job_directory_passthrough",
+        "job_dir_passthrough",
+        "directory_per_job_passthrough",
+        "passthrough_job_directory",
+        "passthrough_job_dir",
+    }:
+        output_dir = p / _safe_output_stem(slot or primary_file.stem)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        job_inputs[key] = str(output_dir.resolve())
+        return job_inputs, output_dir.resolve()
+
     is_directory_value = (
         field_type == "dir_path"
         or not p.suffix
@@ -6997,11 +7018,22 @@ def build_batch_jobs_for_module(module: dict, inputs: dict, parallel_workers: in
         role_indexes[primary_role] = _build_role_index(primary_files)
 
     total = len(primary_files)
+    parallel_cfg = module.get("parallel") if isinstance(module.get("parallel"), dict) else {}
     primary_pass_mode = str(
         primary_field.get("batch_pass_mode")
         or primary_field.get("pass_mode")
+        or parallel_cfg.get("input_pass_mode")
+        or parallel_cfg.get("batch_pass_mode")
+        or parallel_cfg.get("pass_mode")
         or ""
     ).strip().lower()
+    primary_passes_source_file = primary_pass_mode in {
+        "file",
+        "primary_file",
+        "source_file",
+        "main_file",
+        "single_file",
+    }
     primary_uses_directory_view = primary_pass_mode in {
         "directory",
         "dir",
@@ -7010,6 +7042,12 @@ def build_batch_jobs_for_module(module: dict, inputs: dict, parallel_workers: in
         "single_file_dir",
         "single_file_directory",
     }
+    if is_parasol_jd_pair_module(module):
+        # PARASOL/DPC AOD executables accept the primary MD/JD file path and
+        # locate the companion ML/JL file by name. Passing a temporary
+        # per-job directory makes the executable fail with "No Such File".
+        primary_passes_source_file = True
+        primary_uses_directory_view = False
     batch_view_root: Path | None = None
     if primary_uses_directory_view:
         safe_module_id = sanitize_filename(str(module.get("id") or "batch")).strip() or "batch"
@@ -7071,8 +7109,69 @@ def build_batch_jobs_for_module(module: dict, inputs: dict, parallel_workers: in
                                 "请把输入数据放到 NTFS 磁盘，或以管理员身份运行后端/开启 Windows 开发者模式。"
                             ),
                         )
+            if is_parasol_jd_pair_module(module):
+                companion_file = find_parasol_companion_file(module, primary_path)
+                if companion_file is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"缺少配套输入文件：{primary_path.name}。"
+                            "MD 主文件必须配套 ML 文件，JD 主文件必须配套 JL 文件。"
+                        ),
+                    )
+
+                companion_view_file = view_dir / companion_file.name
+                try:
+                    if companion_view_file.exists() or companion_view_file.is_symlink():
+                        companion_view_file.unlink()
+                    os.link(str(companion_file.resolve()), str(companion_view_file))
+                    job_link_modes.append("hardlink")
+                except Exception as hardlink_exc:
+                    try:
+                        if companion_view_file.exists() or companion_view_file.is_symlink():
+                            companion_view_file.unlink()
+                        os.symlink(str(companion_file.resolve()), str(companion_view_file), target_is_directory=False)
+                        job_link_modes.append("symlink")
+                    except Exception as symlink_exc:
+                        allow_copy = str(os.environ.get("LOCAL_WEB_ALLOW_DIRECTORY_VIEW_COPY", "1")).strip().lower() not in {"0", "false", "no", "off"}
+                        if allow_copy:
+                            try:
+                                if companion_view_file.exists() or companion_view_file.is_symlink():
+                                    companion_view_file.unlink()
+                                shutil.copy2(str(companion_file.resolve()), str(companion_view_file))
+                                job_link_modes.append("copy")
+                            except Exception as copy_exc:
+                                raise HTTPException(
+                                    status_code=400,
+                                    detail=(
+                                        f"无法为配套输入文件创建子任务目录视图: {companion_file}\n"
+                                        f"hardlink失败: {type(hardlink_exc).__name__}: {hardlink_exc}\n"
+                                        f"symlink失败: {type(symlink_exc).__name__}: {symlink_exc}\n"
+                                        f"copy失败: {type(copy_exc).__name__}: {copy_exc}"
+                                    ),
+                                )
+                        else:
+                            raise HTTPException(
+                                status_code=400,
+                                detail=(
+                                    f"无法为配套输入文件创建子任务目录视图: {companion_file}\n"
+                                    f"hardlink失败: {type(hardlink_exc).__name__}: {hardlink_exc}\n"
+                                    f"symlink失败: {type(symlink_exc).__name__}: {symlink_exc}"
+                                ),
+                            )
             job_inputs[primary_key] = str(view_dir.resolve())
         else:
+            if is_parasol_jd_pair_module(module):
+                companion_file = find_parasol_companion_file(module, primary_path)
+                if companion_file is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"缺少配套输入文件: {primary_path.name}。"
+                            "MD 主文件必须配套 ML 文件，JD 主文件必须配套 JL 文件。"
+                        ),
+                    )
+                used_by_role.setdefault(primary_role, set()).add(str(companion_file.resolve()))
             job_inputs[primary_key] = str(primary_path.resolve())
         used_by_role[primary_role].add(str(primary_path.resolve()))
 

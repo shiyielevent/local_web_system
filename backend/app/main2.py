@@ -2014,7 +2014,8 @@ def is_python_source_runtime_module(module: dict, exe_path: Path) -> bool:
         return True
     if module.get("python_env_dir"):
         return True
-    if module.get("source_dir") and (module.get("entry_file") or module.get("entry_script")):
+    entry_hint = str(module.get("entry_script") or module.get("entry_file") or "").strip().lower()
+    if module.get("source_dir") and entry_hint.endswith(".py"):
         return True
     try:
         name = exe_path.name.lower()
