@@ -386,7 +386,13 @@ class TaskManager:
             request_cpus = max(1, min(128, int(request_cpus)))
         except Exception:
             request_cpus = 1
-        job_env.setdefault("LOCAL_WEB_HTCONDOR_REQUEST_CPUS", str(request_cpus))
+        # 只要调度器已经生成节点资源计划，就必须覆盖父进程环境里可能残留的
+        # 固定请求值。否则用户把节点设为 3 槽后，三个作业仍各自申请旧的
+        # 4096MB/4CPU，HTCondor 会因为资源不足只同时匹配一到两个作业。
+        if plan:
+            job_env["LOCAL_WEB_HTCONDOR_REQUEST_CPUS"] = str(request_cpus)
+        else:
+            job_env.setdefault("LOCAL_WEB_HTCONDOR_REQUEST_CPUS", str(request_cpus))
 
         request_memory_mb = plan.get("request_memory_mb")
         try:
@@ -398,14 +404,20 @@ class TaskManager:
                 target_machine,
                 process_slots=process_slots,
             )
-        job_env.setdefault("LOCAL_WEB_HTCONDOR_REQUEST_MEMORY_MB", str(max(1024, int(request_memory_mb))))
+        if plan:
+            job_env["LOCAL_WEB_HTCONDOR_REQUEST_MEMORY_MB"] = str(max(1024, int(request_memory_mb)))
+        else:
+            job_env.setdefault("LOCAL_WEB_HTCONDOR_REQUEST_MEMORY_MB", str(max(1024, int(request_memory_mb))))
 
         threads_per_exe = plan.get("threads_per_exe") or request_cpus
         try:
             threads_per_exe = max(1, int(threads_per_exe))
         except Exception:
             threads_per_exe = request_cpus
-        job_env.setdefault("LOCAL_WEB_HTCONDOR_THREADS_PER_EXE", str(threads_per_exe))
+        if plan:
+            job_env["LOCAL_WEB_HTCONDOR_THREADS_PER_EXE"] = str(threads_per_exe)
+        else:
+            job_env.setdefault("LOCAL_WEB_HTCONDOR_THREADS_PER_EXE", str(threads_per_exe))
         return job_env
 
 
@@ -1905,6 +1917,8 @@ class TaskManager:
                         "part_index": index + 1,
                         "part_total": total_parts,
                         "machine_part_index": int(job_chunk.get("machine_job_index") or 1),
+                        "machine_process_slots": int(job_chunk.get("machine_process_slots") or 1),
+                        "estimated_input_bytes": int(job_chunk.get("estimated_input_bytes") or 0),
                         "htcondor_max_files_per_job": max_files_per_job,
                         "file_patterns": self._module_file_patterns(module_item, split_input),
                         "output_mappings": output_mappings,
@@ -2491,9 +2505,10 @@ class TaskManager:
             spec_for_plan = entry.get("spec") if isinstance(entry, dict) else {}
             inputs_for_plan = spec_for_plan.get("inputs") if isinstance((spec_for_plan or {}).get("inputs"), dict) else {}
             machine_for_plan = str((spec_for_plan or {}).get("target_machine") or "").strip()
-            if machine_for_plan:
+            raw_entry_slots = inputs_for_plan.get("machine_process_slots")
+            if machine_for_plan and raw_entry_slots not in {None, ""}:
                 entry_slot_overrides[machine_for_plan] = self._clamp_htcondor_node_process_slot(
-                    inputs_for_plan.get("machine_process_slots", 1),
+                    raw_entry_slots,
                     default=1,
                 )
         resource_plans = self._htcondor_resource_plans(

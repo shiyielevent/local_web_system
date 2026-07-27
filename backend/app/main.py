@@ -3821,6 +3821,18 @@ def _infer_executable_inputs_from_config(param_json: dict, module_root: Path, mo
         value = param_json.get(key)
         value_text = str(value or "")
 
+        # manifest 显式指定的 input_key 就是模块主输入路径。
+        # 不能只依赖字段名包含 input_path/input_dir；很多旧模块只使用名为 input 的键。
+        if key == parallel_input_key and value_text:
+            value_path = Path(value_text)
+            if not value_path.is_absolute():
+                value_path = (module_root / value_path).resolve()
+            if value_path.exists():
+                item["type"] = "file_path" if value_path.is_file() else "dir_path"
+            elif not Path(value_text).suffix:
+                item["type"] = "dir_path"
+            item["io_role"] = "input"
+
         if item.get("type") in {"file_path", "dir_path"} and value_text:
             value_path = Path(value_text)
             if not value_path.is_absolute():
@@ -3862,7 +3874,7 @@ def _infer_executable_inputs_from_config(param_json: dict, module_root: Path, mo
             item["io_role"] = "input"
             if any(x in lower for x in ["input", "file", "dir", "folder", "输入"]):
                 batch_role = _infer_executable_batch_role_from_key(key, str(item.get("label") or ""))
-                if not batch_role and key == parallel_input_key and parallel_mode == "batch_group":
+                if not batch_role and key == parallel_input_key:
                     batch_role = str(parallel_cfg.get("batch_role") or "input").strip() or "input"
                 if batch_role:
                     item["batch_role"] = batch_role
