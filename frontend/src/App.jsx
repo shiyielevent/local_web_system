@@ -2717,7 +2717,10 @@ function HTCondorPage({
   const processSlotOptions = Array.from({ length: 8 }, (_, idx) => idx + 1);
 
   return (
-    <section style={{ display: 'grid', gap: 16, minHeight: 'calc(100vh - 98px)' }}>
+    <section
+      className="htcondor-page-layout"
+      style={{ display: 'grid', gap: 16, minHeight: 'calc(100vh - 98px)' }}
+    >
       <div style={{ ...styles.card, padding: 24 }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap', alignItems: 'center' }}>
           <div>
@@ -2793,13 +2796,13 @@ function HTCondorPage({
         </div>
       )}
 
-      <div style={{
+      <div className="htcondor-main-grid" style={{
         display: 'grid',
         gridTemplateColumns: 'minmax(340px, 0.92fr) minmax(330px, 0.88fr) minmax(430px, 1.2fr)',
         gap: 16,
         alignItems: 'stretch',
       }}>
-        <div style={commonColumnStyle}>
+        <div className="htcondor-main-column htcondor-status-column" style={commonColumnStyle}>
           {cardTitle('运行状态', '集中展示集群角色、节点数量和安装结果。')}
 
           <div style={{
@@ -2842,34 +2845,34 @@ function HTCondorPage({
             <div><strong style={{ color: '#17406b' }}>安装结果：</strong>{install.message || install.status || '暂无安装结果'}</div>
           </div>
 
-          <div style={{
-            marginTop: 12,
-            padding: '12px 12px',
-            borderRadius: 14,
-            background: '#ffffff',
-            border: '1px solid #dce8f3',
-          }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
-              <div>
-                <div style={{ fontSize: 16, fontWeight: 900, color: '#12385f' }}>节点信息、任务分配比例与进程槽</div>
-                <div style={{ marginTop: 4, fontSize: 12, color: '#64748b', lineHeight: 1.45 }}>
-                  默认按 CPU/内存生成建议权重；管理员可手动调整。权重只影响输入文件数量分配。
+          <div className="htcondor-node-scroll htcondor-column-scroll">
+            <div style={{
+              padding: '12px 12px',
+              borderRadius: 14,
+              background: '#ffffff',
+              border: '1px solid #dce8f3',
+            }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+                <div>
+                  <div style={{ fontSize: 16, fontWeight: 900, color: '#12385f' }}>节点信息、任务分配比例与进程槽</div>
+                  <div style={{ marginTop: 4, fontSize: 12, color: '#64748b', lineHeight: 1.45 }}>
+                    默认按 CPU/内存生成建议权重；管理员可手动调整。权重只影响输入文件数量分配。
+                  </div>
                 </div>
+                <select
+                  style={{ ...styles.input, width: 128, minHeight: 38, fontSize: 13 }}
+                  value={weightMode}
+                  disabled={!isAdmin}
+                  onChange={(e) => changeWeightMode(e.target.value)}
+                >
+                  <option value="weighted">按百分比分配</option>
+                  <option value="equal">平均分配</option>
+                </select>
               </div>
-              <select
-                style={{ ...styles.input, width: 128, minHeight: 38, fontSize: 13 }}
-                value={weightMode}
-                disabled={!isAdmin}
-                onChange={(e) => changeWeightMode(e.target.value)}
-              >
-                <option value="weighted">按百分比分配</option>
-                <option value="equal">平均分配</option>
-              </select>
-            </div>
 
-            {weightRows.length ? (
-              <div style={{ display: 'grid', gap: 8, marginTop: 10 }}>
-                {weightRows.map((node) => {
+              {weightRows.length ? (
+                <div style={{ display: 'grid', gap: 8, marginTop: 10 }}>
+                  {weightRows.map((node) => {
                   const machine = String(node.machine || '').trim();
                   const draftValue = nodeWeightsDraft[machine] ?? node.weight_percent ?? node.weight ?? node.suggested_weight_percent ?? node.suggested_weight ?? 0;
                   const draftProcessSlot = nodeProcessSlotsDraft[machine] ?? node.process_slots ?? node.suggested_process_slots ?? 1;
@@ -3001,8 +3004,8 @@ function HTCondorPage({
                       </div>
                     </div>
                   );
-                })}
-                <div style={{
+                  })}
+                  <div style={{
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'space-between',
@@ -3033,24 +3036,25 @@ function HTCondorPage({
                       保存分配比例与进程槽
                     </button>
                   </div>
+                  </div>
                 </div>
-              </div>
-            ) : (
-              <div style={{ marginTop: 10, color: '#64748b', fontSize: 13 }}>
-                暂未发现执行节点。启动父节点或加入子节点后，这里会显示节点分配比例设置。
-              </div>
-            )}
-          </div>
+              ) : (
+                <div style={{ marginTop: 10, color: '#64748b', fontSize: 13 }}>
+                  暂未发现执行节点。启动父节点或加入子节点后，这里会显示节点分配比例设置。
+                </div>
+              )}
+            </div>
 
-          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 'auto', paddingTop: 14 }}>
-            <button style={styles.blueBtn} disabled={!!busy} onClick={onRefresh}>刷新状态</button>
-            <button style={styles.whiteBtn} disabled={!!busy || !isAdmin} onClick={() => onSetMode('htcondor')}>启用 HTCondor 执行</button>
-            <button style={styles.whiteBtn} disabled={!!busy || !isAdmin} onClick={() => onSetMode('local')}>切回本机执行</button>
-            <button style={styles.whiteBtn} disabled={!!busy || !isAdmin} onClick={onSmokeTest}>提交自检任务</button>
+            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 'auto', paddingTop: 14 }}>
+              <button style={styles.blueBtn} disabled={!!busy} onClick={onRefresh}>刷新状态</button>
+              <button style={styles.whiteBtn} disabled={!!busy || !isAdmin} onClick={() => onSetMode('htcondor')}>启用 HTCondor 执行</button>
+              <button style={styles.whiteBtn} disabled={!!busy || !isAdmin} onClick={() => onSetMode('local')}>切回本机执行</button>
+              <button style={styles.whiteBtn} disabled={!!busy || !isAdmin} onClick={onSmokeTest}>提交自检任务</button>
+            </div>
           </div>
         </div>
 
-        <div style={commonColumnStyle}>
+        <div className="htcondor-main-column htcondor-column-scroll htcondor-cluster-scroll" style={commonColumnStyle}>
           {cardTitle('集群配置', '父节点负责调度，子节点负责执行。')}
 
           <div style={{ display: 'grid', gap: 10 }}>
@@ -3172,7 +3176,7 @@ function HTCondorPage({
           </div>
         </div>
 
-        <div style={commonColumnStyle}>
+        <div className="htcondor-main-column htcondor-queue-column" style={commonColumnStyle}>
           {cardTitle('队列和 Slot', '查看执行节点、队列和 WRITE 权限状态。')}
           <div style={{ display: 'grid', gap: 12 }}>
             {logBlock('执行节点列表', nodes.text, 120)}
@@ -5425,6 +5429,7 @@ async function uploadPythonFolder() {
 
     return (
       <section
+        className="tool-page-layout"
         style={{
           display: 'grid',
           gridTemplateColumns: '300px minmax(0, 1fr) 280px',
@@ -5433,6 +5438,7 @@ async function uploadPythonFolder() {
         }}
       >
         <div
+          className="tool-sidebar-column"
           style={{
             ...styles.card,
             height: 'calc(100vh - 98px)',
@@ -5491,7 +5497,7 @@ async function uploadPythonFolder() {
           </div>
         </div>
 
-        <div style={{ ...styles.card, padding: 22 }}>
+        <div className="tool-runtime-scroll" style={{ ...styles.card, padding: 22 }}>
           {selectedModule
               ? renderModuleRuntime(selectedModule)
               : <div style={{ padding: 20, color: '#999' }}>当前工具栏暂无可运行模块</div>}
@@ -6158,8 +6164,17 @@ function renderTaskManagementPage() {
   }
 
   return (
-    <div style={styles.page}>
-      <div style={styles.topbar}>
+    <div
+      className={
+        activeTab === 'htcondor'
+          ? 'htcondor-app-page'
+          : activeTab.startsWith('tool:')
+            ? 'tool-app-page'
+            : undefined
+      }
+      style={styles.page}
+    >
+      <div className="main-app-toolbar" style={styles.topbar}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 18, flexWrap: 'wrap', minWidth: 0, flex: '1 1 auto' }}>
           <div style={{ fontSize: 26, fontWeight: 900, whiteSpace: 'nowrap', flexShrink: 0 }}>云和气溶胶卫星遥感反演系统</div>
           <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', minWidth: 0 }}>
@@ -6187,6 +6202,13 @@ function renderTaskManagementPage() {
       </div>
 
       <div
+        className={
+          activeTab === 'htcondor'
+            ? 'htcondor-content-host'
+            : activeTab.startsWith('tool:')
+              ? 'tool-content-host'
+              : undefined
+        }
         style={{
           padding: 12,
           width: '100%',
@@ -6656,24 +6678,26 @@ function renderTaskManagementPage() {
         {activeTab === 'data_mgmt' && renderDataManagementPage()}
         {activeTab === 'tasks' && renderTaskManagementPage()}
         {activeTab === 'htcondor' && (
-          <HTCondorPage
-            isAdmin={isAdmin}
-            status={htcondorStatus}
-            busy={htcondorBusy}
-            message={htcondorMessage}
-            clusterForm={htcondorClusterForm}
-            setClusterForm={setHTCondorClusterForm}
-            onRefresh={() => refreshHTCondorStatus(false)}
-            onSetMode={handleHTCondorSetMode}
-            onSmokeTest={handleHTCondorSmokeTest}
-            onCreateParent={handleHTCondorCreateParent}
-            onJoinParent={handleHTCondorJoinParent}
-            onLeavePool={handleHTCondorLeavePool}
-            onSaveWeights={handleHTCondorSaveWeights}
-            onPrepareShare={handleHTCondorPrepareShare}
-            onShowShares={handleHTCondorShowShares}
-            onTestShare={handleHTCondorTestShare}
-          />
+          <div className="htcondor-page-scale">
+            <HTCondorPage
+              isAdmin={isAdmin}
+              status={htcondorStatus}
+              busy={htcondorBusy}
+              message={htcondorMessage}
+              clusterForm={htcondorClusterForm}
+              setClusterForm={setHTCondorClusterForm}
+              onRefresh={() => refreshHTCondorStatus(false)}
+              onSetMode={handleHTCondorSetMode}
+              onSmokeTest={handleHTCondorSmokeTest}
+              onCreateParent={handleHTCondorCreateParent}
+              onJoinParent={handleHTCondorJoinParent}
+              onLeavePool={handleHTCondorLeavePool}
+              onSaveWeights={handleHTCondorSaveWeights}
+              onPrepareShare={handleHTCondorPrepareShare}
+              onShowShares={handleHTCondorShowShares}
+              onTestShare={handleHTCondorTestShare}
+            />
+          </div>
         )}
       </div>
 

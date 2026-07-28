@@ -28,7 +28,11 @@ $DetectScript = Join-Path $BackendDir "detect_resources.py"
 $FingerprintFile = Join-Path $VenvDir ".local_web_env.json"
 
 $TargetPythonVersion = "3.12.4"
+$TargetNodeVersion = "22.23.1"
+$MinimumNodeMajorVersion = 18
 $SystemUrl = "http://127.0.0.1:8000"
+$ThirdPartyDir = Join-Path $ProjectRoot "third_party"
+$PrerequisiteLogDir = Join-Path $BackendDir "logs\prerequisites"
 
 # HTCondor is bundled with the project and installed once on first system start.
 $HTCondorBundleDir = Join-Path $ProjectRoot "third_party\htcondor"
@@ -863,6 +867,24 @@ function Get-PythonVersion([string]$PythonExe) {
     }
 }
 
+function Assert-TrustedBundledInstaller([string]$InstallerPath) {
+    if (
+        -not $InstallerPath -or
+        -not (Test-Path -LiteralPath $InstallerPath -PathType Leaf)
+    ) {
+        throw "Bundled installer was not found: $InstallerPath"
+    }
+
+    $signature = Get-AuthenticodeSignature -LiteralPath $InstallerPath
+
+    if ($signature.Status -ne "Valid") {
+        throw (
+            "Bundled installer signature validation failed: " +
+            "$InstallerPath; status=$($signature.Status)"
+        )
+    }
+}
+
 function Find-ExactPython([string]$ExpectedVersion) {
     $candidates = New-Object System.Collections.Generic.List[string]
 
@@ -886,6 +908,7 @@ function Find-ExactPython([string]$ExpectedVersion) {
         "C:\ProgramData\Anaconda3\python.exe",
         "$env:USERPROFILE\anaconda3\python.exe",
         "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe",
+        "$env:ProgramFiles\Python312\python.exe",
         "C:\Python312\python.exe"
     )) {
         if ($candidate) {
@@ -911,6 +934,87 @@ function Find-ExactPython([string]$ExpectedVersion) {
     }
 
     return ""
+}
+
+function Find-BundledPythonInstaller {
+    $fileName = "python-$TargetPythonVersion-amd64.exe"
+    $candidates = @(
+        (Join-Path $ThirdPartyDir "python\$fileName"),
+        # Keep compatibility with the existing directory name.
+        (Join-Path $ThirdPartyDir "pyhton\$fileName"),
+        (Join-Path $ThirdPartyDir $fileName)
+    )
+
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            return $candidate
+        }
+    }
+
+    return ""
+}
+
+function Install-BundledPython {
+    $installer = Find-BundledPythonInstaller
+
+    if (-not $installer) {
+        return ""
+    }
+
+    Write-Step "Install bundled Python $TargetPythonVersion"
+    Write-Info "Installer: $installer"
+
+    Assert-TrustedBundledInstaller -InstallerPath $installer
+
+    New-Item `
+        -ItemType Directory `
+        -Force `
+        -Path $PrerequisiteLogDir |
+        Out-Null
+
+    $logPath = Join-Path `
+        $PrerequisiteLogDir `
+        "python-$TargetPythonVersion-install.log"
+
+    $arguments = @(
+        "/quiet",
+        "/log",
+        ('"{0}"' -f $logPath),
+        "InstallAllUsers=0",
+        "PrependPath=1",
+        "Include_pip=1",
+        "Include_launcher=0",
+        "Include_test=0",
+        "SimpleInstall=1",
+        "Shortcuts=0"
+    )
+
+    $process = Start-Process `
+        -FilePath $installer `
+        -ArgumentList $arguments `
+        -Wait `
+        -PassThru
+
+    if (@(0, 3010) -notcontains [int]$process.ExitCode) {
+        throw (
+            "Bundled Python installation failed with exit code " +
+            "$($process.ExitCode). Log: $logPath"
+        )
+    }
+
+    $pythonExe = Find-ExactPython $TargetPythonVersion
+
+    if (-not $pythonExe) {
+        throw (
+            "Bundled Python installer completed, but Python " +
+            "$TargetPythonVersion could not be found."
+        )
+    }
+
+    Write-Ok "Bundled Python $TargetPythonVersion is ready."
+    Write-Info "Python: $pythonExe"
+
+    return $pythonExe
 }
 
 function Find-CondaExe {
@@ -983,6 +1087,10 @@ function New-ProjectEnvironment {
     Write-Step "Create backend\.venv with Python $TargetPythonVersion"
 
     $basePython = Find-ExactPython $TargetPythonVersion
+
+    if (-not $basePython) {
+        $basePython = Install-BundledPython
+    }
 
     if ($basePython) {
         Write-Info "Found Python: $basePython"
@@ -1217,18 +1325,183 @@ function Ensure-PythonEnvironment {
 # Frontend dependency and build management
 # ---------------------------------------------------------------------------
 
+function Get-NodeVersionForNpm([string]$NpmCommand) {
+    if (
+        -not $NpmCommand -or
+        -not (Test-Path -LiteralPath $NpmCommand -PathType Leaf)
+    ) {
+        return ""
+    }
+
+    $nodeExe = Join-Path (Split-Path -Parent $NpmCommand) "node.exe"
+
+    if (-not (Test-Path -LiteralPath $nodeExe -PathType Leaf)) {
+        return ""
+    }
+
+    try {
+        return ((& $nodeExe --version 2>$null) | Out-String).Trim()
+    }
+    catch {
+        return ""
+    }
+}
+
+function Test-CompatibleNpmCommand([string]$NpmCommand) {
+    $version = Get-NodeVersionForNpm -NpmCommand $NpmCommand
+
+    if ($version -notmatch '^v(\d+)') {
+        return $false
+    }
+
+    return [int]$Matches[1] -ge $MinimumNodeMajorVersion
+}
+
+function Find-CompatibleNpmCommand {
+    $candidates = New-Object System.Collections.Generic.List[string]
+
+    foreach ($commandName in @("npm.cmd", "npm")) {
+        try {
+            $command = Get-Command $commandName -ErrorAction Stop
+            if ($command.Source) {
+                [void]$candidates.Add([string]$command.Source)
+            }
+        }
+        catch {}
+    }
+
+    foreach ($candidate in @(
+        "$env:ProgramFiles\nodejs\npm.cmd",
+        "$env:LOCALAPPDATA\Programs\nodejs\npm.cmd"
+    )) {
+        if ($candidate) {
+            [void]$candidates.Add($candidate)
+        }
+    }
+
+    $programFilesX86 = [Environment]::GetEnvironmentVariable(
+        "ProgramFiles(x86)"
+    )
+
+    if ($programFilesX86) {
+        [void]$candidates.Add(
+            (Join-Path $programFilesX86 "nodejs\npm.cmd")
+        )
+    }
+
+    foreach ($candidate in ($candidates | Select-Object -Unique)) {
+        if (Test-CompatibleNpmCommand -NpmCommand $candidate) {
+            $nodeDir = Split-Path -Parent $candidate
+            $pathEntries = @($env:PATH -split ";" | Where-Object { $_ })
+
+            if ($pathEntries -notcontains $nodeDir) {
+                $env:PATH = "$nodeDir;$env:PATH"
+            }
+
+            return $candidate
+        }
+    }
+
+    return ""
+}
+
+function Find-BundledNodeInstaller {
+    $fileName = "node-v$TargetNodeVersion-x64.msi"
+    $candidates = @(
+        (Join-Path $ThirdPartyDir "node\$fileName"),
+        (Join-Path $ThirdPartyDir $fileName)
+    )
+
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            return $candidate
+        }
+    }
+
+    return ""
+}
+
+function Install-BundledNode {
+    $installer = Find-BundledNodeInstaller
+
+    if (-not $installer) {
+        throw (
+            "Node.js $TargetNodeVersion or newer was not found, and the " +
+            "bundled installer is missing."
+        )
+    }
+
+    Write-Step "Install bundled Node.js $TargetNodeVersion"
+    Write-Info "Installer: $installer"
+    Write-Info "Windows will request administrator approval."
+
+    Assert-TrustedBundledInstaller -InstallerPath $installer
+
+    New-Item `
+        -ItemType Directory `
+        -Force `
+        -Path $PrerequisiteLogDir |
+        Out-Null
+
+    $logPath = Join-Path `
+        $PrerequisiteLogDir `
+        "node-$TargetNodeVersion-install.log"
+
+    $msiexec = Join-Path $env:SystemRoot "System32\msiexec.exe"
+    $arguments = (
+        "/i `"$installer`" /qn /norestart " +
+        "/L*v `"$logPath`""
+    )
+
+    try {
+        $process = Start-Process `
+            -FilePath $msiexec `
+            -ArgumentList $arguments `
+            -Verb RunAs `
+            -WindowStyle Hidden `
+            -Wait `
+            -PassThru
+    }
+    catch {
+        throw (
+            "Node.js installation requires Windows administrator approval. " +
+            $_.Exception.Message
+        )
+    }
+
+    if (@(0, 1641, 3010) -notcontains [int]$process.ExitCode) {
+        throw (
+            "Bundled Node.js installation failed with exit code " +
+            "$($process.ExitCode). Log: $logPath"
+        )
+    }
+
+    $npm = Find-CompatibleNpmCommand
+
+    if (-not $npm) {
+        throw (
+            "Bundled Node.js installer completed, but a compatible " +
+            "node.exe/npm.cmd installation could not be found."
+        )
+    }
+
+    Write-Ok "Bundled Node.js is ready."
+    Write-Info "Node: $(Get-NodeVersionForNpm -NpmCommand $npm)"
+    Write-Info "npm: $npm"
+
+    return $npm
+}
+
 function Find-NpmCommand {
-    $npm = Get-Command npm.cmd -ErrorAction SilentlyContinue
+    $npm = Find-CompatibleNpmCommand
 
-    if (-not $npm) {
-        $npm = Get-Command npm -ErrorAction SilentlyContinue
+    if ($npm) {
+        Write-Info "Node: $(Get-NodeVersionForNpm -NpmCommand $npm)"
+        Write-Info "npm: $npm"
+        return $npm
     }
 
-    if (-not $npm) {
-        throw "npm was not found. Install Node.js and run the launcher again."
-    }
-
-    return $npm.Source
+    return (Install-BundledNode)
 }
 
 function Get-FrontendPackageHash {
@@ -1769,22 +2042,17 @@ try {
     }
 
     Ensure-HTCondorInstalled
-$venvPythonOutput = @(Ensure-PythonEnvironment)
+    Ensure-PythonEnvironment | Out-Null
 
-$venvPython = $venvPythonOutput |
-    Where-Object {
-        $_ -is [string] -and
-        $_.Trim() -and
-        (Test-Path -LiteralPath $_.Trim() -PathType Leaf) -and
-        ($_.Trim().ToLower().EndsWith("python.exe"))
-    } |
-    Select-Object -Last 1
+    $venvPython = [string](Get-VenvPython)
 
-$venvPython = [string]$venvPython
+    if (
+        -not $venvPython -or
+        -not (Test-Path -LiteralPath $venvPython -PathType Leaf)
+    ) {
+        throw "Ensure-PythonEnvironment did not create a valid python.exe path."
+    }
 
-if (-not $venvPython) {
-    throw "Ensure-PythonEnvironment did not return a valid python.exe path."
-}
     Add-HTCondorBinToProcessPath
     Set-BackendRuntimeEnvironment -VenvPython $venvPython
 
@@ -1799,11 +2067,61 @@ if (-not $venvPython) {
     exit $serverExitCode
 }
 catch {
+    $errorRecord = $_
+    $errorMessage = [string]$errorRecord.Exception.Message
+    $errorInvocation = $errorRecord.InvocationInfo
+    $errorLine = if ($null -ne $errorInvocation) {
+        [int]$errorInvocation.ScriptLineNumber
+    }
+    else {
+        0
+    }
+    $errorCommand = if (
+        $null -ne $errorInvocation -and
+        $null -ne $errorInvocation.MyCommand
+    ) {
+        [string]$errorInvocation.MyCommand.Name
+    }
+    else {
+        ""
+    }
+    $errorPosition = if ($null -ne $errorInvocation) {
+        [string]$errorInvocation.PositionMessage
+    }
+    else {
+        ""
+    }
+    $errorStack = [string]$errorRecord.ScriptStackTrace
+    $bootstrapErrorLog = Join-Path $BackendDir "logs\bootstrap_error_latest.txt"
+
+    New-Item `
+        -ItemType Directory `
+        -Force `
+        -Path (Split-Path -Parent $bootstrapErrorLog) |
+        Out-Null
+
+    @(
+        "local_web_module_system bootstrap error"
+        "time=$([DateTime]::Now.ToString('s'))"
+        "type=$($errorRecord.Exception.GetType().FullName)"
+        "message=$errorMessage"
+        "line=$errorLine"
+        "command=$errorCommand"
+        ""
+        "position:"
+        $errorPosition
+        ""
+        "stack:"
+        $errorStack
+    ) | Set-Content -LiteralPath $bootstrapErrorLog -Encoding UTF8
+
     Write-Host ""
     Write-Host (
         "[ERROR] " +
-        $_.Exception.Message
+        $errorMessage +
+        " [line=$errorLine; command=$errorCommand]"
     ) -ForegroundColor Red
+    Write-Info "Error details: $bootstrapErrorLog"
 
     exit 1
 }
