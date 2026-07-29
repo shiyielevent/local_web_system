@@ -1379,7 +1379,7 @@ function TaskWindow({ win, onMin, onClose, onFront, onMove, onStop }) {
           )}
           {Array.isArray(task?.temporary_outputs) && task.temporary_outputs.length > 0 && (
             <div style={{ marginTop: 8 }}>
-              <strong>临时输出：</strong>{task.temporary_outputs.length} 个，父任务成功后登记到数据管理
+              <strong>临时输出：</strong>{task.temporary_outputs.length} 个，父任务结束后登记到数据管理；取消任务会标记为部分结果
               <div style={{ color: '#5f7088', fontSize: 12, marginTop: 4, maxHeight: 56, overflow: 'auto' }}>
                 {task.temporary_outputs.slice(0, 5).map((item) => item.name || item.path).join('；')}
                 {task.temporary_outputs.length > 5 ? `；...还有 ${task.temporary_outputs.length - 5} 个` : ''}
@@ -2435,9 +2435,9 @@ function HTCondorPage({
       display: 'inline-flex',
       alignItems: 'center',
       gap: 6,
-      padding: '5px 8px',
+      padding: '6px 10px',
       borderRadius: 999,
-      fontSize: 11,
+      fontSize: 12,
       fontWeight: 800,
       background: pending ? '#fef3c7' : (ok ? '#dcfce7' : '#fee2e2'),
       color: pending ? '#92400e' : (ok ? '#166534' : '#991b1b'),
@@ -2454,23 +2454,16 @@ function HTCondorPage({
   );
 
   const cardTitle = (text, subText = '') => (
-    <div style={{ minHeight: 48, marginBottom: 14 }}>
-      <div style={{ fontSize: 23, fontWeight: 900, color: '#12385f', lineHeight: 1.2 }}>{text}</div>
-      {subText && <div style={{ marginTop: 6, color: '#64748b', fontSize: 14, lineHeight: 1.5 }}>{subText}</div>}
-    </div>
-  );
-
-  const compactCardTitle = (text, subText = '') => (
-    <div style={{ minHeight: 34, marginBottom: 8 }}>
+    <div style={{ minHeight: 44, marginBottom: 12 }}>
       <div style={{ fontSize: 20, fontWeight: 900, color: '#12385f', lineHeight: 1.2 }}>{text}</div>
-      {subText && <div style={{ marginTop: 4, color: '#64748b', fontSize: 12, lineHeight: 1.35 }}>{subText}</div>}
+      {subText && <div style={{ marginTop: 5, color: '#64748b', fontSize: 13, lineHeight: 1.45 }}>{subText}</div>}
     </div>
   );
 
   const statCard = (label, value, tone = 'normal') => (
     <div style={{
-      minHeight: 56,
-      padding: '8px 10px',
+      minHeight: 66,
+      padding: '10px 12px',
       borderRadius: 14,
       border: tone === 'danger'
         ? '1px solid #fecaca'
@@ -2485,7 +2478,7 @@ function HTCondorPage({
     }}>
       <div style={{ fontSize: 12, color: '#6a7f96', fontWeight: 800 }}>{label}</div>
       <div style={{
-        marginTop: 4,
+        marginTop: 5,
         fontWeight: 900,
         color: tone === 'danger' ? '#b91c1c' : (tone === 'warning' ? '#a16207' : '#173b61'),
         overflowWrap: 'anywhere',
@@ -2500,8 +2493,8 @@ function HTCondorPage({
 
   const infoCard = (label, value) => (
     <div style={{
-      minHeight: 78,
-      padding: '9px 12px',
+      minHeight: 92,
+      padding: '10px 12px',
       borderRadius: 14,
       border: '1px solid #dce8f3',
       background: '#fff',
@@ -2509,12 +2502,12 @@ function HTCondorPage({
     }}>
       <div style={{ fontSize: 12, color: '#6a7f96', fontWeight: 800 }}>{label}</div>
       <div style={{
-        marginTop: 4,
+        marginTop: 5,
         fontWeight: 900,
         color: '#173b61',
         overflowWrap: 'anywhere',
         whiteSpace: 'pre-wrap',
-        lineHeight: 1.35,
+        lineHeight: 1.45,
         fontSize: 13,
       }}>
         {value || '-'}
@@ -2546,11 +2539,10 @@ function HTCondorPage({
     ...styles.card,
     padding: 18,
     height: '100%',
-    minHeight: 620,
+    minHeight: 640,
     boxSizing: 'border-box',
     display: 'flex',
     flexDirection: 'column',
-    fontSize: 15,
   };
 
   const weightPlan = info.node_weight_plan || info.node_weight_config || {};
@@ -2727,17 +2719,17 @@ function HTCondorPage({
   return (
     <section
       className="htcondor-page-layout"
-      style={{ display: 'grid', gap: 12, minHeight: 'calc(100vh - 98px)' }}
+      style={{ display: 'grid', gap: 16, minHeight: 'calc(100vh - 98px)' }}
     >
-      <div style={{ ...styles.card, padding: '10px 18px' }}>
+      <div style={{ ...styles.card, padding: 24 }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap', alignItems: 'center' }}>
           <div>
-            <div style={{ fontSize: 26, fontWeight: 900, color: '#12385f' }}>HTCondor 分布式</div>
-            <div style={{ marginTop: 5, color: '#5c7189', lineHeight: 1.45, fontSize: 13 }}>
+            <div style={{ fontSize: 28, fontWeight: 900, color: '#12385f' }}>HTCondor 分布式</div>
+            <div style={{ marginTop: 8, color: '#5c7189', lineHeight: 1.7 }}>
               当前接入 HTCondor 提交与执行模式，用于父节点调度、子节点执行和多节点任务分配。
             </div>
           </div>
-          <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
             {okBadge(info.install_validated, '一键安装已验证', '安装未完全验证')}
             {okBadge(info.service_running, 'Condor 服务运行中', 'Condor 服务未运行')}
             {poolRole === 'child' && okBadge(
@@ -2806,31 +2798,47 @@ function HTCondorPage({
 
       <div className="htcondor-main-grid" style={{
         display: 'grid',
-        gridTemplateColumns: 'minmax(500px, 1fr) minmax(500px, 1fr)',
-        gap: 18,
+        gridTemplateColumns: 'minmax(340px, 0.92fr) minmax(330px, 0.88fr) minmax(430px, 1.2fr)',
+        gap: 16,
         alignItems: 'stretch',
       }}>
         <div className="htcondor-main-column htcondor-status-column" style={commonColumnStyle}>
-          {compactCardTitle('运行状态', `HTCondor 版本：${shortVersion || '-'}`)}
+          {cardTitle('运行状态', '集中展示集群角色、节点数量和安装结果。')}
 
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 8 }}>
+          <div style={{
+            padding: '10px 12px',
+            borderRadius: 14,
+            border: '1px solid #dce8f3',
+            background: 'linear-gradient(135deg, #ffffff 0%, #f5f9ff 100%)',
+            marginBottom: 10,
+          }}>
+            <div style={{ fontSize: 12, color: '#6a7f96', fontWeight: 800 }}>HTCondor 版本</div>
+            <div style={{ marginTop: 5, fontSize: 14, fontWeight: 900, color: '#173b61', overflowWrap: 'anywhere' }}>
+              {shortVersion || '-'}
+            </div>
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 10 }}>
             {statCard('运行模式', mode === 'htcondor' ? 'HTCondor 分布式执行' : '本机 local')}
             {statCard('集群状态', clusterStatusText, clusterStatusTone)}
             {statCard('节点数量', String(nodeCount))}
-            {statCard('当前角色', roleText, roleTone)}
-            {statCard('父节点信息', parentInfo)}
-            {statCard('子节点信息', childInfo)}
+            {statCard('当前节点角色', roleText, roleTone)}
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginTop: 10 }}>
+            {infoCard('父节点信息', parentInfo)}
+            {infoCard('子节点信息', childInfo)}
           </div>
 
           <div style={{
-            marginTop: 7,
-            padding: '7px 10px',
+            marginTop: 10,
+            padding: '10px 12px',
             borderRadius: 12,
             background: '#f8fbff',
             border: '1px dashed #cfe0f2',
             color: '#5b6f86',
-            fontSize: 12,
-            lineHeight: 1.4,
+            fontSize: 13,
+            lineHeight: 1.55,
           }}>
             <div><strong style={{ color: '#17406b' }}>当前机器：</strong>{info.machine || '-'}</div>
             <div><strong style={{ color: '#17406b' }}>服务状态：</strong>{service.state || (info.service_running ? 'running' : 'stopped')}</div>
@@ -2839,21 +2847,20 @@ function HTCondorPage({
 
           <div className="htcondor-node-scroll htcondor-column-scroll">
             <div style={{
-              padding: '16px 18px',
+              padding: '12px 12px',
               borderRadius: 14,
-              background: 'linear-gradient(135deg, #ffffff 0%, #f3f8ff 100%)',
-              border: '2px solid #c6dcf3',
-              boxShadow: '0 10px 26px rgba(30, 87, 139, 0.08)',
+              background: '#ffffff',
+              border: '1px solid #dce8f3',
             }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
                 <div>
-                  <div style={{ fontSize: 19, fontWeight: 900, color: '#12385f' }}>节点信息、任务分配比例与进程槽</div>
-                  <div style={{ marginTop: 6, fontSize: 14, color: '#64748b', lineHeight: 1.55 }}>
+                  <div style={{ fontSize: 16, fontWeight: 900, color: '#12385f' }}>节点信息、任务分配比例与进程槽</div>
+                  <div style={{ marginTop: 4, fontSize: 12, color: '#64748b', lineHeight: 1.45 }}>
                     默认按 CPU/内存生成建议权重；管理员可手动调整。权重只影响输入文件数量分配。
                   </div>
                 </div>
                 <select
-                  style={{ ...styles.input, width: 144, minHeight: 42, fontSize: 14, fontWeight: 800 }}
+                  style={{ ...styles.input, width: 128, minHeight: 38, fontSize: 13 }}
                   value={weightMode}
                   disabled={!isAdmin}
                   onChange={(e) => changeWeightMode(e.target.value)}
@@ -2876,28 +2883,28 @@ function HTCondorPage({
                       key={machine || node.name}
                       style={{
                         display: 'grid',
-                        gridTemplateColumns: 'minmax(0, 1.2fr) 0.66fr 0.86fr 168px 104px',
-                        gap: 10,
+                        gridTemplateColumns: 'minmax(0, 1.12fr) 0.7fr 0.78fr 144px 92px',
+                        gap: 8,
                         alignItems: 'center',
-                        padding: '11px 12px',
+                        padding: '9px 10px',
                         borderRadius: 12,
                         border: '1px solid #e3edf7',
                         background: isCurrent ? '#f0f7ff' : '#f8fbff',
                       }}
                     >
                       <div style={{ minWidth: 0 }}>
-                        <div style={{ fontWeight: 900, color: '#17406b', overflowWrap: 'anywhere', fontSize: 14 }}>
+                        <div style={{ fontWeight: 900, color: '#17406b', overflowWrap: 'anywhere', fontSize: 13 }}>
                           {machine || '-'}{isCurrent ? '（本机）' : ''}
                         </div>
-                        <div style={{ marginTop: 3, fontSize: 13, color: '#64748b' }}>
+                        <div style={{ marginTop: 3, fontSize: 12, color: '#64748b' }}>
                           {node.state || '-'} / {node.activity || '-'}
                         </div>
                       </div>
-                      <div style={{ fontSize: 13, color: '#475569', lineHeight: 1.45 }}>
+                      <div style={{ fontSize: 12, color: '#475569', lineHeight: 1.45 }}>
                         <div>CPU：{node.cpus || '-'}</div>
                         <div>内存：{memGb}GB</div>
                       </div>
-                      <div style={{ fontSize: 13, color: '#475569', lineHeight: 1.45 }}>
+                      <div style={{ fontSize: 12, color: '#475569', lineHeight: 1.45 }}>
                         <div>比例建议：<strong style={{ color: '#17406b' }}>{node.suggested_weight_percent ?? node.suggested_weight ?? 0}%</strong></div>
                         <div>槽建议：<strong style={{ color: '#17406b' }}>{node.suggested_process_slots || 1}</strong></div>
                         <div>来源：{node.source === 'manual' ? '手动' : (node.source === 'equal' ? '平均' : '建议')}</div>
@@ -3032,7 +3039,7 @@ function HTCondorPage({
                   </div>
                 </div>
               ) : (
-                <div style={{ marginTop: 14, color: '#64748b', fontSize: 14, lineHeight: 1.65 }}>
+                <div style={{ marginTop: 10, color: '#64748b', fontSize: 13 }}>
                   暂未发现执行节点。启动父节点或加入子节点后，这里会显示节点分配比例设置。
                 </div>
               )}
@@ -3153,13 +3160,13 @@ function HTCondorPage({
 
           <div style={{
             marginTop: 'auto',
-            padding: '16px 18px',
+            padding: '14px 16px',
             borderRadius: 14,
             background: '#f8fbff',
             border: '1px dashed #cfe0f2',
             color: '#5b6f86',
             lineHeight: 1.7,
-            fontSize: 14,
+            fontSize: 13,
           }}>
             <div style={{ fontWeight: 900, color: '#17406b', marginBottom: 6 }}>操作说明</div>
             <div>1. 父节点点击“启动集群”。</div>
@@ -3169,6 +3176,15 @@ function HTCondorPage({
           </div>
         </div>
 
+        <div className="htcondor-main-column htcondor-queue-column" style={commonColumnStyle}>
+          {cardTitle('队列和 Slot', '查看执行节点、队列和 WRITE 权限状态。')}
+          <div style={{ display: 'grid', gap: 12 }}>
+            {logBlock('执行节点列表', nodes.text, 120)}
+            {logBlock('condor_status', slot.text, 190)}
+            {logBlock('condor_q', queue.text, 165)}
+            {logBlock('condor_ping WRITE', ping.text, 120)}
+          </div>
+        </div>
       </div>
     </section>
   );
@@ -5356,26 +5372,48 @@ async function uploadPythonFolder() {
   }
 
   function renderInstalledModulesTree() {
+    const toolbarCount = Math.max(visibleToolbars.length, 1);
+
     return (
       <div
+        className="installed-modules-split"
         style={{
           display: 'grid',
-          gap: 10,
-          marginTop: 12,
+          gridTemplateRows: `repeat(${toolbarCount}, minmax(0, 1fr))`,
+          gap: 12,
           flex: 1,
           minHeight: 0,
-          overflow: 'auto',
-          alignContent: 'start',
-          paddingRight: 4,
+          overflow: 'hidden',
         }}
       >
         {visibleToolbars.map((tb) => {
           const list = modulesByTool[tb.key] || [];
           const expanded = expandedToolTypes[tb.key] !== false;
           return (
-            <div key={tb.key} style={{ border: '1px solid #d6e2ef', background: '#fff', borderRadius: 12, overflow: 'hidden' }}>
+            <div
+              key={tb.key}
+              className="installed-module-group"
+              style={{
+                border: '1px solid #d6e2ef',
+                background: '#fff',
+                borderRadius: 12,
+                overflow: 'hidden',
+                minHeight: 0,
+                display: 'flex',
+                flexDirection: 'column',
+              }}
+            >
               <button
-                style={{ ...styles.whiteBtn, width: '100%', border: 'none', borderRadius: 0, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
+                style={{
+                  ...styles.whiteBtn,
+                  width: '100%',
+                  border: 'none',
+                  borderRadius: 0,
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  flexShrink: 0,
+                }}
                 onClick={() => setExpandedToolTypes((prev) => ({ ...prev, [tb.key]: !expanded }))}
               >
                 <span>{expanded ? '▼' : '▶'} {tb.label}</span>
@@ -5383,7 +5421,21 @@ async function uploadPythonFolder() {
               </button>
 
               {expanded && (
-                <div style={{ padding: 10, display: 'grid', gap: 10 }}>
+                <div
+                  className="installed-module-group-scroll"
+                  style={{
+                    padding: 10,
+                    display: 'grid',
+                    gap: 10,
+                    alignContent: 'start',
+                    flex: 1,
+                    minHeight: 0,
+                    overflowX: 'hidden',
+                    overflowY: 'scroll',
+                    overscrollBehaviorY: 'contain',
+                    scrollbarGutter: 'stable',
+                  }}
+                >
                   {list.length === 0 && <div style={{ color: '#9aa8b8', fontSize: 13 }}>暂无模块</div>}
                   {list.map((m) => (
                     <div key={m.id} style={{ border: '1px solid #e2ebf5', background: '#fbfdff', borderRadius: 10, padding: 10 }}>
@@ -5641,7 +5693,7 @@ function renderDataManagementPage() {
                 数据管理
               </div>
               <div style={{ color: '#6a7f96', marginTop: 4, fontSize: 13 }}>
-                只展示模块运行成功后登记的输出文件；文件仍保留在原始输出路径，不会被移动。
+                展示任务正常完成或取消前已经生成的输出文件；取消任务的文件会标记为部分结果，文件仍保留在原始输出路径。
               </div>
             </div>
 
@@ -5665,6 +5717,7 @@ function renderDataManagementPage() {
                   <th style={{...thStyle, width: 250}}>文件名</th>
                   <th style={{...thStyle, width: 78}}>类型</th>
                   <th style={{...thStyle, width: 150}}>所属模块</th>
+                  <th style={{...thStyle, width: 125}}>任务状态</th>
                   <th style={{...thStyle, width: 88}}>大小</th>
                   <th style={{...thStyle, width: 145}}>创建时间</th>
                   <th style={thStyle}>本地路径</th>
@@ -5675,7 +5728,7 @@ function renderDataManagementPage() {
               <tbody>
                 {dataFiles.length === 0 && (
                   <tr>
-                    <td style={tdStyle} colSpan={isAdmin ? 9 : 8}>
+                    <td style={tdStyle} colSpan={isAdmin ? 10 : 9}>
                       暂无输出结果文件。运行模块后，系统会自动登记输出路径下的文件。
                     </td>
                   </tr>
@@ -5702,6 +5755,23 @@ function renderDataManagementPage() {
                     <td style={tdStyle}>{file.file_type}</td>
                     <td style={tdEllipsisStyle} title={file.module_name || file.module_id || '-'}>
                       {file.module_name || file.module_id}
+                    </td>
+                    <td style={tdStyle}>
+                      <span
+                        title={file.task_status === 'cancelled' ? '任务取消前已经生成的文件，可能不是完整结果' : '任务正常完成后登记的结果'}
+                        style={{
+                          display: 'inline-block',
+                          padding: '4px 8px',
+                          borderRadius: 999,
+                          whiteSpace: 'nowrap',
+                          fontSize: 12,
+                          fontWeight: 800,
+                          color: file.task_status === 'cancelled' ? '#9a3412' : '#166534',
+                          background: file.task_status === 'cancelled' ? '#ffedd5' : '#dcfce7',
+                        }}
+                      >
+                        {file.task_status === 'cancelled' ? '已取消·部分结果' : '已完成'}
+                      </span>
                     </td>
                     <td style={tdStyle}>{file.size_text || file.size}</td>
                     <td style={tdStyle}>{file.created_at || '-'}</td>
@@ -6154,7 +6224,9 @@ function renderTaskManagementPage() {
           ? 'htcondor-app-page'
           : activeTab.startsWith('tool:')
             ? 'tool-app-page'
-            : undefined
+            : activeTab === 'module_mgmt' && moduleMgmtAction === 'installed_modules'
+              ? 'module-installed-app-page'
+              : undefined
       }
       style={styles.page}
     >
@@ -6191,7 +6263,9 @@ function renderTaskManagementPage() {
             ? 'htcondor-content-host'
             : activeTab.startsWith('tool:')
               ? 'tool-content-host'
-              : undefined
+              : activeTab === 'module_mgmt' && moduleMgmtAction === 'installed_modules'
+                ? 'module-installed-content-host'
+                : undefined
         }
         style={{
           padding: 12,
@@ -6204,6 +6278,7 @@ function renderTaskManagementPage() {
       >
         {activeTab === 'module_mgmt' && isAdmin && (
           <section
+            className={moduleMgmtAction === 'installed_modules' ? 'module-installed-section' : undefined}
             style={{
               ...styles.card,
               padding: 16,
@@ -6212,6 +6287,7 @@ function renderTaskManagementPage() {
             }}
           >
             <div
+              className={moduleMgmtAction === 'installed_modules' ? 'module-installed-layout' : undefined}
               style={{
                 display: 'grid',
                 gridTemplateColumns: '380px minmax(0, 1fr)',
@@ -6221,7 +6297,10 @@ function renderTaskManagementPage() {
                 alignItems: 'stretch',
               }}
             >
-              <div style={{ ...styles.card, padding: 16 }}>
+              <div
+                className={moduleMgmtAction === 'installed_modules' ? 'module-installed-sidebar' : undefined}
+                style={{ ...styles.card, padding: 16 }}
+              >
                 <div style={{ fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 16 }}>
                   集成管理功能
                 </div>
@@ -6246,7 +6325,10 @@ function renderTaskManagementPage() {
                 </div>
               </div>
 
-              <div style={{ display: 'grid', gap: 16, minWidth: 0, minHeight: 'calc(100vh - 130px)', alignItems: 'stretch' }}>
+              <div
+                className={moduleMgmtAction === 'installed_modules' ? 'module-installed-main' : undefined}
+                style={{ display: 'grid', gap: 16, minWidth: 0, minHeight: 'calc(100vh - 130px)', alignItems: 'stretch' }}
+              >
                 {moduleMgmtAction === 'python_upload' && (
                   <div style={{ ...styles.card, padding: 22 }}>
                     <div style={{ fontSize: 24, fontWeight: 900, color: '#12385f', marginBottom: 10 }}>
@@ -6575,6 +6657,7 @@ function renderTaskManagementPage() {
                 {moduleMgmtAction === 'installed_modules' && (
                   <>
                     <div
+                      className="installed-modules-card"
                       style={{
                         ...styles.card,
                         padding: 18,

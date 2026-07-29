@@ -1064,23 +1064,37 @@ function Get-VenvPython {
     return ""
 }
 
-function Backup-ExistingEnvironment {
+function Remove-ExistingEnvironment {
     if (-not (Test-Path -LiteralPath $VenvDir)) {
-        return ""
+        return
     }
 
-    $backup = (
-        "${VenvDir}_backup_" +
-        (Get-Date -Format "yyyyMMdd_HHmmss")
-    )
+    $expectedVenv = [System.IO.Path]::GetFullPath(
+        (Join-Path $BackendDir ".venv")
+    ).TrimEnd("\", "/")
+    $actualVenv = [System.IO.Path]::GetFullPath(
+        $VenvDir
+    ).TrimEnd("\", "/")
 
-    Write-Info "Moving old environment to: $backup"
-    Move-Item `
+    if (
+        -not $actualVenv.Equals(
+            $expectedVenv,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )
+    ) {
+        throw "Refusing to remove unexpected environment path: $actualVenv"
+    }
+
+    Write-Info "Removing old backend\.venv before rebuilding."
+    Remove-Item `
         -LiteralPath $VenvDir `
-        -Destination $backup `
-        -Force
+        -Recurse `
+        -Force `
+        -ErrorAction Stop
 
-    return $backup
+    if (Test-Path -LiteralPath $VenvDir) {
+        throw "Failed to remove old backend\.venv."
+    }
 }
 
 function New-ProjectEnvironment {
@@ -1140,23 +1154,24 @@ function Test-EnvironmentReady(
         return $false
     }
 
-    try {
-        if (Test-Path -LiteralPath $FingerprintFile -PathType Leaf) {
-            $fingerprint = Get-Content `
-                -LiteralPath $FingerprintFile `
-                -Raw `
-                -Encoding UTF8 |
-                ConvertFrom-Json
+    if (-not (Test-Path -LiteralPath $FingerprintFile -PathType Leaf)) {
+        return $false
+    }
 
-            if ([string]$fingerprint.lock_sha256 -ne $LockHash) {
-                Write-Warn "backend\.venv fingerprint differs from requirements.lock.txt; checking core runtime packages."
-            }
+    try {
+        $fingerprint = Get-Content `
+            -LiteralPath $FingerprintFile `
+            -Raw `
+            -Encoding UTF8 |
+            ConvertFrom-Json
+
+        if ([string]$fingerprint.lock_sha256 -ne $LockHash) {
+            return $false
         }
 
         & $PythonExe `
             $VerifyScript `
             --lock $LockFile `
-            --profile core `
             --quiet
 
         if ($LASTEXITCODE -ne 0) {
@@ -1205,10 +1220,8 @@ function Ensure-PythonEnvironment {
         }
     }
 
-    $backupPath = ""
-
     if (-not $ready) {
-        $backupPath = Backup-ExistingEnvironment
+        Remove-ExistingEnvironment
 
         try {
             New-ProjectEnvironment
@@ -1294,17 +1307,6 @@ function Ensure-PythonEnvironment {
                     -Recurse `
                     -Force `
                     -ErrorAction SilentlyContinue
-            }
-
-            if (
-                $backupPath -and
-                (Test-Path -LiteralPath $backupPath)
-            ) {
-                Write-Info "Restoring previous environment."
-                Move-Item `
-                    -LiteralPath $backupPath `
-                    -Destination $VenvDir `
-                    -Force
             }
 
             throw
