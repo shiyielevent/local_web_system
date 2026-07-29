@@ -2435,9 +2435,9 @@ function HTCondorPage({
       display: 'inline-flex',
       alignItems: 'center',
       gap: 6,
-      padding: '6px 10px',
+      padding: '5px 8px',
       borderRadius: 999,
-      fontSize: 12,
+      fontSize: 11,
       fontWeight: 800,
       background: pending ? '#fef3c7' : (ok ? '#dcfce7' : '#fee2e2'),
       color: pending ? '#92400e' : (ok ? '#166534' : '#991b1b'),
@@ -2454,16 +2454,23 @@ function HTCondorPage({
   );
 
   const cardTitle = (text, subText = '') => (
-    <div style={{ minHeight: 44, marginBottom: 12 }}>
+    <div style={{ minHeight: 48, marginBottom: 14 }}>
+      <div style={{ fontSize: 23, fontWeight: 900, color: '#12385f', lineHeight: 1.2 }}>{text}</div>
+      {subText && <div style={{ marginTop: 6, color: '#64748b', fontSize: 14, lineHeight: 1.5 }}>{subText}</div>}
+    </div>
+  );
+
+  const compactCardTitle = (text, subText = '') => (
+    <div style={{ minHeight: 34, marginBottom: 8 }}>
       <div style={{ fontSize: 20, fontWeight: 900, color: '#12385f', lineHeight: 1.2 }}>{text}</div>
-      {subText && <div style={{ marginTop: 5, color: '#64748b', fontSize: 13, lineHeight: 1.45 }}>{subText}</div>}
+      {subText && <div style={{ marginTop: 4, color: '#64748b', fontSize: 12, lineHeight: 1.35 }}>{subText}</div>}
     </div>
   );
 
   const statCard = (label, value, tone = 'normal') => (
     <div style={{
-      minHeight: 66,
-      padding: '10px 12px',
+      minHeight: 56,
+      padding: '8px 10px',
       borderRadius: 14,
       border: tone === 'danger'
         ? '1px solid #fecaca'
@@ -2478,7 +2485,7 @@ function HTCondorPage({
     }}>
       <div style={{ fontSize: 12, color: '#6a7f96', fontWeight: 800 }}>{label}</div>
       <div style={{
-        marginTop: 5,
+        marginTop: 4,
         fontWeight: 900,
         color: tone === 'danger' ? '#b91c1c' : (tone === 'warning' ? '#a16207' : '#173b61'),
         overflowWrap: 'anywhere',
@@ -2493,8 +2500,8 @@ function HTCondorPage({
 
   const infoCard = (label, value) => (
     <div style={{
-      minHeight: 92,
-      padding: '10px 12px',
+      minHeight: 78,
+      padding: '9px 12px',
       borderRadius: 14,
       border: '1px solid #dce8f3',
       background: '#fff',
@@ -2502,12 +2509,12 @@ function HTCondorPage({
     }}>
       <div style={{ fontSize: 12, color: '#6a7f96', fontWeight: 800 }}>{label}</div>
       <div style={{
-        marginTop: 5,
+        marginTop: 4,
         fontWeight: 900,
         color: '#173b61',
         overflowWrap: 'anywhere',
         whiteSpace: 'pre-wrap',
-        lineHeight: 1.45,
+        lineHeight: 1.35,
         fontSize: 13,
       }}>
         {value || '-'}
@@ -2539,10 +2546,11 @@ function HTCondorPage({
     ...styles.card,
     padding: 18,
     height: '100%',
-    minHeight: 640,
+    minHeight: 620,
     boxSizing: 'border-box',
     display: 'flex',
     flexDirection: 'column',
+    fontSize: 15,
   };
 
   const weightPlan = info.node_weight_plan || info.node_weight_config || {};
@@ -2719,17 +2727,17 @@ function HTCondorPage({
   return (
     <section
       className="htcondor-page-layout"
-      style={{ display: 'grid', gap: 16, minHeight: 'calc(100vh - 98px)' }}
+      style={{ display: 'grid', gap: 12, minHeight: 'calc(100vh - 98px)' }}
     >
-      <div style={{ ...styles.card, padding: 24 }}>
+      <div style={{ ...styles.card, padding: '10px 18px' }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap', alignItems: 'center' }}>
           <div>
-            <div style={{ fontSize: 28, fontWeight: 900, color: '#12385f' }}>HTCondor 分布式</div>
-            <div style={{ marginTop: 8, color: '#5c7189', lineHeight: 1.7 }}>
+            <div style={{ fontSize: 26, fontWeight: 900, color: '#12385f' }}>HTCondor 分布式</div>
+            <div style={{ marginTop: 5, color: '#5c7189', lineHeight: 1.45, fontSize: 13 }}>
               当前接入 HTCondor 提交与执行模式，用于父节点调度、子节点执行和多节点任务分配。
             </div>
           </div>
-          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap' }}>
             {okBadge(info.install_validated, '一键安装已验证', '安装未完全验证')}
             {okBadge(info.service_running, 'Condor 服务运行中', 'Condor 服务未运行')}
             {poolRole === 'child' && okBadge(
@@ -2798,47 +2806,31 @@ function HTCondorPage({
 
       <div className="htcondor-main-grid" style={{
         display: 'grid',
-        gridTemplateColumns: 'minmax(340px, 0.92fr) minmax(330px, 0.88fr) minmax(430px, 1.2fr)',
-        gap: 16,
+        gridTemplateColumns: 'minmax(500px, 1fr) minmax(500px, 1fr)',
+        gap: 18,
         alignItems: 'stretch',
       }}>
         <div className="htcondor-main-column htcondor-status-column" style={commonColumnStyle}>
-          {cardTitle('运行状态', '集中展示集群角色、节点数量和安装结果。')}
+          {compactCardTitle('运行状态', `HTCondor 版本：${shortVersion || '-'}`)}
 
-          <div style={{
-            padding: '10px 12px',
-            borderRadius: 14,
-            border: '1px solid #dce8f3',
-            background: 'linear-gradient(135deg, #ffffff 0%, #f5f9ff 100%)',
-            marginBottom: 10,
-          }}>
-            <div style={{ fontSize: 12, color: '#6a7f96', fontWeight: 800 }}>HTCondor 版本</div>
-            <div style={{ marginTop: 5, fontSize: 14, fontWeight: 900, color: '#173b61', overflowWrap: 'anywhere' }}>
-              {shortVersion || '-'}
-            </div>
-          </div>
-
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 10 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 8 }}>
             {statCard('运行模式', mode === 'htcondor' ? 'HTCondor 分布式执行' : '本机 local')}
             {statCard('集群状态', clusterStatusText, clusterStatusTone)}
             {statCard('节点数量', String(nodeCount))}
-            {statCard('当前节点角色', roleText, roleTone)}
-          </div>
-
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginTop: 10 }}>
-            {infoCard('父节点信息', parentInfo)}
-            {infoCard('子节点信息', childInfo)}
+            {statCard('当前角色', roleText, roleTone)}
+            {statCard('父节点信息', parentInfo)}
+            {statCard('子节点信息', childInfo)}
           </div>
 
           <div style={{
-            marginTop: 10,
-            padding: '10px 12px',
+            marginTop: 7,
+            padding: '7px 10px',
             borderRadius: 12,
             background: '#f8fbff',
             border: '1px dashed #cfe0f2',
             color: '#5b6f86',
-            fontSize: 13,
-            lineHeight: 1.55,
+            fontSize: 12,
+            lineHeight: 1.4,
           }}>
             <div><strong style={{ color: '#17406b' }}>当前机器：</strong>{info.machine || '-'}</div>
             <div><strong style={{ color: '#17406b' }}>服务状态：</strong>{service.state || (info.service_running ? 'running' : 'stopped')}</div>
@@ -2847,20 +2839,21 @@ function HTCondorPage({
 
           <div className="htcondor-node-scroll htcondor-column-scroll">
             <div style={{
-              padding: '12px 12px',
+              padding: '16px 18px',
               borderRadius: 14,
-              background: '#ffffff',
-              border: '1px solid #dce8f3',
+              background: 'linear-gradient(135deg, #ffffff 0%, #f3f8ff 100%)',
+              border: '2px solid #c6dcf3',
+              boxShadow: '0 10px 26px rgba(30, 87, 139, 0.08)',
             }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
                 <div>
-                  <div style={{ fontSize: 16, fontWeight: 900, color: '#12385f' }}>节点信息、任务分配比例与进程槽</div>
-                  <div style={{ marginTop: 4, fontSize: 12, color: '#64748b', lineHeight: 1.45 }}>
+                  <div style={{ fontSize: 19, fontWeight: 900, color: '#12385f' }}>节点信息、任务分配比例与进程槽</div>
+                  <div style={{ marginTop: 6, fontSize: 14, color: '#64748b', lineHeight: 1.55 }}>
                     默认按 CPU/内存生成建议权重；管理员可手动调整。权重只影响输入文件数量分配。
                   </div>
                 </div>
                 <select
-                  style={{ ...styles.input, width: 128, minHeight: 38, fontSize: 13 }}
+                  style={{ ...styles.input, width: 144, minHeight: 42, fontSize: 14, fontWeight: 800 }}
                   value={weightMode}
                   disabled={!isAdmin}
                   onChange={(e) => changeWeightMode(e.target.value)}
@@ -2883,28 +2876,28 @@ function HTCondorPage({
                       key={machine || node.name}
                       style={{
                         display: 'grid',
-                        gridTemplateColumns: 'minmax(0, 1.12fr) 0.7fr 0.78fr 144px 92px',
-                        gap: 8,
+                        gridTemplateColumns: 'minmax(0, 1.2fr) 0.66fr 0.86fr 168px 104px',
+                        gap: 10,
                         alignItems: 'center',
-                        padding: '9px 10px',
+                        padding: '11px 12px',
                         borderRadius: 12,
                         border: '1px solid #e3edf7',
                         background: isCurrent ? '#f0f7ff' : '#f8fbff',
                       }}
                     >
                       <div style={{ minWidth: 0 }}>
-                        <div style={{ fontWeight: 900, color: '#17406b', overflowWrap: 'anywhere', fontSize: 13 }}>
+                        <div style={{ fontWeight: 900, color: '#17406b', overflowWrap: 'anywhere', fontSize: 14 }}>
                           {machine || '-'}{isCurrent ? '（本机）' : ''}
                         </div>
-                        <div style={{ marginTop: 3, fontSize: 12, color: '#64748b' }}>
+                        <div style={{ marginTop: 3, fontSize: 13, color: '#64748b' }}>
                           {node.state || '-'} / {node.activity || '-'}
                         </div>
                       </div>
-                      <div style={{ fontSize: 12, color: '#475569', lineHeight: 1.45 }}>
+                      <div style={{ fontSize: 13, color: '#475569', lineHeight: 1.45 }}>
                         <div>CPU：{node.cpus || '-'}</div>
                         <div>内存：{memGb}GB</div>
                       </div>
-                      <div style={{ fontSize: 12, color: '#475569', lineHeight: 1.45 }}>
+                      <div style={{ fontSize: 13, color: '#475569', lineHeight: 1.45 }}>
                         <div>比例建议：<strong style={{ color: '#17406b' }}>{node.suggested_weight_percent ?? node.suggested_weight ?? 0}%</strong></div>
                         <div>槽建议：<strong style={{ color: '#17406b' }}>{node.suggested_process_slots || 1}</strong></div>
                         <div>来源：{node.source === 'manual' ? '手动' : (node.source === 'equal' ? '平均' : '建议')}</div>
@@ -3039,7 +3032,7 @@ function HTCondorPage({
                   </div>
                 </div>
               ) : (
-                <div style={{ marginTop: 10, color: '#64748b', fontSize: 13 }}>
+                <div style={{ marginTop: 14, color: '#64748b', fontSize: 14, lineHeight: 1.65 }}>
                   暂未发现执行节点。启动父节点或加入子节点后，这里会显示节点分配比例设置。
                 </div>
               )}
@@ -3160,13 +3153,13 @@ function HTCondorPage({
 
           <div style={{
             marginTop: 'auto',
-            padding: '14px 16px',
+            padding: '16px 18px',
             borderRadius: 14,
             background: '#f8fbff',
             border: '1px dashed #cfe0f2',
             color: '#5b6f86',
             lineHeight: 1.7,
-            fontSize: 13,
+            fontSize: 14,
           }}>
             <div style={{ fontWeight: 900, color: '#17406b', marginBottom: 6 }}>操作说明</div>
             <div>1. 父节点点击“启动集群”。</div>
@@ -3176,15 +3169,6 @@ function HTCondorPage({
           </div>
         </div>
 
-        <div className="htcondor-main-column htcondor-queue-column" style={commonColumnStyle}>
-          {cardTitle('队列和 Slot', '查看执行节点、队列和 WRITE 权限状态。')}
-          <div style={{ display: 'grid', gap: 12 }}>
-            {logBlock('执行节点列表', nodes.text, 120)}
-            {logBlock('condor_status', slot.text, 190)}
-            {logBlock('condor_q', queue.text, 165)}
-            {logBlock('condor_ping WRITE', ping.text, 120)}
-          </div>
-        </div>
       </div>
     </section>
   );

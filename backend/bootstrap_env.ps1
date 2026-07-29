@@ -1140,24 +1140,23 @@ function Test-EnvironmentReady(
         return $false
     }
 
-    if (-not (Test-Path -LiteralPath $FingerprintFile -PathType Leaf)) {
-        return $false
-    }
-
     try {
-        $fingerprint = Get-Content `
-            -LiteralPath $FingerprintFile `
-            -Raw `
-            -Encoding UTF8 |
-            ConvertFrom-Json
+        if (Test-Path -LiteralPath $FingerprintFile -PathType Leaf) {
+            $fingerprint = Get-Content `
+                -LiteralPath $FingerprintFile `
+                -Raw `
+                -Encoding UTF8 |
+                ConvertFrom-Json
 
-        if ([string]$fingerprint.lock_sha256 -ne $LockHash) {
-            return $false
+            if ([string]$fingerprint.lock_sha256 -ne $LockHash) {
+                Write-Warn "backend\.venv fingerprint differs from requirements.lock.txt; checking core runtime packages."
+            }
         }
 
         & $PythonExe `
             $VerifyScript `
             --lock $LockFile `
+            --profile core `
             --quiet
 
         if ($LASTEXITCODE -ne 0) {

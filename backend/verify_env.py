@@ -7,6 +7,33 @@ import sys
 from pathlib import Path
 
 TARGET_PYTHON = "3.12.4"
+CORE_PACKAGES = {
+    "fastapi",
+    "uvicorn",
+    "pydantic",
+    "pydantic-core",
+    "python-multipart",
+    "starlette",
+    "anyio",
+    "idna",
+    "typing-extensions",
+    "annotated-types",
+    "click",
+    "h11",
+    "python-dotenv",
+    "colorama",
+    "pyyaml",
+    "numpy",
+    "pillow",
+    "tifffile",
+    "psutil",
+    "pyinstaller",
+    "altgraph",
+    "pefile",
+    "pyinstaller-hooks-contrib",
+    "pywin32-ctypes",
+    "setuptools",
+}
 
 
 def parse_lock(path: Path) -> dict[str, str]:
@@ -24,9 +51,22 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--lock", required=True)
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument(
+        "--profile",
+        choices=["full", "core"],
+        default="full",
+        help="full checks exact locked versions; core only checks packages needed to start the local system.",
+    )
     args = parser.parse_args()
 
     expected = parse_lock(Path(args.lock))
+    if args.profile == "core":
+        expected = {
+            package: wanted
+            for package, wanted in expected.items()
+            if package in CORE_PACKAGES
+        }
+
     errors: list[str] = []
     py_version = platform.python_version()
     if py_version != TARGET_PYTHON:
@@ -39,7 +79,10 @@ def main() -> int:
         except metadata.PackageNotFoundError:
             actual = "<missing>"
         rows.append((package, wanted, actual))
-        if actual != wanted:
+        if args.profile == "core":
+            if actual == "<missing>":
+                errors.append(f"{package} expected installed, actual <missing>")
+        elif actual != wanted:
             errors.append(f"{package} expected {wanted}, actual {actual}")
 
     if not args.quiet:
@@ -54,7 +97,10 @@ def main() -> int:
         return 1
 
     if not args.quiet:
-        print("\n[OK] Environment versions match requirements.lock.txt")
+        if args.profile == "core":
+            print("\n[OK] Core backend environment is ready")
+        else:
+            print("\n[OK] Environment versions match requirements.lock.txt")
     return 0
 
 
