@@ -13,20 +13,29 @@ backend/.venv/
 backend/.venv_*/
 backend/.venv_backup_*/
 backend/module_envs/
+
+# Local application data and installed modules
+backend/data/
 backend/installed_modules/
 
-# Runtime and logs
+# Runtime, per-user runtime and logs
 backend/runtime/
+backend/runtime_user/
 backend/logs/
 *.log
+
+# Local module drop directories
+module_drop/
+backend/module_drop/
+
+# Local secrets and machine-specific environment files
+.env
+.env.*
+!.env.example
 
 # Frontend generated files
 frontend/node_modules/
 frontend/dist/
-
-# Generated task/data records
-backend/data/tasks.json
-backend/data/data_files.json
 
 # Local wheels and offline caches
 backend/python_wheels/
@@ -45,4 +54,3 @@ backend/.pyi_tmp/
 
 diff_with_github.txt
 /backend/app/main_逐行解释版.py
-/backend/data/modules.json
