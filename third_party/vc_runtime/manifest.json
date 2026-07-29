@@ -1,0 +1,8 @@
+{
+  "file": "vc_redist.x64.exe",
+  "architecture": "x64",
+  "file_version": "14.44.35211.0",
+  "sha256": "CC0FF0EB1DC3F5188AE6300FAEF32BF5BEEBA4BDD6E8E445A9184072096B713B",
+  "publisher": "Microsoft Corporation",
+  "source": "https://aka.ms/vs/17/release/vc_redist.x64.exe"
+}

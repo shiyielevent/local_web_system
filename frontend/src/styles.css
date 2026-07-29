@@ -321,6 +321,73 @@ pre {
   background: #70879e;
 }
 
+.module-installed-app-page {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  min-height: 0 !important;
+  overflow: hidden !important;
+}
+
+.module-installed-app-page > .main-app-toolbar {
+  flex: 0 0 auto;
+}
+
+.module-installed-content-host {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden !important;
+}
+
+.module-installed-section {
+  height: 100%;
+  min-height: 0 !important;
+  overflow: hidden;
+}
+
+.module-installed-layout {
+  height: 100%;
+  min-height: 0 !important;
+  overflow: hidden;
+}
+
+.module-installed-sidebar,
+.module-installed-main,
+.installed-modules-card {
+  height: 100%;
+  min-height: 0 !important;
+  overflow: hidden !important;
+}
+
+.installed-modules-split {
+  height: 100%;
+  min-height: 0;
+}
+
+.installed-module-group-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: #8fa4b9 #e6eef6;
+}
+
+.installed-module-group-scroll::-webkit-scrollbar {
+  width: 10px;
+}
+
+.installed-module-group-scroll::-webkit-scrollbar-track {
+  background: #e6eef6;
+  border-radius: 999px;
+}
+
+.installed-module-group-scroll::-webkit-scrollbar-thumb {
+  background: #8fa4b9;
+  border: 2px solid #e6eef6;
+  border-radius: 999px;
+}
+
+.installed-module-group-scroll::-webkit-scrollbar-thumb:hover {
+  background: #70879e;
+}
+
 .log-panel {
   min-height: 280px;
   max-height: 420px;
@@ -432,6 +499,38 @@ pre {
 }
 
 @media (max-width: 900px) {
+  .module-installed-app-page {
+    display: block;
+    height: auto;
+    min-height: 100vh !important;
+    overflow-y: auto !important;
+  }
+
+  .module-installed-content-host,
+  .module-installed-section,
+  .module-installed-layout,
+  .module-installed-sidebar,
+  .module-installed-main,
+  .installed-modules-card {
+    height: auto !important;
+    min-height: 0 !important;
+    overflow: visible !important;
+  }
+
+  .module-installed-layout {
+    grid-template-columns: 1fr !important;
+  }
+
+  .installed-modules-split {
+    grid-template-rows: none !important;
+    height: auto;
+    overflow: visible;
+  }
+
+  .installed-module-group-scroll {
+    max-height: 360px;
+  }
+
   .tool-app-page {
     display: block;
     height: auto;

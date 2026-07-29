@@ -6789,11 +6789,47 @@ def scan_output_files(output_paths: list[Path]) -> list[Path]:
     return files
 
 
+def output_file_signature(file_path: Path) -> tuple[int, int]:
+    """返回用于判断输出文件是否在任务期间发生变化的轻量签名。"""
+    stat = file_path.stat()
+    return int(stat.st_size), int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000)))
+
+
+def snapshot_output_files(output_paths: list[Path]) -> dict[str, tuple[int, int]]:
+    """记录任务启动前已经存在的输出文件，取消任务时用于排除旧文件。"""
+    snapshot: dict[str, tuple[int, int]] = {}
+    for file_path in scan_output_files(output_paths):
+        try:
+            key = os.path.normcase(str(file_path.resolve()))
+            snapshot[key] = output_file_signature(file_path)
+        except OSError:
+            continue
+    return snapshot
+
+
+def collect_changed_output_files(
+    output_paths: list[Path],
+    initial_snapshot: dict[str, tuple[int, int]],
+) -> list[Path]:
+    """只返回任务启动后新建或被修改的输出文件。"""
+    changed: list[Path] = []
+    for file_path in scan_output_files(output_paths):
+        try:
+            key = os.path.normcase(str(file_path.resolve()))
+            if initial_snapshot.get(key) != output_file_signature(file_path):
+                changed.append(file_path)
+        except OSError:
+            continue
+    return changed
+
+
 def upsert_data_files_from_outputs(
     module: dict,
     task_id: str,
     output_paths: list[Path],
     owner_username: str = "",
+    task_status: str = "success",
+    files: list[Path] | None = None,
 ):
     """
     把任务输出结果登记到 data_files.json。
@@ -6810,9 +6846,9 @@ def upsert_data_files_from_outputs(
         key = f"{owner}::{path_text}"
         by_key[key] = item
 
-    files = scan_output_files(output_paths)
+    output_files = list(files) if files is not None else scan_output_files(output_paths)
 
-    for file_path in files:
+    for file_path in output_files:
         if not file_path.exists() or not file_path.is_file():
             continue
 
@@ -6834,6 +6870,8 @@ def upsert_data_files_from_outputs(
             "module_id": module.get("id", ""),
             "module_name": module.get("name") or module.get("id", ""),
             "task_id": task_id,
+            "task_status": task_status,
+            "is_partial": task_status != "success",
             "owner_username": str(owner_username or ""),
             "size": stat.st_size,
             "size_text": format_file_size(stat.st_size),
@@ -6864,6 +6902,7 @@ def start_data_file_scan_after_task(
     import time
 
     terminal_statuses = {"success", "failed", "cancelled"}
+    initial_output_snapshot = snapshot_output_files(output_paths)
 
     def worker():
         while True:
@@ -6873,18 +6912,42 @@ def start_data_file_scan_after_task(
 
             status = task.get("status")
             if status in terminal_statuses:
-                if status == "success":
+                if status in {"success", "cancelled"}:
                     try:
                         task_owner = owner_username or str(task.get("owner_username") or "")
+                        changed_files = None
+
+                        if status == "cancelled":
+                            # cancel_task 会先写入 cancelled，再等待进程结束。短暂等待，
+                            # 避免最后一个已经写完的文件还没来得及刷新到磁盘。
+                            time.sleep(1)
+                            changed_files = collect_changed_output_files(
+                                output_paths,
+                                initial_output_snapshot,
+                            )
 
                         upsert_data_files_from_outputs(
                             module=module,
                             task_id=task_id,
                             output_paths=output_paths,
                             owner_username=task_owner,
+                            task_status=status,
+                            files=changed_files,
                         )
                         try:
-                            task_manager.append_log(task_id, "[DATA] 输出结果已登记到数据管理")
+                            if status == "cancelled":
+                                if changed_files:
+                                    task_manager.append_log(
+                                        task_id,
+                                        f"[DATA] 已将取消前生成的 {len(changed_files)} 个部分结果登记到数据管理",
+                                    )
+                                else:
+                                    task_manager.append_log(
+                                        task_id,
+                                        "[DATA] 任务已取消，本次没有生成可登记的新输出文件",
+                                    )
+                            else:
+                                task_manager.append_log(task_id, "[DATA] 输出结果已登记到数据管理")
                         except Exception:
                             pass
                     except Exception as exc:

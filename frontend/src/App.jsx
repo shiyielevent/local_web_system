@@ -1379,7 +1379,7 @@ function TaskWindow({ win, onMin, onClose, onFront, onMove, onStop }) {
           )}
           {Array.isArray(task?.temporary_outputs) && task.temporary_outputs.length > 0 && (
             <div style={{ marginTop: 8 }}>
-              <strong>临时输出：</strong>{task.temporary_outputs.length} 个，父任务成功后登记到数据管理
+              <strong>临时输出：</strong>{task.temporary_outputs.length} 个，父任务结束后登记到数据管理；取消任务会标记为部分结果
               <div style={{ color: '#5f7088', fontSize: 12, marginTop: 4, maxHeight: 56, overflow: 'auto' }}>
                 {task.temporary_outputs.slice(0, 5).map((item) => item.name || item.path).join('；')}
                 {task.temporary_outputs.length > 5 ? `；...还有 ${task.temporary_outputs.length - 5} 个` : ''}
@@ -5372,26 +5372,48 @@ async function uploadPythonFolder() {
   }
 
   function renderInstalledModulesTree() {
+    const toolbarCount = Math.max(visibleToolbars.length, 1);
+
     return (
       <div
+        className="installed-modules-split"
         style={{
           display: 'grid',
-          gap: 10,
-          marginTop: 12,
+          gridTemplateRows: `repeat(${toolbarCount}, minmax(0, 1fr))`,
+          gap: 12,
           flex: 1,
           minHeight: 0,
-          overflow: 'auto',
-          alignContent: 'start',
-          paddingRight: 4,
+          overflow: 'hidden',
         }}
       >
         {visibleToolbars.map((tb) => {
           const list = modulesByTool[tb.key] || [];
           const expanded = expandedToolTypes[tb.key] !== false;
           return (
-            <div key={tb.key} style={{ border: '1px solid #d6e2ef', background: '#fff', borderRadius: 12, overflow: 'hidden' }}>
+            <div
+              key={tb.key}
+              className="installed-module-group"
+              style={{
+                border: '1px solid #d6e2ef',
+                background: '#fff',
+                borderRadius: 12,
+                overflow: 'hidden',
+                minHeight: 0,
+                display: 'flex',
+                flexDirection: 'column',
+              }}
+            >
               <button
-                style={{ ...styles.whiteBtn, width: '100%', border: 'none', borderRadius: 0, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
+                style={{
+                  ...styles.whiteBtn,
+                  width: '100%',
+                  border: 'none',
+                  borderRadius: 0,
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  flexShrink: 0,
+                }}
                 onClick={() => setExpandedToolTypes((prev) => ({ ...prev, [tb.key]: !expanded }))}
               >
                 <span>{expanded ? '▼' : '▶'} {tb.label}</span>
@@ -5399,7 +5421,21 @@ async function uploadPythonFolder() {
               </button>
 
               {expanded && (
-                <div style={{ padding: 10, display: 'grid', gap: 10 }}>
+                <div
+                  className="installed-module-group-scroll"
+                  style={{
+                    padding: 10,
+                    display: 'grid',
+                    gap: 10,
+                    alignContent: 'start',
+                    flex: 1,
+                    minHeight: 0,
+                    overflowX: 'hidden',
+                    overflowY: 'scroll',
+                    overscrollBehaviorY: 'contain',
+                    scrollbarGutter: 'stable',
+                  }}
+                >
                   {list.length === 0 && <div style={{ color: '#9aa8b8', fontSize: 13 }}>暂无模块</div>}
                   {list.map((m) => (
                     <div key={m.id} style={{ border: '1px solid #e2ebf5', background: '#fbfdff', borderRadius: 10, padding: 10 }}>
@@ -5657,7 +5693,7 @@ function renderDataManagementPage() {
                 数据管理
               </div>
               <div style={{ color: '#6a7f96', marginTop: 4, fontSize: 13 }}>
-                只展示模块运行成功后登记的输出文件；文件仍保留在原始输出路径，不会被移动。
+                展示任务正常完成或取消前已经生成的输出文件；取消任务的文件会标记为部分结果，文件仍保留在原始输出路径。
               </div>
             </div>
 
@@ -5681,6 +5717,7 @@ function renderDataManagementPage() {
                   <th style={{...thStyle, width: 250}}>文件名</th>
                   <th style={{...thStyle, width: 78}}>类型</th>
                   <th style={{...thStyle, width: 150}}>所属模块</th>
+                  <th style={{...thStyle, width: 125}}>任务状态</th>
                   <th style={{...thStyle, width: 88}}>大小</th>
                   <th style={{...thStyle, width: 145}}>创建时间</th>
                   <th style={thStyle}>本地路径</th>
@@ -5691,7 +5728,7 @@ function renderDataManagementPage() {
               <tbody>
                 {dataFiles.length === 0 && (
                   <tr>
-                    <td style={tdStyle} colSpan={isAdmin ? 9 : 8}>
+                    <td style={tdStyle} colSpan={isAdmin ? 10 : 9}>
                       暂无输出结果文件。运行模块后，系统会自动登记输出路径下的文件。
                     </td>
                   </tr>
@@ -5718,6 +5755,23 @@ function renderDataManagementPage() {
                     <td style={tdStyle}>{file.file_type}</td>
                     <td style={tdEllipsisStyle} title={file.module_name || file.module_id || '-'}>
                       {file.module_name || file.module_id}
+                    </td>
+                    <td style={tdStyle}>
+                      <span
+                        title={file.task_status === 'cancelled' ? '任务取消前已经生成的文件，可能不是完整结果' : '任务正常完成后登记的结果'}
+                        style={{
+                          display: 'inline-block',
+                          padding: '4px 8px',
+                          borderRadius: 999,
+                          whiteSpace: 'nowrap',
+                          fontSize: 12,
+                          fontWeight: 800,
+                          color: file.task_status === 'cancelled' ? '#9a3412' : '#166534',
+                          background: file.task_status === 'cancelled' ? '#ffedd5' : '#dcfce7',
+                        }}
+                      >
+                        {file.task_status === 'cancelled' ? '已取消·部分结果' : '已完成'}
+                      </span>
                     </td>
                     <td style={tdStyle}>{file.size_text || file.size}</td>
                     <td style={tdStyle}>{file.created_at || '-'}</td>
@@ -6170,7 +6224,9 @@ function renderTaskManagementPage() {
           ? 'htcondor-app-page'
           : activeTab.startsWith('tool:')
             ? 'tool-app-page'
-            : undefined
+            : activeTab === 'module_mgmt' && moduleMgmtAction === 'installed_modules'
+              ? 'module-installed-app-page'
+              : undefined
       }
       style={styles.page}
     >
@@ -6207,7 +6263,9 @@ function renderTaskManagementPage() {
             ? 'htcondor-content-host'
             : activeTab.startsWith('tool:')
               ? 'tool-content-host'
-              : undefined
+              : activeTab === 'module_mgmt' && moduleMgmtAction === 'installed_modules'
+                ? 'module-installed-content-host'
+                : undefined
         }
         style={{
           padding: 12,
@@ -6220,6 +6278,7 @@ function renderTaskManagementPage() {
       >
         {activeTab === 'module_mgmt' && isAdmin && (
           <section
+            className={moduleMgmtAction === 'installed_modules' ? 'module-installed-section' : undefined}
             style={{
               ...styles.card,
               padding: 16,
@@ -6228,6 +6287,7 @@ function renderTaskManagementPage() {
             }}
           >
             <div
+              className={moduleMgmtAction === 'installed_modules' ? 'module-installed-layout' : undefined}
               style={{
                 display: 'grid',
                 gridTemplateColumns: '380px minmax(0, 1fr)',
@@ -6237,7 +6297,10 @@ function renderTaskManagementPage() {
                 alignItems: 'stretch',
               }}
             >
-              <div style={{ ...styles.card, padding: 16 }}>
+              <div
+                className={moduleMgmtAction === 'installed_modules' ? 'module-installed-sidebar' : undefined}
+                style={{ ...styles.card, padding: 16 }}
+              >
                 <div style={{ fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 16 }}>
                   集成管理功能
                 </div>
@@ -6262,7 +6325,10 @@ function renderTaskManagementPage() {
                 </div>
               </div>
 
-              <div style={{ display: 'grid', gap: 16, minWidth: 0, minHeight: 'calc(100vh - 130px)', alignItems: 'stretch' }}>
+              <div
+                className={moduleMgmtAction === 'installed_modules' ? 'module-installed-main' : undefined}
+                style={{ display: 'grid', gap: 16, minWidth: 0, minHeight: 'calc(100vh - 130px)', alignItems: 'stretch' }}
+              >
                 {moduleMgmtAction === 'python_upload' && (
                   <div style={{ ...styles.card, padding: 22 }}>
                     <div style={{ fontSize: 24, fontWeight: 900, color: '#12385f', marginBottom: 10 }}>
@@ -6591,6 +6657,7 @@ function renderTaskManagementPage() {
                 {moduleMgmtAction === 'installed_modules' && (
                   <>
                     <div
+                      className="installed-modules-card"
                       style={{
                         ...styles.card,
                         padding: 18,
