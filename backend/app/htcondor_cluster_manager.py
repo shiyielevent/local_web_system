@@ -2541,6 +2541,85 @@ else {
         local_names = self._local_machine_names()
         return target in local_names or target.split(".")[0] in local_names
 
+    def _unc_host(self, unc_root: str) -> str:
+        r"""从 \\host\share 形式的 UNC 路径中提取主机名或 IP。"""
+        text = str(unc_root or "").strip()
+        if not text.startswith("\\\\"):
+            return ""
+        parts = text.lstrip("\\").split("\\", 1)
+        return str(parts[0] if parts else "").strip()
+
+    def _is_local_unc_share(self, unc_root: str) -> bool:
+        """判断 UNC 共享是否由当前父节点本机提供。"""
+        host = self._unc_host(unc_root).strip("[]").lower()
+        if not host:
+            return False
+        if host in {"localhost", ".", "127.0.0.1", "::1"}:
+            return True
+
+        local_names = self._local_machine_names()
+        if host in local_names or host.split(".")[0] in local_names:
+            return True
+
+        local_ips = {str(item or "").strip().lower() for item in self._local_ipv4_list()}
+        bind_ip = str(self.state.get("bind_ip") or "").strip().lower()
+        if bind_ip:
+            local_ips.add(bind_ip)
+        return host in local_ips
+
+    def _shared_directory_job_credentials(
+        self,
+        shared_cfg: Dict[str, Any],
+    ) -> tuple[str, str, str]:
+        """返回远程作业访问共享目录所需的账户、密码和凭据来源。
+
+        平台创建的父节点共享已经给本机 LocalWebCondor 授予 NTFS 权限，
+        一键安装也保存了这个账户的随机密码。父节点自己的 UNC 共享应直接
+        复用该专用账户，避免每换一台父节点就要求用户手工设置环境变量。
+
+        环境变量只保留给外部 SMB 共享使用；如果旧安装暂时无法读取专用
+        账户密文，也可以作为兼容回退。
+        """
+        unc_root = str((shared_cfg or {}).get("unc_root") or "").strip()
+        configured_user = str(os.environ.get("LOCAL_WEB_HTCONDOR_SHARE_USER", "")).strip()
+        configured_password = str(os.environ.get("LOCAL_WEB_HTCONDOR_SHARE_PASSWORD", "")).strip()
+
+        local_root = str((shared_cfg or {}).get("local_root") or "").strip()
+        shared_role = str((shared_cfg or {}).get("role") or "").strip().lower()
+        is_parent_managed_share = bool(
+            self._is_local_unc_share(unc_root)
+            or (
+                shared_role == "parent"
+                and local_root
+                and Path(local_root).exists()
+            )
+        )
+
+        if is_parent_managed_share:
+            try:
+                password = self._read_submit_account_password()
+                computer_name = str(
+                    os.environ.get("COMPUTERNAME") or socket.gethostname() or "."
+                ).strip()
+                if password and computer_name:
+                    return (
+                        f"{computer_name}\\LocalWebCondor",
+                        password,
+                        "automatic_parent_localwebcondor",
+                    )
+            except Exception as exc:
+                if configured_user and configured_password:
+                    return configured_user, configured_password, "environment_fallback"
+                raise HTCondorClusterError(
+                    "无法自动读取父节点 LocalWebCondor 共享凭据。"
+                    "请在父节点重新运行 start_system.bat，让一键安装修复专用账户和密码密文。"
+                    f"原始错误：{type(exc).__name__}: {exc}"
+                ) from exc
+
+        if configured_user and configured_password:
+            return configured_user, configured_password, "environment_external_share"
+        return "", "", "none"
+
     def _write_job_files(
         self,
         job_id: str,
@@ -2689,8 +2768,9 @@ else {
         # 1）执行账号需要 localwebshare 凭据才能访问父节点共享目录；
         # 2）执行账号本身已具备共享目录权限，net use 失败但 UNC 仍可直接访问。
         share_unc = str(shared_cfg.get("unc_root") or "").strip()
-        share_user = str(os.environ.get("LOCAL_WEB_HTCONDOR_SHARE_USER", "")).strip()
-        share_password = str(os.environ.get("LOCAL_WEB_HTCONDOR_SHARE_PASSWORD", "")).strip()
+        share_user = ""
+        share_password = ""
+        share_credential_source = "none"
 
         local_target_machine = self._is_local_target_machine(target_machine)
         if shared_cfg.get("enabled") and share_unc and local_target_machine:
@@ -2699,6 +2779,11 @@ else {
             ])
 
         if shared_cfg.get("enabled") and share_unc and not local_target_machine:
+            (
+                share_user,
+                share_password,
+                share_credential_source,
+            ) = self._shared_directory_job_credentials(shared_cfg)
             safe_unc = share_unc.replace("%", "%%")
             safe_user = share_user.replace("%", "%%")
             safe_password = share_password.replace("%", "%%")
@@ -2712,6 +2797,7 @@ else {
 
             lines.extend([
                 "echo [HTCONDOR] connect shared directory",
+                "echo [HTCONDOR] shared credential source=" + share_credential_source,
                 "echo [HTCONDOR] job user:",
                 "whoami",
                 "echo [HTCONDOR] share_unc=" + safe_unc,
