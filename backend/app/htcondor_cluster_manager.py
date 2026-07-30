@@ -2754,7 +2754,12 @@ else {
             "set LOCAL_WEB_CONFIG_JSON=%LOCAL_WEB_JOB_DIR%\\localweb_config.json",
             "if exist \"%LOCAL_WEB_JOB_DIR%\\rewrite_config.ps1\" (",
             "  powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%LOCAL_WEB_JOB_DIR%\\rewrite_config.ps1\"",
-            "  if errorlevel 1 exit /b 101",
+            "  if errorlevel 1 (",
+            "    echo return_code=101 > \"%LOCAL_WEB_JOB_DIR%\\result.txt\"",
+            "    echo computer=%COMPUTERNAME% >> \"%LOCAL_WEB_JOB_DIR%\\result.txt\"",
+            "    echo ended_at=%DATE% %TIME% >> \"%LOCAL_WEB_JOB_DIR%\\result.txt\"",
+            "    exit /b 101",
+            "  )",
             "  set LOCAL_WEB_CONFIG_JSON=%LOCAL_WEB_JOB_DIR%\\localweb_runtime_config.json",
             ")",
             "echo [HTCONDOR] job started",
@@ -2861,7 +2866,14 @@ else {
 
         if working_dir:
             lines.append(f"cd /d {self._batch_quote(str(working_dir))}")
-            lines.append("if errorlevel 1 exit /b 100")
+            lines.extend([
+                "if errorlevel 1 (",
+                "  echo return_code=100 > \"%LOCAL_WEB_JOB_DIR%\\result.txt\"",
+                "  echo computer=%COMPUTERNAME% >> \"%LOCAL_WEB_JOB_DIR%\\result.txt\"",
+                "  echo ended_at=%DATE% %TIME% >> \"%LOCAL_WEB_JOB_DIR%\\result.txt\"",
+                "  exit /b 100",
+                ")",
+            ])
 
         lines.extend([
             cmd_line,
@@ -3420,11 +3432,19 @@ queue 1
         }
 
     def smoke_test(self) -> Dict[str, Any]:
+        pool_role = str(self.state.get("pool_role") or "standalone").strip().lower()
+        if pool_role == "child":
+            parent_ip = str(self.state.get("parent_ip") or "").strip()
+            raise HTCondorClusterError(
+                "当前节点是 HTCondor 子节点，不能在本机提交自检任务。"
+                "提交自检任务需要本机有 schedd 提交端，请到父节点的分布式页面执行。"
+                + (f" 当前父节点：{parent_ip}:9618。" if parent_ip else "")
+            )
         command = ["C:\\Windows\\System32\\cmd.exe", "/D", "/C", "echo htcondor smoke ok"]
         result = self.run_job(
             job_id=f"smoke_{int(time.time())}",
             command=command,
-            working_dir=str(self.runtime_dir),
+            working_dir="",
             env={},
             timeout_seconds=120,
         )
