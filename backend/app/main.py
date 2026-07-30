@@ -1881,7 +1881,8 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
     # 6. 统一决定运行方式
     run_mode = resolve_run_parallel_mode(module, inputs, workers)
 
-    # 普通单任务或模块内部并行同样遵循“用户选文件夹，平台生成 TIFF 文件名”。
+    # 普通单任务或模块内部并行在这里统一处理输出路径。
+    # 目录型 EXE 保留用户选择的目录；确实接收单文件的模块才生成 TIFF 文件名。
     # batch_group/platform_split 会在各自生成子任务时逐个映射，不能在这里提前改写。
     if run_mode in {"none", "module_internal"}:
         inputs = map_single_run_output_directory(module, inputs)
@@ -6227,6 +6228,39 @@ def _output_directory_passthrough(module: dict, output_field: dict) -> bool:
     }
 
 
+def _single_run_executable_directory_passthrough(
+    module: dict,
+    output_field: dict,
+    output_value: str,
+) -> bool:
+    """兼容旧安装清单：目录型 EXE 输出参数在单任务模式下原样传递。"""
+    if str(module.get("runtime") or "").strip().lower() != "executable":
+        return False
+
+    mode = str(
+        (module.get("parallel") or {}).get("output_mode")
+        or output_field.get("output_mode")
+        or ""
+    ).strip().lower()
+    if mode in {
+        "file", "single_file", "output_file", "generated_file",
+        "platform_file", "platform_generated_file",
+    }:
+        return False
+
+    field_type = str(output_field.get("type") or "").strip().lower()
+    batch_role = str(output_field.get("batch_role") or "").strip().upper()
+    return (
+        field_type == "dir_path"
+        or batch_role == "OUTPUT_DIR"
+        or is_probably_dir_output(
+            module,
+            str(output_field.get("key") or ""),
+            output_value,
+        )
+    )
+
+
 def _normalise_output_extension(module: dict, output_field: dict) -> str:
     ext = str(
         output_field.get("output_ext")
@@ -6366,7 +6400,7 @@ def _find_primary_input_file(module: dict, inputs: dict) -> Path | None:
 
 
 def map_single_run_output_directory(module: dict, inputs: dict) -> dict:
-    """普通单任务/模块内部并行时，也把输出文件夹改写为一个 TIFF 文件路径。"""
+    """处理单任务输出；目录型 EXE 原样传目录，文件型输出生成 TIFF 路径。"""
     output_field = _first_output_field(module)
     if not output_field:
         return dict(inputs)
@@ -6378,7 +6412,14 @@ def map_single_run_output_directory(module: dict, inputs: dict) -> dict:
         return dict(inputs)
 
     result = dict(inputs)
-    if _output_directory_passthrough(module, output_field):
+    if (
+        _output_directory_passthrough(module, output_field)
+        or _single_run_executable_directory_passthrough(
+            module,
+            output_field,
+            raw,
+        )
+    ):
         Path(raw).mkdir(parents=True, exist_ok=True)
         result[key] = str(Path(raw).resolve())
         return result
@@ -6859,10 +6900,11 @@ def _make_batch_output_value(
     job_index: int = 0,
     used_output_paths: set[str] | None = None,
 ) -> tuple[dict, Optional[Path]]:
-    """为多输入批处理子任务生成唯一输出 TIFF。
+    """为多输入批处理子任务在统一输出目录中生成唯一 TIFF。
 
     用户始终只选择输出文件夹；平台把当前子任务的完整 TIFF 路径写入 config.json。
-    因此无论并发数为 1、2 或更多，所有结果都会保存到用户指定文件夹，且不会互相覆盖。
+    因此无论并发数为 1、2 或更多，所有结果都会直接保存到用户指定文件夹，
+    不再给每个子任务创建独立子目录，且不会互相覆盖。
     """
     job_inputs = dict(base_inputs)
     output_field = _get_output_dir_field_for_batch(module)
@@ -6916,8 +6958,6 @@ def _make_batch_output_value(
 
     if is_directory_value:
         output_dir = p
-        if output_mode in {"job_directory", "job_dir", "subdir", "subdirectory", "directory_per_job"}:
-            output_dir = p / _safe_output_stem(slot or primary_file.stem)
         base_name = _choose_output_base_name(
             module,
             output_field,
