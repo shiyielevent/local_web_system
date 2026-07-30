@@ -233,13 +233,15 @@ class TaskManager:
         return local_root / "_localweb_htcondor_shared" / str(parent_id)
 
     def _make_shared_part_output_path(self, original_path: str, part_name: str) -> tuple[Path, str]:
-        """生成父节点本地 part 输出路径及对应 UNC 路径。"""
+        """生成父节点本地输出路径及对应 UNC 路径。"""
         old_path = Path(str(original_path or ""))
         if old_path.suffix:
             local_path = old_path.with_name(f"{old_path.stem}_{part_name}{old_path.suffix}")
             local_path.parent.mkdir(parents=True, exist_ok=True)
         else:
-            local_path = old_path / part_name
+            # 目录型输出由各子任务直接写入用户选择的同一个目录。
+            # 输入文件已按子任务拆分，算法通常会按输入文件名生成互不冲突的结果。
+            local_path = old_path
             local_path.mkdir(parents=True, exist_ok=True)
         unc = self._path_to_shared_unc(local_path)
         return local_path, unc
@@ -581,7 +583,7 @@ class TaskManager:
 
             source_dir = job_dir / job_subdir
             target_root = Path(original_path)
-            target_dir = target_root / part_name if part_name else target_root
+            target_dir = target_root
 
             if not source_dir.exists():
                 self.append_log(
@@ -589,21 +591,9 @@ class TaskManager:
                     f"[HTCONDOR-WARN] {label or child_id} 未发现传回输出目录：{source_dir}",
                 )
                 continue
-            # 每次 HTCondor 子任务回收前，先清空本次 part 输出目录，
-            # 避免历史测试结果残留导致文件数量看起来变多。
-            # 注意：只清理带 part_name 的子目录，不能直接清空用户选择的输出根目录。
-            if part_name:
-                try:
-                    if target_dir.exists() and target_dir.is_dir():
-                        shutil.rmtree(target_dir, ignore_errors=True)
-                    target_dir.mkdir(parents=True, exist_ok=True)
-                except Exception as exc:
-                    self.append_log(
-                        parent_id,
-                        f"[HTCONDOR-WARN] 清空历史 part 输出目录失败：{target_dir}，原因：{type(exc).__name__}: {exc}"
-                    )
-            else:
-                target_dir.mkdir(parents=True, exist_ok=True)
+            # 所有子任务的结果统一合并到用户选择的输出根目录。
+            # 不能清空该目录，否则后完成的子任务会删除先完成子任务的结果。
+            target_dir.mkdir(parents=True, exist_ok=True)
 
             file_count, byte_count = self._copy_tree_contents(source_dir, target_dir)
             if file_count <= 0:
@@ -1992,7 +1982,7 @@ class TaskManager:
         return walk(data, [])
 
     def _rewrite_output_paths_for_part(self, data: Any, part_name: str):
-        """给每个子任务改一个独立输出目录，避免两个节点写同一个目录。"""
+        """让目录型输出统一写入原目录；单文件输出仍追加 part 标识。"""
         output_words = ["output", "out_dir", "outpath", "result", "save_dir", "target_dir"]
 
         def walk(obj: Any, key_name: str = ""):
@@ -2002,11 +1992,11 @@ class TaskManager:
                     if isinstance(value, str) and any(word in low_key for word in output_words):
                         try:
                             old_path = Path(value)
-                            # 文件路径保持后缀，目录路径追加 part_x。
+                            # 单文件输出必须追加 part 标识；目录输出统一写入原目录。
                             if old_path.suffix:
                                 new_path = old_path.with_name(f"{old_path.stem}_{part_name}{old_path.suffix}")
                             else:
-                                new_path = old_path / part_name
+                                new_path = old_path
                             new_path.parent.mkdir(parents=True, exist_ok=True)
                             if not new_path.suffix:
                                 new_path.mkdir(parents=True, exist_ok=True)
