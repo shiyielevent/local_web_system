@@ -6226,6 +6226,8 @@ function renderTaskManagementPage() {
             ? 'tool-app-page'
             : activeTab === 'module_mgmt' && moduleMgmtAction === 'installed_modules'
               ? 'module-installed-app-page'
+              : activeTab === 'module_mgmt' && moduleMgmtAction === 'cpp_upload'
+                ? 'module-upload-app-page'
               : undefined
       }
       style={styles.page}
@@ -6265,6 +6267,8 @@ function renderTaskManagementPage() {
               ? 'tool-content-host'
               : activeTab === 'module_mgmt' && moduleMgmtAction === 'installed_modules'
                 ? 'module-installed-content-host'
+                : activeTab === 'module_mgmt' && moduleMgmtAction === 'cpp_upload'
+                  ? 'module-upload-content-host'
                 : undefined
         }
         style={{
@@ -6278,7 +6282,13 @@ function renderTaskManagementPage() {
       >
         {activeTab === 'module_mgmt' && isAdmin && (
           <section
-            className={moduleMgmtAction === 'installed_modules' ? 'module-installed-section' : undefined}
+            className={
+              moduleMgmtAction === 'installed_modules'
+                ? 'module-installed-section'
+                : moduleMgmtAction === 'cpp_upload'
+                  ? 'module-upload-section'
+                  : undefined
+            }
             style={{
               ...styles.card,
               padding: 16,
@@ -6287,7 +6297,13 @@ function renderTaskManagementPage() {
             }}
           >
             <div
-              className={moduleMgmtAction === 'installed_modules' ? 'module-installed-layout' : undefined}
+              className={
+                moduleMgmtAction === 'installed_modules'
+                  ? 'module-installed-layout'
+                  : moduleMgmtAction === 'cpp_upload'
+                    ? 'module-upload-layout'
+                    : undefined
+              }
               style={{
                 display: 'grid',
                 gridTemplateColumns: '380px minmax(0, 1fr)',
@@ -6298,7 +6314,13 @@ function renderTaskManagementPage() {
               }}
             >
               <div
-                className={moduleMgmtAction === 'installed_modules' ? 'module-installed-sidebar' : undefined}
+                className={
+                  moduleMgmtAction === 'installed_modules'
+                    ? 'module-installed-sidebar'
+                    : moduleMgmtAction === 'cpp_upload'
+                      ? 'module-upload-sidebar'
+                      : undefined
+                }
                 style={{ ...styles.card, padding: 16 }}
               >
                 <div style={{ fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 16 }}>
@@ -6326,7 +6348,13 @@ function renderTaskManagementPage() {
               </div>
 
               <div
-                className={moduleMgmtAction === 'installed_modules' ? 'module-installed-main' : undefined}
+                className={
+                  moduleMgmtAction === 'installed_modules'
+                    ? 'module-installed-main'
+                    : moduleMgmtAction === 'cpp_upload'
+                      ? 'module-upload-main'
+                      : undefined
+                }
                 style={{ display: 'grid', gap: 16, minWidth: 0, minHeight: 'calc(100vh - 130px)', alignItems: 'stretch' }}
               >
                 {moduleMgmtAction === 'python_upload' && (
@@ -6488,7 +6516,7 @@ function renderTaskManagementPage() {
                 )}
 
                 {moduleMgmtAction === 'cpp_upload' && (
-                    <div style={{ ...styles.card, padding: 18 }}>
+                    <div className="module-upload-scroll" style={{ ...styles.card, padding: 18 }}>
                       <div style={{ fontSize: 22, fontWeight: 900, color: '#12385f', marginBottom: 14 }}>
                         可执行模块上传
                       </div>
