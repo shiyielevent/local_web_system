@@ -968,6 +968,33 @@ function getTaskProgressInfo(task, taskLogs, elapsedTextOverride = '') {
     };
   }
 
+  const fileProgress = task?.file_progress && typeof task.file_progress === 'object'
+    ? task.file_progress
+    : null;
+  const fileTotal = Number.parseInt(String(fileProgress?.total || task?.file_total || 0), 10) || 0;
+  if (fileTotal > 0) {
+    const rawDone = Number.parseInt(String(fileProgress?.done || task?.file_done || 0), 10) || 0;
+    const fileDone = Math.max(0, Math.min(fileTotal, rawDone));
+    const matchedOutputs = Number.parseInt(String(fileProgress?.matched_outputs || fileDone), 10) || fileDone;
+    const percent = Math.max(0, Math.min(99, Math.round((fileDone / fileTotal) * 100)));
+    const scanInterval = Number.parseInt(String(fileProgress?.scan_interval_seconds || 0), 10) || 0;
+    const outputDirs = Array.isArray(fileProgress?.output_dirs) ? fileProgress.output_dirs : [];
+    const scanText = scanInterval > 0
+      ? `父节点输出目录约每 ${scanInterval} 秒扫描一次`
+      : '父节点输出目录扫描';
+    const dirText = outputDirs.length > 0
+      ? `；扫描目录：${outputDirs.slice(0, 2).join('；')}${outputDirs.length > 2 ? ' 等' : ''}`
+      : '';
+
+    return {
+      percent,
+      label: `文件进度：${fileDone}/${fileTotal}`,
+      detail: `已生成 ${matchedOutputs} 个输出文件；${scanText}${elapsedText ? `，已运行 ${elapsedText}` : ''}${dirText}`,
+      mode: 'file_progress',
+      color: '#2d7cf6',
+    };
+  }
+
   const parallelTotal = Number.parseInt(String(task?.parallel_total || 0), 10) || 0;
   if (parallelTotal > 0) {
     const completed = Number.parseInt(String(task?.parallel_done || 0), 10) || 0;
@@ -2421,6 +2448,9 @@ function HTCondorPage({
   const smokeTestTitle = poolRole === 'child'
     ? '当前电脑是子节点。HTCondor 提交自检任务需要在父节点执行，否则会找不到本机 schedd。'
     : '提交一个很小的 HTCondor 作业，验证父节点调度、执行节点和返回码。';
+  const showParentExecutionControls = isAdmin && poolRole === 'parent';
+  const canManageParentConfig = isAdmin && poolRole === 'parent';
+  const canStartParentCluster = isAdmin && poolRole !== 'child';
   const leaveButtonStyle = leaveDisabled
     ? {
         ...styles.whiteBtn,
@@ -2823,13 +2853,13 @@ function HTCondorPage({
                 <div>
                   <div style={{ fontSize: 18, fontWeight: 900, color: '#12385f' }}>节点信息、任务分配比例与进程槽</div>
                   <div style={{ marginTop: 4, fontSize: 13, color: '#64748b', lineHeight: 1.45 }}>
-                    默认按 CPU/内存生成建议权重；管理员可手动调整。权重只影响输入文件数量分配。
+                    默认按 CPU/内存生成建议权重；仅父节点管理员可手动调整。权重只影响输入文件数量分配。
                   </div>
                 </div>
                 <select
                   style={{ ...styles.input, width: 136, minHeight: 40, fontSize: 14 }}
                   value={weightMode}
-                  disabled={!isAdmin}
+                  disabled={!canManageParentConfig}
                   onChange={(e) => changeWeightMode(e.target.value)}
                 >
                   <option value="weighted">按百分比分配</option>
@@ -2878,96 +2908,103 @@ function HTCondorPage({
                       </div>
                       <div>
                         <div style={{ fontSize: 12, fontWeight: 900, color: '#64748b', marginBottom: 4 }}>分配比例</div>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                          <button
-                            type="button"
-                            title="减少 1%"
-                            aria-label={`${machine} 分配比例减少 1%`}
-                            disabled={!isAdmin || weightMode === 'equal' || Number(draftValue) <= 0}
-                            onClick={() => setDraftWeight(machine, (Number(draftValue) || 0) - 1)}
-                            style={{
-                              width: 30,
-                              minWidth: 30,
-                              height: 36,
-                              borderRadius: 8,
-                              border: '1px solid #b9cce0',
-                              background: '#ffffff',
-                              color: '#17406b',
-                              fontSize: 22,
-                              fontWeight: 900,
-                              lineHeight: 1,
-                              padding: 0,
-                              display: 'inline-flex',
-                              alignItems: 'center',
-                              justifyContent: 'center',
-                              cursor: !isAdmin || weightMode === 'equal' || Number(draftValue) <= 0 ? 'not-allowed' : 'pointer',
-                              opacity: !isAdmin || weightMode === 'equal' || Number(draftValue) <= 0 ? 0.45 : 1,
-                              userSelect: 'none',
-                            }}
-                          >
-                            −
-                          </button>
-                          <input
-                            type="text"
-                            inputMode="numeric"
-                            pattern="[0-9]*"
-                            style={{
-                              ...styles.input,
-                              width: 48,
-                              minWidth: 48,
-                              minHeight: 36,
-                              padding: '0 5px',
-                              fontSize: 14,
-                              fontWeight: 800,
-                              textAlign: 'center',
-                            }}
-                            value={draftValue}
-                            disabled={!isAdmin || weightMode === 'equal'}
-                            onChange={(e) => setDraftWeight(machine, e.target.value.replace(/\D/g, ''))}
-                          />
-                          <button
-                            type="button"
-                            title="增加 1%"
-                            aria-label={`${machine} 分配比例增加 1%`}
-                            disabled={!isAdmin || weightMode === 'equal' || Number(draftValue) >= 100}
-                            onClick={() => setDraftWeight(machine, (Number(draftValue) || 0) + 1)}
-                            style={{
-                              width: 30,
-                              minWidth: 30,
-                              height: 36,
-                              borderRadius: 8,
-                              border: '1px solid #b9cce0',
-                              background: '#ffffff',
-                              color: '#17406b',
-                              fontSize: 22,
-                              fontWeight: 900,
-                              lineHeight: 1,
-                              padding: 0,
-                              display: 'inline-flex',
-                              alignItems: 'center',
-                              justifyContent: 'center',
-                              cursor: !isAdmin || weightMode === 'equal' || Number(draftValue) >= 100 ? 'not-allowed' : 'pointer',
-                              opacity: !isAdmin || weightMode === 'equal' || Number(draftValue) >= 100 ? 0.45 : 1,
-                              userSelect: 'none',
-                            }}
-                          >
-                            +
-                          </button>
-                          <span style={{ fontSize: 13, fontWeight: 900, color: '#475569' }}>%</span>
-                        </div>
+                        {canManageParentConfig ? (
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                            <button
+                              type="button"
+                              title="减少 1%"
+                              aria-label={`${machine} 分配比例减少 1%`}
+                              disabled={weightMode === 'equal' || Number(draftValue) <= 0}
+                              onClick={() => setDraftWeight(machine, (Number(draftValue) || 0) - 1)}
+                              style={{
+                                width: 30,
+                                minWidth: 30,
+                                height: 36,
+                                borderRadius: 8,
+                                border: '1px solid #b9cce0',
+                                background: '#ffffff',
+                                color: '#17406b',
+                                fontSize: 22,
+                                fontWeight: 900,
+                                lineHeight: 1,
+                                padding: 0,
+                                display: 'inline-flex',
+                                alignItems: 'center',
+                                justifyContent: 'center',
+                                cursor: weightMode === 'equal' || Number(draftValue) <= 0 ? 'not-allowed' : 'pointer',
+                                opacity: weightMode === 'equal' || Number(draftValue) <= 0 ? 0.45 : 1,
+                                userSelect: 'none',
+                              }}
+                            >
+                              −
+                            </button>
+                            <input
+                              type="text"
+                              inputMode="numeric"
+                              pattern="[0-9]*"
+                              style={{
+                                ...styles.input,
+                                width: 48,
+                                minWidth: 48,
+                                minHeight: 36,
+                                padding: '0 5px',
+                                fontSize: 14,
+                                fontWeight: 800,
+                                textAlign: 'center',
+                              }}
+                              value={draftValue}
+                              disabled={weightMode === 'equal'}
+                              onChange={(e) => setDraftWeight(machine, e.target.value.replace(/\D/g, ''))}
+                            />
+                            <button
+                              type="button"
+                              title="增加 1%"
+                              aria-label={`${machine} 分配比例增加 1%`}
+                              disabled={weightMode === 'equal' || Number(draftValue) >= 100}
+                              onClick={() => setDraftWeight(machine, (Number(draftValue) || 0) + 1)}
+                              style={{
+                                width: 30,
+                                minWidth: 30,
+                                height: 36,
+                                borderRadius: 8,
+                                border: '1px solid #b9cce0',
+                                background: '#ffffff',
+                                color: '#17406b',
+                                fontSize: 22,
+                                fontWeight: 900,
+                                lineHeight: 1,
+                                padding: 0,
+                                display: 'inline-flex',
+                                alignItems: 'center',
+                                justifyContent: 'center',
+                                cursor: weightMode === 'equal' || Number(draftValue) >= 100 ? 'not-allowed' : 'pointer',
+                                opacity: weightMode === 'equal' || Number(draftValue) >= 100 ? 0.45 : 1,
+                                userSelect: 'none',
+                              }}
+                            >
+                              +
+                            </button>
+                            <span style={{ fontSize: 13, fontWeight: 900, color: '#475569' }}>%</span>
+                          </div>
+                        ) : (
+                          <div className="htcondor-readonly-value">{draftValue}%</div>
+                        )}
                       </div>
                       <div>
                         <div style={{ fontSize: 11, fontWeight: 900, color: '#64748b', marginBottom: 4 }}>进程槽</div>
-                        <select
-                          style={{ ...styles.input, minHeight: 36, padding: '0 8px', fontSize: 13 }}
-                          value={draftProcessSlot}
-                          disabled={!isAdmin}
-                          onChange={(e) => setDraftProcessSlot(machine, e.target.value)}
-                        >
-                          {processSlotOptions.map((value) => (
-                            <option key={value} value={value}>{value}</option>
-                          ))}
-                        </select>
+                        {canManageParentConfig ? (
+                          <select
+                            style={{ ...styles.input, minHeight: 36, padding: '0 8px', fontSize: 13 }}
+                            value={draftProcessSlot}
+                            onChange={(e) => setDraftProcessSlot(machine, e.target.value)}
+                          >
+                            {processSlotOptions.map((value) => (
+                              <option key={value} value={value}>{value}</option>
+                            ))}
+                          </select>
+                        ) : (
+                          <div className="htcondor-readonly-value">{draftProcessSlot}</div>
+                        )}
                       </div>
                     </div>
                   );
@@ -2991,18 +3028,22 @@ function HTCondorPage({
                   }}>
                     当前分配比例合计：{weightTotal}% {weightsValid ? '✓' : '（必须为100%）'}
                   </div>
-                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-                    <button style={{ ...styles.whiteBtn, padding: '8px 12px' }} disabled={!!busy || !isAdmin} onClick={resetWeightsToSuggested}>
-                      恢复建议比例/槽
-                    </button>
-                    <button
-                      style={{ ...styles.blueBtn, padding: '8px 12px', opacity: weightsValid ? 1 : 0.55 }}
-                      disabled={!!busy || !isAdmin || !weightsValid}
-                      onClick={saveWeights}
-                    >
-                      保存分配比例与进程槽
-                    </button>
-                  </div>
+                  {canManageParentConfig ? (
+                    <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                      <button style={{ ...styles.whiteBtn, padding: '8px 12px' }} disabled={!!busy} onClick={resetWeightsToSuggested}>
+                        恢复建议比例/槽
+                      </button>
+                      <button
+                        style={{ ...styles.blueBtn, padding: '8px 12px', opacity: weightsValid ? 1 : 0.55 }}
+                        disabled={!!busy || !weightsValid}
+                        onClick={saveWeights}
+                      >
+                        保存分配比例与进程槽
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="htcondor-permission-note">任务分配比例与进程槽由父节点管理员统一配置。</div>
+                  )}
                   </div>
                 </div>
               ) : (
@@ -3016,16 +3057,25 @@ function HTCondorPage({
 
           <div className="htcondor-action-bar">
             <button style={styles.blueBtn} disabled={!!busy} onClick={onRefresh}>刷新状态</button>
-            <button style={styles.whiteBtn} disabled={!!busy || !isAdmin} onClick={() => onSetMode('htcondor')}>启用 HTCondor 执行</button>
-            <button style={styles.whiteBtn} disabled={!!busy || !isAdmin} onClick={() => onSetMode('local')}>切回本机执行</button>
-            <button
-              style={styles.whiteBtn}
-              disabled={smokeTestDisabled}
-              title={smokeTestTitle}
-              onClick={onSmokeTest}
-            >
-              提交自检任务
-            </button>
+            {showParentExecutionControls && (
+              <>
+                <button style={styles.whiteBtn} disabled={!!busy} onClick={() => onSetMode('htcondor')}>启用 HTCondor 执行</button>
+                <button style={styles.whiteBtn} disabled={!!busy} onClick={() => onSetMode('local')}>切回本机执行</button>
+                <button
+                  style={styles.whiteBtn}
+                  disabled={smokeTestDisabled}
+                  title={smokeTestTitle}
+                  onClick={onSmokeTest}
+                >
+                  提交自检任务
+                </button>
+              </>
+            )}
+            {!showParentExecutionControls && (
+              <div className="htcondor-action-note">
+                子节点只执行父节点下发任务，执行模式切换和自检任务由父节点管理员操作。
+              </div>
+            )}
           </div>
         </div>
 
@@ -3080,10 +3130,14 @@ function HTCondorPage({
           }}>
             <div style={{ fontSize: 16, fontWeight: 900, color: '#12385f' }}>共享目录</div>
             <div style={{ marginTop: 4, fontSize: 12, color: '#64748b', lineHeight: 1.55 }}>
-              父节点点击“添加共享目录”后选择本地数据目录；系统会自动创建 Windows 共享。允许添加多个共享目录。
+              {canManageParentConfig
+                ? '父节点点击“添加共享目录”后选择本地数据目录；系统会自动创建 Windows 共享。允许添加多个共享目录。'
+                : '共享目录由父节点管理员创建；当前节点只负责查看配置和测试访问。'}
             </div>
             <div style={{ marginTop: 10, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-              <button style={styles.blueBtn} disabled={!!busy || !isAdmin} onClick={onPrepareShare}>添加共享目录</button>
+              {canManageParentConfig && (
+                <button style={styles.blueBtn} disabled={!!busy} onClick={onPrepareShare}>添加共享目录</button>
+              )}
               <button style={styles.whiteBtn} disabled={!!busy} onClick={onShowShares}>查看当前配置的共享目录</button>
               <button style={styles.whiteBtn} disabled={!!busy || !sharedEnabled} onClick={onTestShare}>测试共享目录</button>
             </div>
@@ -3097,7 +3151,14 @@ function HTCondorPage({
           </div>
 
           <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 16 }}>
-            <button style={styles.blueBtn} disabled={!!busy || !isAdmin} onClick={onCreateParent}>启动集群</button>
+            <button
+              style={styles.blueBtn}
+              disabled={!!busy || !canStartParentCluster}
+              onClick={onCreateParent}
+              title={poolRole === 'child' ? '当前电脑已经是子节点，不能在子节点上启动父节点集群。' : '启动本机为 HTCondor 父节点'}
+            >
+              启动集群
+            </button>
             <button
               style={styles.whiteBtn}
               disabled={joinDisabled}

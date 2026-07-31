@@ -93,6 +93,36 @@ button { cursor: pointer; }
   white-space: nowrap;
 }
 
+.htcondor-action-note {
+  flex: 1 1 260px;
+  color: #64748b;
+  font-size: 13px;
+  line-height: 1.45;
+  padding: 8px 0;
+}
+
+.htcondor-readonly-value {
+  min-height: 36px;
+  min-width: 58px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 1px solid #dce8f3;
+  background: #f8fbff;
+  color: #17406b;
+  font-size: 14px;
+  font-weight: 900;
+}
+
+.htcondor-permission-note {
+  color: #64748b;
+  font-size: 13px;
+  line-height: 1.45;
+  padding: 8px 0;
+}
+
 .htcondor-cluster-scroll {
   min-height: 640px;
 }

@@ -1930,6 +1930,7 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
                 module,
                 scan_paths,
                 owner_username=username,
+                expected_total=len(jobs),
             )
 
         return task
@@ -1960,6 +1961,7 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
                     module,
                     output_paths,
                     owner_username=username,
+                    expected_total=len(jobs),
                 )
 
             return task
@@ -1984,6 +1986,7 @@ def api_run_module(payload: ModuleRunRequest, authorization: str | None = Header
             module,
             output_paths,
             owner_username=username,
+            expected_total=estimate_input_file_count_for_progress(module, inputs),
         )
 
     return task
@@ -7603,6 +7606,123 @@ def collect_changed_output_files(
     return changed
 
 
+def get_output_progress_scan_interval_seconds() -> float:
+    """输出目录进度扫描间隔。
+
+    默认 3 秒：前端感知足够及时，同时避免频繁递归扫描大输出目录。
+    可通过 LOCAL_WEB_OUTPUT_PROGRESS_SCAN_SECONDS 调整，限制在 1-30 秒之间。
+    """
+    try:
+        interval = float(os.environ.get("LOCAL_WEB_OUTPUT_PROGRESS_SCAN_SECONDS", "3") or "3")
+    except Exception:
+        interval = 3.0
+    return max(1.0, min(30.0, interval))
+
+
+def output_progress_display_dirs(output_paths: list[Path]) -> list[str]:
+    """返回用于前端显示的父节点输出扫描目录。"""
+    dirs: list[str] = []
+    seen: set[str] = set()
+    for raw_path in output_paths:
+        p = Path(raw_path)
+        scan_dir = p if (p.is_dir() or not p.suffix) else p.parent
+        if not scan_dir:
+            continue
+        try:
+            resolved = scan_dir.resolve()
+        except Exception:
+            resolved = scan_dir
+        key = os.path.normcase(str(resolved))
+        if key in seen:
+            continue
+        seen.add(key)
+        dirs.append(str(resolved))
+    return dirs
+
+
+def estimate_input_file_count_for_progress(module: dict, inputs: dict) -> int:
+    """普通任务的文件级进度兜底估算。
+
+    平台批处理和并行拆分会直接使用 jobs 数量；这里主要服务于普通单任务或
+    module_internal 模式，尽量从输入文件夹里估算可处理文件数量。
+    """
+    try:
+        cfg = normalize_parallel_config(module)
+        patterns = parse_parallel_patterns(str(cfg.get("file_patterns") or DEFAULT_PARALLEL_PATTERNS))
+    except Exception:
+        patterns = parse_parallel_patterns(DEFAULT_PARALLEL_PATTERNS)
+
+    candidate_keys: list[str] = []
+    try:
+        explicit = str(normalize_parallel_config(module).get("input_key") or "").strip()
+        if explicit:
+            candidate_keys.append(explicit)
+    except Exception:
+        pass
+
+    for field in module.get("inputs", []) or []:
+        key = str(field.get("key") or "").strip()
+        if not key or key in candidate_keys:
+            continue
+        if is_output_field(field):
+            continue
+        if str(field.get("type") or "").lower() in {"file_path", "dir_path"}:
+            candidate_keys.append(key)
+
+    for key in candidate_keys:
+        value = str((inputs or {}).get(key) or "").strip()
+        if not value:
+            continue
+        p = Path(value)
+        try:
+            if p.is_file():
+                return 1
+            if p.is_dir():
+                found: set[str] = set()
+                for pattern in patterns:
+                    for item in p.rglob(pattern):
+                        if item.is_file():
+                            found.add(os.path.normcase(str(item.resolve())))
+                if found:
+                    return len(found)
+        except Exception:
+            continue
+    return 0
+
+
+def update_task_output_file_progress(
+    task_id: str,
+    output_paths: list[Path],
+    initial_snapshot: dict[str, tuple[int, int]],
+    expected_total: int,
+    scan_interval: float,
+) -> list[Path]:
+    """扫描父节点输出目录并写回文件级进度。"""
+    if expected_total <= 0:
+        return []
+
+    changed_files = collect_changed_output_files(output_paths, initial_snapshot)
+    matched_outputs = len(changed_files)
+    done = max(0, min(int(expected_total), matched_outputs))
+
+    task_manager.update_task(
+        task_id,
+        file_total=int(expected_total),
+        file_done=done,
+        file_progress={
+            "mode": "output_scan",
+            "source": "parent_output_scan",
+            "total": int(expected_total),
+            "done": done,
+            "matched_outputs": matched_outputs,
+            "scan_interval_seconds": int(round(scan_interval)),
+            "output_dirs": output_progress_display_dirs(output_paths),
+            "updated_at": now_iso(),
+        },
+    )
+    return changed_files
+
+
 def upsert_data_files_from_outputs(
     module: dict,
     task_id: str,
@@ -7674,23 +7794,62 @@ def start_data_file_scan_after_task(
     module: dict,
     output_paths: list[Path],
     owner_username: str = "",
+    expected_total: int | None = None,
 ):
     """
-    任务结束后扫描输出路径，将结果登记到数据管理。
+    扫描父节点输出路径：
+    1. 任务运行中按输出文件数量写回进度；
+    2. 任务结束后将结果登记到数据管理。
     """
     import threading
     import time
 
     terminal_statuses = {"success", "failed", "cancelled"}
     initial_output_snapshot = snapshot_output_files(output_paths)
+    try:
+        progress_total = max(0, int(expected_total or 0))
+    except Exception:
+        progress_total = 0
+    scan_interval = get_output_progress_scan_interval_seconds()
 
     def worker():
+        if progress_total > 0:
+            try:
+                task_manager.append_log(
+                    task_id,
+                    f"[PROGRESS] 文件级进度按父节点输出目录扫描，每 {scan_interval:g} 秒刷新一次；总文件数={progress_total}",
+                )
+                update_task_output_file_progress(
+                    task_id,
+                    output_paths,
+                    initial_output_snapshot,
+                    progress_total,
+                    scan_interval,
+                )
+            except Exception:
+                pass
+
         while True:
             task = task_manager.get_task(task_id)
             if not task:
                 return
 
             status = task.get("status")
+            if progress_total > 0:
+                try:
+                    update_task_output_file_progress(
+                        task_id,
+                        output_paths,
+                        initial_output_snapshot,
+                        progress_total,
+                        scan_interval,
+                    )
+                except Exception as exc:
+                    try:
+                        task_manager.append_log(task_id, f"[PROGRESS-WARN] 输出目录进度扫描失败: {repr(exc)}")
+                    except Exception:
+                        pass
+
             if status in terminal_statuses:
                 if status in {"success", "cancelled"}:
                     try:
@@ -7742,7 +7901,7 @@ def start_data_file_scan_after_task(
                         pass
                 return
 
-            time.sleep(2)
+            time.sleep(scan_interval)
 
     threading.Thread(target=worker, daemon=True).start()
 
