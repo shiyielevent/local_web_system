@@ -2215,8 +2215,44 @@ function Invoke-AsSubmitAccount {
         -WorkingDirectory $RuntimeDir `
         -RedirectStandardOutput $StdoutPath `
         -RedirectStandardError $StderrPath `
-        -Wait `
         -PassThru
+
+    if ($null -eq $process) {
+        throw "无法启动提交账户辅助进程：$ScriptPath"
+    }
+
+    # Windows PowerShell 5.1 在 Start-Process 同时使用 -Credential、
+    # RedirectStandardOutput/RedirectStandardError 和 -Wait 时，偶尔会出现：
+    # 子进程已经结束、结果文件也已生成，但父脚本仍永久卡在 -Wait。
+    # 原函数虽然接收 TimeoutSeconds，却没有真正使用。这里改为只轮询目标
+    # 进程本身，并严格执行超时，避免一次自检让整个启动器无限等待。
+    $effectiveTimeout = [Math]::Max(10, [int]$TimeoutSeconds)
+    $deadline = (Get-Date).AddSeconds($effectiveTimeout)
+
+    while (-not $process.HasExited) {
+        if ((Get-Date) -ge $deadline) {
+            try {
+                Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+                $process.WaitForExit(5000) | Out-Null
+            }
+            catch {}
+
+            throw (
+                "提交账户辅助进程执行超时。" +
+                " timeout_seconds=$effectiveTimeout" +
+                " script=$ScriptPath" +
+                " pid=$($process.Id)"
+            )
+        }
+
+        $process.WaitForExit(500) | Out-Null
+        $process.Refresh()
+    }
+
+    # 确保重定向的 stdout/stderr 已全部刷新到文件，然后再读取退出码和日志。
+    $process.WaitForExit()
+    $processExitCode = [int]$process.ExitCode
+    $process.Dispose()
 
     $stdoutText = ""
     if (Test-Path -LiteralPath $StdoutPath -PathType Leaf) {
@@ -2245,7 +2281,7 @@ function Invoke-AsSubmitAccount {
     }
 
     return [pscustomobject]@{
-        exit_code = [int]$process.ExitCode
+        exit_code = $processExitCode
         stdout = $stdoutText
         stderr = $stderrText
     }
