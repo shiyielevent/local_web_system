@@ -64,13 +64,33 @@ button { cursor: pointer; }
   display: flex;
   flex: 1 1 auto;
   flex-direction: column;
-  min-height: 340px;
+  min-height: 0;
   margin-top: 8px;
   padding-right: 6px;
+  padding-bottom: 10px;
 }
 
 .htcondor-status-column {
   gap: 0;
+}
+
+.htcondor-action-bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+  padding: 12px 6px 0;
+  border-top: 1px solid #dce8f3;
+  background: linear-gradient(180deg, rgba(248, 251, 255, 0.95), #f8fbff);
+  position: relative;
+  z-index: 20;
+}
+
+.htcondor-action-bar button {
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 .htcondor-cluster-scroll {

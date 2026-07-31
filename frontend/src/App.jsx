@@ -3012,19 +3012,20 @@ function HTCondorPage({
               )}
             </div>
 
-            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginTop: 'auto', paddingTop: 14 }}>
-              <button style={styles.blueBtn} disabled={!!busy} onClick={onRefresh}>刷新状态</button>
-              <button style={styles.whiteBtn} disabled={!!busy || !isAdmin} onClick={() => onSetMode('htcondor')}>启用 HTCondor 执行</button>
-              <button style={styles.whiteBtn} disabled={!!busy || !isAdmin} onClick={() => onSetMode('local')}>切回本机执行</button>
-              <button
-                style={styles.whiteBtn}
-                disabled={smokeTestDisabled}
-                title={smokeTestTitle}
-                onClick={onSmokeTest}
-              >
-                提交自检任务
-              </button>
-            </div>
+          </div>
+
+          <div className="htcondor-action-bar">
+            <button style={styles.blueBtn} disabled={!!busy} onClick={onRefresh}>刷新状态</button>
+            <button style={styles.whiteBtn} disabled={!!busy || !isAdmin} onClick={() => onSetMode('htcondor')}>启用 HTCondor 执行</button>
+            <button style={styles.whiteBtn} disabled={!!busy || !isAdmin} onClick={() => onSetMode('local')}>切回本机执行</button>
+            <button
+              style={styles.whiteBtn}
+              disabled={smokeTestDisabled}
+              title={smokeTestTitle}
+              onClick={onSmokeTest}
+            >
+              提交自检任务
+            </button>
           </div>
         </div>
 

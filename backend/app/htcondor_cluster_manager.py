@@ -1135,6 +1135,11 @@ $result | ConvertTo-Json -Depth 8 | Set-Content -Path $resultPath -Encoding UTF8
         service_state = ((runtime.get("installed_runtime") or {}).get("service") or {}).get("state")
         install_ok = bool(install_result.get("success") and install_result.get("status") == "fully_validated")
         service_ok = service_state == "running"
+        offline = {"ok": False, "text": "Condor 服务未运行"}
+        nodes = {**offline, "items": []}
+        ping = dict(offline)
+        queue = dict(offline)
+        slot = dict(offline)
         if service_ok:
             # All three commands contact the same remote collector on a child
             # node. Running them serially triples any DNS/network delay.
@@ -1146,11 +1151,6 @@ $result | ConvertTo-Json -Depth 8 | Set-Content -Path $resultPath -Encoding UTF8
                 ping = ping_future.result()
                 queue = queue_future.result()
             slot = {"ok": bool(nodes.get("ok")), "text": str(nodes.get("text") or "")}
-        else:
-            offline = {"ok": False, "text": "Condor 服务未运行"}
-            nodes = {**offline, "items": []}
-            ping = offline
-            queue = offline
         mode = str(self.state.get("execution_mode") or "local")
         local_machine = socket.gethostname()
         pool_role = str(self.state.get("pool_role") or "standalone")
