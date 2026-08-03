@@ -1,4 +1,5 @@
 from __future__ import annotations
+import base64
 import copy
 import fnmatch
 import json
@@ -629,6 +630,36 @@ class TaskManager:
         except Exception:
             return []
 
+        # Reuse this exact condor_status result for the CPU/memory and process
+        # slot calculations below.  Previously the split path immediately
+        # launched a second identical status command; when both commands hit
+        # their 90-second network timeout, the UI sat at queued for ~3 minutes.
+        aggregated: Dict[str, Dict[str, Any]] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            machine = str(item.get("machine") or "").strip()
+            if not machine:
+                continue
+            old = aggregated.get(machine) or {}
+            try:
+                cpus = max(float(old.get("cpus") or 0), float(item.get("cpus") or 0))
+            except Exception:
+                cpus = old.get("cpus") or item.get("cpus")
+            try:
+                memory = max(float(old.get("memory") or 0), float(item.get("memory") or 0))
+            except Exception:
+                memory = old.get("memory") or item.get("memory")
+            aggregated[machine] = {
+                **old,
+                **item,
+                "cpus": cpus or item.get("cpus"),
+                "memory": memory or item.get("memory"),
+            }
+        if aggregated:
+            self._htcondor_node_status_cache = {k: dict(v) for k, v in aggregated.items()}
+            self._htcondor_node_status_cache_at = time.time()
+
         machines: List[str] = []
         # 优先使用空闲节点；如果暂时没有 Idle，也保留节点名，方便 HTCondor 自己排队。
         idle_items = [
@@ -1205,6 +1236,67 @@ class TaskManager:
 
         return False
 
+    def _htcondor_stream_stage_enabled(self, module_item: Dict[str, Any] | None = None) -> bool:
+        """远程节点是否使用“当前批次 + 下一批次”双缓冲本地暂存。"""
+        raw_env = str(os.environ.get("LOCAL_WEB_HTCONDOR_STREAM_STAGE_INPUTS", "")).strip().lower()
+        if raw_env:
+            return raw_env in {"1", "true", "yes", "on"}
+
+        if isinstance(module_item, dict):
+            parallel = module_item.get("parallel") if isinstance(module_item.get("parallel"), dict) else {}
+            for key in ["htcondor_stream_stage_inputs", "stream_stage_inputs"]:
+                value = parallel.get(key)
+                if value not in {None, ""}:
+                    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+                value = module_item.get(key)
+                if value not in {None, ""}:
+                    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+        # 共享目录存在时，远程 EXE 默认先把小批次输入暂存到执行节点本地。
+        return True
+
+    def _htcondor_stream_stage_batch_size(self, module_item: Dict[str, Any] | None = None) -> int:
+        """双缓冲暂存每批文件数；按需求只允许 1 或 2，默认 2。"""
+        raw_values: List[Any] = [
+            os.environ.get("LOCAL_WEB_HTCONDOR_STAGE_FILES_PER_BATCH", ""),
+        ]
+        if isinstance(module_item, dict):
+            parallel = module_item.get("parallel") if isinstance(module_item.get("parallel"), dict) else {}
+            for key in ["htcondor_stage_files_per_batch", "stage_files_per_batch"]:
+                raw_values.append(parallel.get(key))
+                raw_values.append(module_item.get(key))
+        raw_values.append(2)
+
+        for raw in raw_values:
+            if raw in {None, ""}:
+                continue
+            try:
+                return max(1, min(2, int(raw)))
+            except Exception:
+                continue
+        return 2
+
+    def _htcondor_stream_stage_first_batch_size(self, module_item: Dict[str, Any] | None = None) -> int:
+        """首批直接从共享目录读取的文件数，默认 1 个。"""
+        raw_values: List[Any] = [
+            os.environ.get("LOCAL_WEB_HTCONDOR_FIRST_STAGE_FILES", ""),
+        ]
+        if isinstance(module_item, dict):
+            parallel = module_item.get("parallel") if isinstance(module_item.get("parallel"), dict) else {}
+            for key in ["htcondor_first_stage_files", "first_stage_files"]:
+                raw_values.append(parallel.get(key))
+                raw_values.append(module_item.get(key))
+        raw_values.append(1)
+
+        for raw in raw_values:
+            if raw in {None, ""}:
+                continue
+            try:
+                return max(1, min(2, int(raw)))
+            except Exception:
+                continue
+        return 1
+
     def _htcondor_max_files_per_job(self, module_item: Dict[str, Any] | None = None) -> int:
         """每个 HTCondor 子任务最多处理多少个输入文件。
 
@@ -1750,6 +1842,12 @@ class TaskManager:
         output_defs = self._module_output_defs(module_item, split_key=split_key)
         aux_input_defs = self._module_aux_input_defs(module_item, split_key=split_key)
         shared_io = self._htcondor_shared_io_enabled()
+        stream_stage_enabled = bool(shared_io and self._htcondor_stream_stage_enabled(module_item))
+        stream_stage_batch_size = self._htcondor_stream_stage_batch_size(module_item)
+        stream_stage_first_batch_size = min(
+            stream_stage_batch_size,
+            self._htcondor_stream_stage_first_batch_size(module_item),
+        )
         shared_root = self._shared_task_root(parent_id) if shared_io else split_root
         if shared_io:
             shared_root.mkdir(parents=True, exist_ok=True)
@@ -1802,9 +1900,40 @@ class TaskManager:
 
             shared_input_unc = self._path_to_shared_unc(part_input_dir) if shared_io else ""
             use_local_paths = bool(shared_io and self._htcondor_target_uses_local_paths(machine))
+            stream_stage = bool(
+                stream_stage_enabled
+                and not use_local_paths
+                and shared_input_unc
+                and len(chunk_items) > stream_stage_first_batch_size
+            )
+            direct_input_unc = ""
+            if stream_stage:
+                # The first one or two inputs are exposed through a tiny UNC
+                # directory view and executed immediately.  While that first
+                # algorithm process is running, the wrapper prefetches the next
+                # batch into the execute node's local disk.
+                direct_input_dir = part_dir / f"{split_key}_direct"
+                direct_input_dir.mkdir(parents=True, exist_ok=True)
+                direct_modes: List[str] = []
+                for source in chunk_items[:stream_stage_first_batch_size]:
+                    direct_modes.append(self._link_or_copy_file(
+                        source,
+                        direct_input_dir / source.name,
+                        allow_copy=False,
+                    ))
+                if any(str(mode).startswith("failed") for mode in direct_modes):
+                    raise RuntimeError("无法为远程首批直读文件创建目录视图。")
+                used_modes.extend(direct_modes)
+                direct_input_unc = self._path_to_shared_unc(direct_input_dir)
+                if not direct_input_unc:
+                    raise RuntimeError("无法把远程首批直读目录转换为 UNC 路径。")
             if shared_io and use_local_paths:
                 # 父节点本机任务直接读写本地路径，避免 netCDF4/HDF5 通过 UNC 访问自己的共享目录。
                 part_config[split_key] = str(part_input_dir)
+            elif stream_stage:
+                # 远程节点由作业包装器按“当前批次 + 下一批次”复制到本地沙箱。
+                # EXE 启动前，包装器会把这里改成已经完整复制好的当前批次目录。
+                part_config[split_key] = "__LOCAL_WEB_JOB_DIR__/stage_current"
             elif shared_io and shared_input_unc:
                 # 远程子节点通过 UNC 读取父节点共享目录。
                 part_config[split_key] = shared_input_unc
@@ -1822,6 +1951,9 @@ class TaskManager:
                     out_local, out_unc = self._make_shared_part_output_path(original_out_path, part_name)
                     out_value = str(out_local) if use_local_paths else out_unc
                     if out_value:
+                        # 双缓冲只把“大输入”暂存到远程节点本地；算法生成的输出仍直接
+                        # 写回父节点共享目录。这样每个 TIF 在计算完成后立即传回父节点，
+                        # 不再依赖 Windows HTCondor 对整个输出目录的回收与合并。
                         part_config[out_key] = out_value
                         continue
 
@@ -1883,6 +2015,25 @@ class TaskManager:
 
             part_command = [str(x) for x in command]
             part_command[config_index] = str(part_config_path)
+            part_env = dict(env or {})
+            if stream_stage:
+                stream_stage_plan = {
+                    "version": 1,
+                    "input_key": split_key,
+                    "source_dir": shared_input_unc,
+                    "direct_input_dir": direct_input_unc,
+                    "files": [source.name for source in chunk_items],
+                    "batch_size": stream_stage_batch_size,
+                    "first_batch_size": stream_stage_first_batch_size,
+                    "output_dirs": [
+                        str(item.get("job_subdir") or item.get("key") or "").strip()
+                        for item in output_mappings
+                        if str(item.get("job_subdir") or item.get("key") or "").strip()
+                    ],
+                }
+                part_env["LOCAL_WEB_HTCONDOR_STREAM_STAGE_PLAN_B64"] = base64.b64encode(
+                    json.dumps(stream_stage_plan, ensure_ascii=False).encode("utf-8")
+                ).decode("ascii")
 
             entries.append({
                 "spec": {
@@ -1891,7 +2042,7 @@ class TaskManager:
                     "module_name": str(module_item.get("name") or parent_task.get("module_name") or ""),
                     "command": part_command,
                     "working_dir": working_dir,
-                    "env": env or {},
+                    "env": part_env,
                     "target_machine": machine,
                     "inputs": {
                         "split_mode": "module_config",
@@ -1912,7 +2063,13 @@ class TaskManager:
                         "htcondor_max_files_per_job": max_files_per_job,
                         "file_patterns": self._module_file_patterns(module_item, split_input),
                         "output_mappings": output_mappings,
+                        # 输入双缓冲不改变输出策略：父节点任务写本地目录，远程任务写父节点 UNC。
+                        # 两者的输出都已直接进入用户选择的目录，无需 HTCondor 再回收临时输出目录。
                         "shared_io": bool(shared_io and (shared_input_unc or use_local_paths)),
+                        "stream_stage_inputs": stream_stage,
+                        "stream_stage_batch_size": stream_stage_batch_size if stream_stage else 0,
+                        "stream_stage_first_batch_size": stream_stage_first_batch_size if stream_stage else 0,
+                        "stream_direct_input_unc": direct_input_unc,
                         "shared_input_dir_unc": shared_input_unc,
                         "link_modes": sorted(set(used_modes)),
                     },
@@ -2539,6 +2696,17 @@ class TaskManager:
             max_workers = requested_max_workers
         max_workers = max(1, min(int(max_workers or 1), max(1, total)))
 
+        try:
+            node_submit_stagger_seconds = max(
+                0.0,
+                min(
+                    30.0,
+                    float(os.environ.get("LOCAL_WEB_HTCONDOR_NODE_START_STAGGER_SECONDS", "8") or "8"),
+                ),
+            )
+        except Exception:
+            node_submit_stagger_seconds = 8.0
+
         manager = self.htcondor_manager
         if manager is None:
             raise RuntimeError("HTCondorClusterManager 未初始化")
@@ -2568,13 +2736,43 @@ class TaskManager:
                 for machine in machines
             )
             self.append_log(parent_id, f"[HTCONDOR] 已启用节点并发上限：{node_limit_text}；同一执行节点按上限同时运行 EXE。")
+            if node_submit_stagger_seconds > 0:
+                self.append_log(
+                    parent_id,
+                    f"[HTCONDOR-START] 同一节点的多个 EXE 将错峰 {node_submit_stagger_seconds:g} 秒启动，"
+                    "避免模型和运行库同时冷加载拖慢首个结果。",
+                )
 
         shared_count = 0
+        stream_stage_count = 0
         for entry in entries:
             spec = entry.get("spec") if isinstance(entry, dict) else {}
             inputs = spec.get("inputs") if isinstance(spec.get("inputs"), dict) else {}
             if inputs.get("shared_io"):
                 shared_count += 1
+            if inputs.get("stream_stage_inputs"):
+                stream_stage_count += 1
+        if stream_stage_count:
+            batch_sizes = sorted({
+                int(
+                    (
+                        (entry.get("spec") or {}).get("inputs")
+                        if isinstance((entry.get("spec") or {}).get("inputs"), dict)
+                        else {}
+                    ).get("stream_stage_batch_size") or 2
+                )
+                for entry in entries
+                if isinstance(entry, dict)
+                and isinstance((entry.get("spec") or {}).get("inputs"), dict)
+                and ((entry.get("spec") or {}).get("inputs") or {}).get("stream_stage_inputs")
+            })
+            batch_text = "/".join(str(value) for value in batch_sizes) or "2"
+            self.append_log(
+                parent_id,
+                f"[HTCONDOR-STAGE] 已启用远程输入双缓冲：首批 1 个文件直接读取共享目录，后续每批 {batch_text} 个文件暂存到执行节点本地。"
+                "首批计算开始后立即后台预取下一批；计算当前批次时只保留下一批；"
+                "批次完成立即删除其本地输入，任务结束仅回传输出。",
+            )
         if shared_count:
             cfg = self._htcondor_shared_io_config()
             self.append_log(
@@ -2601,6 +2799,7 @@ class TaskManager:
         failures = 0
         future_map: Dict[Any, Dict[str, Any]] = {}
         active_target_counts: Dict[str, int] = {}
+        target_last_submit_monotonic: Dict[str, float] = {}
         submitted_count = 0
         pending_entries: List[tuple[int, Dict[str, Any]]] = list(enumerate(entries))
 
@@ -2611,7 +2810,23 @@ class TaskManager:
             if cleanup_root and cleanup_root not in htcondor_cleanup_roots:
                 htcondor_cleanup_roots.append(cleanup_root)
 
-        def make_on_update(current_child_id: str, current_label: str, current_target: str):
+        def make_on_update(
+            current_child_id: str,
+            current_label: str,
+            current_target: str,
+            current_spec: Dict[str, Any],
+        ):
+            current_inputs = (
+                current_spec.get("inputs")
+                if isinstance(current_spec.get("inputs"), dict)
+                else {}
+            )
+            current_stream_stage = bool(current_inputs.get("stream_stage_inputs"))
+            current_first_stage_files = max(
+                1,
+                int(current_inputs.get("stream_stage_first_batch_size") or 1),
+            )
+
             def on_update(info):
                 info = info or {}
                 kind = str(info.get("type") or "")
@@ -2654,6 +2869,16 @@ class TaskManager:
                             useful.append(raw)
                     if useful:
                         self._append_htcondor_output(current_child_id, "CONDOR", "\n".join(useful), max_lines=80)
+                    if any("executing" in str(line or "").lower() for line in useful):
+                        if current_stream_stage:
+                            phase_text = (
+                                f"已获得执行槽，首批 {current_first_stage_files} 个输入文件将直接从共享目录计算，并后台预取后续输入。"
+                            )
+                            self.update_task(current_child_id, runtime_phase="running_direct_first_batch")
+                        else:
+                            phase_text = "已获得执行槽，正在启动算法并加载运行库与模型。"
+                            self.update_task(current_child_id, runtime_phase="starting_algorithm")
+                        self.append_log(parent_id, f"[HTCONDOR-START] {current_label} {phase_text}")
             return on_update
 
         def make_should_cancel(current_child_id: str):
@@ -2721,7 +2946,7 @@ class TaskManager:
                     thread_limit=(resource_plans.get(target_machine) or {}).get("threads_per_exe"),
                 ),
                 timeout_seconds=self.htcondor_job_timeout_seconds,
-                on_update=make_on_update(child_id, label, target_machine),
+                on_update=make_on_update(child_id, label, target_machine, spec),
                 should_cancel=make_should_cancel(child_id),
                 target_machine=target_machine,
             )
@@ -2733,6 +2958,7 @@ class TaskManager:
             }
             if target_machine:
                 active_target_counts[target_machine] = active_target_counts.get(target_machine, 0) + 1
+                target_last_submit_monotonic[target_machine] = time.monotonic()
                 self.append_log(parent_id, f"[HTCONDOR] 已提交 {submitted_count + 1}/{total}: {label} -> {target_machine}")
             else:
                 self.append_log(parent_id, f"[HTCONDOR] 已提交 {submitted_count + 1}/{total}: {label}")
@@ -2747,7 +2973,15 @@ class TaskManager:
                     spec = entry.get("spec") if isinstance(entry, dict) else {}
                     target_machine = str((spec or {}).get("target_machine") or "").strip()
                     target_limit = per_target_limits.get(target_machine, max_workers)
-                    if not target_machine or active_target_counts.get(target_machine, 0) < target_limit:
+                    active_count = active_target_counts.get(target_machine, 0)
+                    stagger_ready = True
+                    if target_machine and active_count > 0 and node_submit_stagger_seconds > 0:
+                        last_submit = target_last_submit_monotonic.get(target_machine, 0.0)
+                        stagger_ready = (time.monotonic() - last_submit) >= node_submit_stagger_seconds
+                    if (
+                        (not target_machine or active_count < target_limit)
+                        and stagger_ready
+                    ):
                         selected_pos = pos
                         break
                 if selected_pos is None:
@@ -2774,6 +3008,7 @@ class TaskManager:
 
                     done, _ = wait(list(future_map.keys()), timeout=0.5, return_when=FIRST_COMPLETED)
                     if not done:
+                        launch_available(pool)
                         continue
 
                     for future in done:

@@ -6237,7 +6237,13 @@ def _single_run_executable_directory_passthrough(
     output_value: str,
 ) -> bool:
     """兼容旧安装清单：目录型 EXE 输出参数在单任务模式下原样传递。"""
-    if str(module.get("runtime") or "").strip().lower() != "executable":
+    runtime = str(module.get("runtime") or "").strip().lower()
+    if runtime not in {
+        "executable",
+        "cpp_native",
+        "native",
+        "native_executable",
+    }:
         return False
 
     mode = str(

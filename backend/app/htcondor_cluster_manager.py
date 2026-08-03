@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 from concurrent.futures import ThreadPoolExecutor
 import json
 import ipaddress
@@ -78,6 +79,32 @@ class HTCondorClusterManager:
             "last_timeout_monotonic": 0.0,
             "last_success_at": "",
         }
+        # A single task launch used to run the same collector health checks
+        # repeatedly: once before enqueueing, again while discovering nodes,
+        # and once per submitted child job.  A slow collector command can take
+        # up to 90 seconds, so two identical serial checks looked like a
+        # three-minute queue.  Keep a short, lock-protected snapshot so all
+        # children from one launch reuse the same validated pool state.
+        self._execution_health_cache_lock = threading.Lock()
+        self._execution_health_cache_at = 0.0
+        self._execution_health_cache_enabled = False
+        try:
+            self._execution_health_cache_seconds = max(
+                5.0,
+                min(60.0, float(os.environ.get("LOCAL_WEB_HTCONDOR_EXECUTION_CACHE_SECONDS", "20") or "20")),
+            )
+        except Exception:
+            self._execution_health_cache_seconds = 20.0
+        self._node_status_cache_lock = threading.Lock()
+        self._node_status_cache_at = 0.0
+        self._node_status_cache: Dict[str, Any] = {}
+        try:
+            self._node_status_cache_seconds = max(
+                2.0,
+                min(30.0, float(os.environ.get("LOCAL_WEB_HTCONDOR_NODE_CACHE_SECONDS", "10") or "10")),
+            )
+        except Exception:
+            self._node_status_cache_seconds = 10.0
 
         try:
             self.status_query_timeout_seconds = max(
@@ -233,22 +260,29 @@ class HTCondorClusterManager:
                 return
             local_root = str(item.get("local_root") or "").strip()
             unc_root = str(item.get("unc_root") or "").strip()
+            runtime_managed = bool(item.get("runtime_managed", raw.get("runtime_managed", False)))
             share_name = str(item.get("share_name") or "").strip()
             if not share_name:
-                share_name = (unc_root.rstrip("\\/").split("\\")[-1] if unc_root else "LocalWebData") or "LocalWebData"
-            enabled = bool(item.get("enabled", True)) and bool(local_root or unc_root)
+                share_name = (unc_root.rstrip("\\/").split("\\")[-1] if unc_root else "")
+            enabled = bool(item.get("enabled", True)) and bool(local_root or unc_root or runtime_managed)
             clean = {
                 "enabled": enabled,
                 "local_root": local_root,
                 "unc_root": unc_root,
                 "share_name": share_name,
+                "runtime_managed": runtime_managed,
                 "role": str(item.get("role") or raw.get("role") or "").strip(),
                 "parent_ip": str(item.get("parent_ip") or raw.get("parent_ip") or "").strip(),
                 "connect_ok": bool(item.get("connect_ok", raw.get("connect_ok", enabled))),
                 "connect_message": str(item.get("connect_message") or raw.get("connect_message") or "").strip(),
                 "updated_at": str(item.get("updated_at") or raw.get("updated_at") or "").strip(),
             }
-            key = (clean["unc_root"] or clean["local_root"] or clean["share_name"]).lower()
+            key = (
+                clean["unc_root"]
+                or clean["local_root"]
+                or clean["share_name"]
+                or (f"runtime://{clean['parent_ip']}" if runtime_managed else "")
+            ).lower()
             if not key:
                 return
             for idx, old in enumerate(items):
@@ -262,7 +296,7 @@ class HTCondorClusterManager:
         if isinstance(raw_shares, list):
             for item in raw_shares:
                 add_item(item)
-        if raw.get("unc_root") or raw.get("local_root"):
+        if raw.get("unc_root") or raw.get("local_root") or raw.get("runtime_managed"):
             add_item(raw)
         return items
 
@@ -294,6 +328,7 @@ class HTCondorClusterManager:
             "local_root": str(primary.get("local_root") or ""),
             "unc_root": str(primary.get("unc_root") or ""),
             "share_name": str(primary.get("share_name") or "LocalWebData"),
+            "runtime_managed": bool(primary.get("runtime_managed")),
             "role": str(primary.get("role") or ""),
             "parent_ip": str(primary.get("parent_ip") or ""),
             "connect_ok": bool(primary.get("connect_ok")),
@@ -308,6 +343,7 @@ class HTCondorClusterManager:
         """读取共享目录模式配置。新版支持多个共享目录，并兼容旧版单共享字段。"""
         items = self._normalize_shared_io_items()
         primary = self._primary_shared_io_item(items)
+        runtime_managed = bool(primary.get("runtime_managed"))
         enabled = any(bool(item.get("enabled")) for item in items)
         connect_ok = bool(primary.get("connect_ok"))
         connect_message = str(primary.get("connect_message") or "").strip()
@@ -333,7 +369,11 @@ class HTCondorClusterManager:
             "enabled": bool(enabled),
             "local_root": str(primary.get("local_root") or "").strip(),
             "unc_root": str(primary.get("unc_root") or "").strip(),
-            "share_name": str(primary.get("share_name") or "LocalWebData").strip() or "LocalWebData",
+            "share_name": (
+                "" if runtime_managed
+                else (str(primary.get("share_name") or "LocalWebData").strip() or "LocalWebData")
+            ),
+            "runtime_managed": runtime_managed,
             "role": str(primary.get("role") or "").strip(),
             "parent_ip": str(primary.get("parent_ip") or "").strip(),
             "connect_ok": connect_ok,
@@ -706,15 +746,52 @@ $result | ConvertTo-Json -Depth 8 | Set-Content -Path $resultPath -Encoding UTF8
             raise HTCondorClusterError("共享目录自动连接当前只支持 Windows。")
 
         parent_ip = str(parent_ip or "").strip()
-        share_name = str(share_name or "LocalWebData").strip() or "LocalWebData"
+        requested_share_name = str(share_name or "").strip()
         unc_root = str(unc_root or "").strip()
+        user = str(os.environ.get("LOCAL_WEB_HTCONDOR_SHARE_USER", "")).strip()
+        password = str(os.environ.get("LOCAL_WEB_HTCONDOR_SHARE_PASSWORD", "")).strip()
+
+        # 子节点并不知道父节点安装时随机生成的 LocalWebCondor 密码，不能在加入
+        # 集群时用当前 Windows 账户盲目访问 SMB。真实远程任务由父节点提交，
+        # 父节点会在 run_job.cmd 中自动注入自己的专用共享凭据。因此未显式配置
+        # 外部共享账号时，将共享连接标记为“任务运行时管理”，既不保存管理员
+        # 密码，也不再产生每次加入集群必现的 WinError 1326。
+        if not (user and password):
+            message = (
+                "子节点已启用任务运行时共享连接；父节点提交远程任务时会自动提供"
+                "实际共享路径和专用凭据，无需在子节点保存父节点 Windows 密码。"
+            )
+            self.state["shared_io_config"] = {
+                "enabled": True,
+                "local_root": "",
+                "unc_root": "",
+                "share_name": "",
+                "runtime_managed": True,
+                "role": "child",
+                "parent_ip": parent_ip,
+                "connect_ok": True,
+                "connect_message": message,
+                "updated_at": now_iso(),
+            }
+            self._save_state()
+            return {
+                "ok": True,
+                "enabled": True,
+                "runtime_managed": True,
+                "unc_root": "",
+                "share_name": "",
+                "parent_ip": parent_ip,
+                "message": message,
+                "test_path": "",
+                "commands": [],
+            }
+
+        share_name = requested_share_name or "LocalWebData"
         if not unc_root:
             if not parent_ip:
                 raise HTCondorClusterError("自动连接共享目录需要父节点 IP。")
             unc_root = f"\\\\{parent_ip}\\{share_name}"
 
-        user = str(os.environ.get("LOCAL_WEB_HTCONDOR_SHARE_USER", "")).strip()
-        password = str(os.environ.get("LOCAL_WEB_HTCONDOR_SHARE_PASSWORD", "")).strip()
         server = parent_ip or unc_root.strip("\\").split("\\")[0]
         commands: List[Dict[str, Any]] = []
 
@@ -751,6 +828,44 @@ $result | ConvertTo-Json -Depth 8 | Set-Content -Path $resultPath -Encoding UTF8
             ok = False
             message = f"子节点自动连接共享目录失败：{type(exc).__name__}: {exc}"
 
+        # 环境变量里可能还残留旧父节点的账号、密码或共享名。直接连接失败时
+        # 不应让已经成功加入的 HTCondor 子节点显示为共享故障；远程任务仍可
+        # 使用父节点提交时注入的当前 LocalWebCondor 专用凭据。自动降级后也
+        # 不保留猜测出来的 H8Data/LocalWebData 路径，避免下次加入重复报错。
+        if not ok:
+            direct_error = message
+            message = (
+                "子节点直接 SMB 连接未建立，已自动切换为任务运行时共享连接；"
+                "父节点提交远程任务时会提供实际共享路径和专用凭据。"
+            )
+            self.state["shared_io_config"] = {
+                "enabled": True,
+                "local_root": "",
+                "unc_root": "",
+                "share_name": "",
+                "runtime_managed": True,
+                "role": "child",
+                "parent_ip": parent_ip,
+                "connect_ok": True,
+                "connect_message": message,
+                "direct_connect_error": direct_error,
+                "updated_at": now_iso(),
+            }
+            self._save_state()
+            return {
+                "ok": True,
+                "enabled": True,
+                "runtime_managed": True,
+                "direct_connect_ok": False,
+                "direct_connect_error": direct_error,
+                "unc_root": "",
+                "share_name": "",
+                "parent_ip": parent_ip,
+                "message": message,
+                "test_path": "",
+                "commands": commands,
+            }
+
         self.state["shared_io_config"] = {
             "enabled": bool(ok),
             "local_root": "",
@@ -777,6 +892,14 @@ $result | ConvertTo-Json -Depth 8 | Set-Content -Path $resultPath -Encoding UTF8
     def test_shared_io(self) -> Dict[str, Any]:
         """测试当前配置的共享目录是否可读写。多共享目录会逐个测试。"""
         cfg = self.shared_io_config()
+        if cfg.get("runtime_managed"):
+            return {
+                "ok": True,
+                "runtime_managed": True,
+                "message": "子节点共享由父节点在远程任务启动时自动连接，将在实际任务中验证读写。",
+                "config": cfg,
+                "results": [],
+            }
         shares = cfg.get("shares") if isinstance(cfg.get("shares"), list) else []
         if not shares and cfg.get("unc_root"):
             shares = [cfg]
@@ -1346,9 +1469,20 @@ $result | ConvertTo-Json -Depth 8 | Set-Content -Path $resultPath -Encoding UTF8
     def distributed_execution_requested(self) -> bool:
         return str(self.state.get("execution_mode") or "local") == "htcondor"
 
-    def distributed_execution_enabled(self) -> bool:
-        data = self.status()
-        return bool(data.get("enabled"))
+    def distributed_execution_enabled(self, force_refresh: bool = False) -> bool:
+        now = time.monotonic()
+        with self._execution_health_cache_lock:
+            if (
+                not force_refresh
+                and self._execution_health_cache_at > 0
+                and now - self._execution_health_cache_at <= self._execution_health_cache_seconds
+            ):
+                return bool(self._execution_health_cache_enabled)
+            data = self.status()
+            enabled = bool(data.get("enabled"))
+            self._execution_health_cache_enabled = enabled
+            self._execution_health_cache_at = time.monotonic()
+            return enabled
 
     def set_execution_mode(self, mode: str) -> Dict[str, Any]:
         mode = str(mode or "local").strip().lower()
@@ -1362,6 +1496,7 @@ $result | ConvertTo-Json -Depth 8 | Set-Content -Path $resultPath -Encoding UTF8
 
         self.state["execution_mode"] = mode
         self._save_state()
+        self._execution_health_cache_at = 0.0
         data = self.status()
         data["message"] = "已启用 HTCondor 执行" if mode == "htcondor" else "已切回本机执行"
         return data
@@ -1903,13 +2038,14 @@ finally {{
 }}
 """
 
-    def _query_pool_nodes(self, pool_ip: str = "") -> Dict[str, Any]:
+    def _query_pool_nodes(self, pool_ip: str = "", timeout_seconds: float | None = None) -> Dict[str, Any]:
         """查询指定父节点池中的执行节点。"""
         args = [self._exe("condor_status.exe")]
         if pool_ip:
             args.extend(["-pool", f"{pool_ip}:9618"])
         args.extend(["-af", "Name", "Machine", "State", "Activity", "Cpus", "Memory", "SlotType", "PartitionableSlot"])
-        result = self._run(args, timeout=self.status_query_timeout_seconds)
+        timeout = self.status_query_timeout_seconds if timeout_seconds is None else max(3.0, float(timeout_seconds))
+        result = self._run(args, timeout=timeout)
         text = "\n".join(x for x in [result.get("stdout", ""), result.get("stderr", ""), result.get("error", "")] if x).strip()
         items = []
         # condor_status may print authentication/communication errors using
@@ -1958,12 +2094,26 @@ finally {{
         last["verified"] = False
         return last
 
-    def node_status(self) -> Dict[str, Any]:
+    def node_status(self, force_refresh: bool = False, timeout_seconds: float | None = None) -> Dict[str, Any]:
         """返回当前 HTCondor 池里的执行节点。"""
-        try:
-            return self._query_pool_nodes()
-        except Exception as exc:
-            return {"ok": False, "text": str(exc), "items": []}
+        now = time.monotonic()
+        with self._node_status_cache_lock:
+            if (
+                not force_refresh
+                and self._node_status_cache
+                and now - self._node_status_cache_at <= self._node_status_cache_seconds
+            ):
+                return copy.deepcopy(self._node_status_cache)
+            try:
+                result = self._query_pool_nodes(timeout_seconds=timeout_seconds)
+            except Exception as exc:
+                result = {"ok": False, "text": str(exc), "items": []}
+            # Cache successful responses only.  A temporary communication
+            # failure must not replace the last usable pool snapshot.
+            if result.get("ok") and result.get("items"):
+                self._node_status_cache = copy.deepcopy(result)
+                self._node_status_cache_at = time.monotonic()
+            return result
 
     def create_parent_node(self, bind_ip: str = "", low_port: int = 9700, high_port: int = 9800) -> Dict[str, Any]:
         bind_ip = self._pick_bind_ip(bind_ip)
@@ -2043,7 +2193,13 @@ finally {{
                     )
                     result["shared_io"] = shared_result
                     if shared_result.get("ok"):
-                        result["message"] = (result.get("message") or "子节点已加入父节点") + "；共享目录已自动连接。"
+                        if shared_result.get("runtime_managed"):
+                            result["message"] = (
+                                (result.get("message") or "子节点已加入父节点")
+                                + "；共享目录将在远程任务运行时由父节点自动连接。"
+                            )
+                        else:
+                            result["message"] = (result.get("message") or "子节点已加入父节点") + "；共享目录已自动连接。"
                     else:
                         result["message"] = (result.get("message") or "子节点已加入父节点") + f"；但共享目录自动连接失败：{shared_result.get('message')}"
                 except Exception as exc:
@@ -2667,6 +2823,26 @@ else {
         safe_command = [str(x) for x in command]
         transfer_files = ["run_job.cmd"]
         transfer_output_items = ["result.txt"]
+        stream_stage_plan: Dict[str, Any] = {}
+        stream_stage_plan_raw = str(
+            (env or {}).get("LOCAL_WEB_HTCONDOR_STREAM_STAGE_PLAN_B64") or ""
+        ).strip()
+        if stream_stage_plan_raw:
+            try:
+                decoded = base64.b64decode(stream_stage_plan_raw, validate=True).decode("utf-8")
+                candidate = json.loads(decoded)
+                if isinstance(candidate, dict):
+                    stream_stage_plan = candidate
+            except Exception as exc:
+                raise HTCondorClusterError(
+                    f"远程输入双缓冲计划无效：{type(exc).__name__}: {exc}"
+                ) from exc
+        stream_stage_enabled = bool(
+            stream_stage_plan
+            and str(stream_stage_plan.get("source_dir") or "").strip()
+            and isinstance(stream_stage_plan.get("files"), list)
+            and stream_stage_plan.get("files")
+        )
         config_arg_index = None
         config_copy = job_path / "localweb_config.json"
         rewrite_script = job_path / "rewrite_config.ps1"
@@ -2729,6 +2905,277 @@ else {
             except Exception:
                 pass
 
+        stream_stage_runner = job_path / "stream_stage_runner.ps1"
+        stream_stage_copy = job_path / "stream_stage_copy.ps1"
+        stream_stage_plan_file = job_path / "stream_stage_plan.json"
+        if stream_stage_enabled:
+            if config_arg_index is None or not config_copy.is_file():
+                raise HTCondorClusterError("远程输入双缓冲要求命令中包含有效的 config.json")
+
+            source_dir = str(stream_stage_plan.get("source_dir") or "").strip()
+            direct_input_dir = str(stream_stage_plan.get("direct_input_dir") or "").strip()
+            input_key = str(stream_stage_plan.get("input_key") or "").strip()
+            if not source_dir or not direct_input_dir or not input_key:
+                raise HTCondorClusterError("远程输入双缓冲计划缺少 source_dir、direct_input_dir 或 input_key")
+
+            clean_files: List[str] = []
+            for raw_name in stream_stage_plan.get("files") or []:
+                name = str(raw_name or "").strip()
+                if not name or Path(name).name != name or name in {".", ".."}:
+                    raise HTCondorClusterError(f"远程输入双缓冲文件名不安全：{name!r}")
+                clean_files.append(name)
+            if not clean_files:
+                raise HTCondorClusterError("远程输入双缓冲没有可执行的输入文件")
+
+            try:
+                batch_size = max(1, min(2, int(stream_stage_plan.get("batch_size") or 2)))
+            except Exception:
+                batch_size = 2
+            try:
+                first_batch_size = max(
+                    1,
+                    min(batch_size, int(stream_stage_plan.get("first_batch_size") or 1)),
+                )
+            except Exception:
+                first_batch_size = 1
+
+            clean_output_dirs: List[str] = []
+            for raw_name in stream_stage_plan.get("output_dirs") or []:
+                name = str(raw_name or "").strip()
+                if (
+                    not name
+                    or Path(name).name != name
+                    or name in {".", "..", "stage_current", "stage_next"}
+                ):
+                    raise HTCondorClusterError(f"远程输入双缓冲输出目录名不安全：{name!r}")
+                if name not in clean_output_dirs:
+                    clean_output_dirs.append(name)
+
+            runtime_plan = {
+                "version": 1,
+                "source_dir": source_dir,
+                "direct_input_dir": direct_input_dir,
+                "input_key": input_key,
+                "files": clean_files,
+                "batch_size": batch_size,
+                "first_batch_size": first_batch_size,
+                "output_dirs": clean_output_dirs,
+                "command": safe_command,
+                "config_arg_index": int(config_arg_index),
+                "working_dir": str(working_dir or ""),
+            }
+            stream_stage_plan_file.write_text(
+                json.dumps(runtime_plan, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+            stream_stage_copy.write_text(
+                r"""param(
+    [Parameter(Mandatory=$true)][string]$PlanPath,
+    [Parameter(Mandatory=$true)][int]$BatchIndex,
+    [Parameter(Mandatory=$true)][string]$Destination
+)
+$ErrorActionPreference = 'Stop'
+$plan = Get-Content -LiteralPath $PlanPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$files = @($plan.files)
+$batchSize = [Math]::Max(1, [Math]::Min(2, [int]$plan.batch_size))
+$firstBatchSize = [Math]::Max(1, [Math]::Min($batchSize, [int]$plan.first_batch_size))
+if ($BatchIndex -eq 0) {
+    $start = 0
+    $currentBatchSize = $firstBatchSize
+} else {
+    $start = $firstBatchSize + (($BatchIndex - 1) * $batchSize)
+    $currentBatchSize = $batchSize
+}
+if ($start -ge $files.Count) {
+    throw "batch index out of range: $BatchIndex"
+}
+if (Test-Path -LiteralPath $Destination) {
+    Remove-Item -LiteralPath $Destination -Recurse -Force
+}
+New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+$end = [Math]::Min($files.Count, $start + $currentBatchSize)
+for ($index = $start; $index -lt $end; $index++) {
+    $name = [string]$files[$index]
+    if ([System.IO.Path]::GetFileName($name) -ne $name) {
+        throw "unsafe input file name: $name"
+    }
+    $source = Join-Path ([string]$plan.source_dir) $name
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+        throw "input file does not exist: $source"
+    }
+    $temporary = Join-Path $Destination ($name + '.localweb.partial')
+    $target = Join-Path $Destination $name
+    Copy-Item -LiteralPath $source -Destination $temporary -Force
+    $sourceLength = (Get-Item -LiteralPath $source).Length
+    $targetLength = (Get-Item -LiteralPath $temporary).Length
+    if ($sourceLength -ne $targetLength) {
+        throw "input copy size mismatch: $source -> $temporary"
+    }
+    Move-Item -LiteralPath $temporary -Destination $target -Force
+}
+""",
+                encoding="utf-8-sig",
+            )
+
+            stream_stage_runner.write_text(
+                r"""param(
+    [Parameter(Mandatory=$true)][string]$PlanPath,
+    [Parameter(Mandatory=$true)][string]$ConfigTemplate
+)
+$ErrorActionPreference = 'Stop'
+$jobDir = $env:LOCAL_WEB_JOB_DIR
+$copyScript = Join-Path $jobDir 'stream_stage_copy.ps1'
+$plan = Get-Content -LiteralPath $PlanPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$files = @($plan.files)
+$batchSize = [Math]::Max(1, [Math]::Min(2, [int]$plan.batch_size))
+$firstBatchSize = [Math]::Max(1, [Math]::Min($batchSize, [int]$plan.first_batch_size))
+$remainingFiles = [Math]::Max(0, $files.Count - $firstBatchSize)
+$batchCount = 1 + [int][Math]::Ceiling($remainingFiles / [double]$batchSize)
+$directInputDir = [string]$plan.direct_input_dir
+$stageA = Join-Path $jobDir 'stage_current'
+$stageB = Join-Path $jobDir 'stage_next'
+$currentDir = $directInputDir
+$nextDir = $stageA
+$prefetch = $null
+
+function Invoke-LocalWebCopy([int]$BatchIndex, [string]$Destination) {
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $copyScript `
+        -PlanPath $PlanPath -BatchIndex $BatchIndex -Destination $Destination
+    if ($LASTEXITCODE -ne 0) {
+        throw "input staging failed for batch $BatchIndex, exit_code=$LASTEXITCODE"
+    }
+}
+
+try {
+    if (-not (Test-Path -LiteralPath $directInputDir -PathType Container)) {
+        throw "direct input directory is missing: $directInputDir"
+    }
+    Write-Output "[HTCONDOR-STAGE] running first batch directly from shared directory; local prefetch starts in background"
+
+    for ($batchIndex = 0; $batchIndex -lt $batchCount; $batchIndex++) {
+        $nextBatchIndex = $batchIndex + 1
+        $prefetch = $null
+        if ($nextBatchIndex -lt $batchCount) {
+            if (Test-Path -LiteralPath $nextDir) {
+                Remove-Item -LiteralPath $nextDir -Recurse -Force
+            }
+            Write-Output "[HTCONDOR-STAGE] prefetching next batch $($nextBatchIndex + 1)/$batchCount"
+            $prefetchArguments = @(
+                '-NoProfile',
+                '-ExecutionPolicy', 'Bypass',
+                '-File', ('"{0}"' -f $copyScript),
+                '-PlanPath', ('"{0}"' -f $PlanPath),
+                '-BatchIndex', [string]$nextBatchIndex,
+                '-Destination', ('"{0}"' -f $nextDir)
+            )
+            $prefetch = Start-Process -FilePath 'powershell.exe' `
+                -ArgumentList $prefetchArguments -WindowStyle Hidden -PassThru
+        }
+
+        $configText = Get-Content -LiteralPath $ConfigTemplate -Raw -Encoding UTF8
+        $config = $configText | ConvertFrom-Json
+        $inputPath = $currentDir -replace '\\','/'
+        $inputKey = [string]$plan.input_key
+        $inputProperty = $config.PSObject.Properties[$inputKey]
+        if ($null -eq $inputProperty) {
+            $config | Add-Member -NotePropertyName $inputKey -NotePropertyValue $inputPath
+        } else {
+            $inputProperty.Value = $inputPath
+        }
+        $batchConfig = Join-Path $jobDir ("localweb_batch_{0}.json" -f $batchIndex)
+        $json = $config | ConvertTo-Json -Depth 100
+        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText($batchConfig, $json, $utf8NoBom)
+
+        $command = @($plan.command)
+        if ($command.Count -lt 1) {
+            throw 'empty command in stream staging plan'
+        }
+        $executable = [string]$command[0]
+        $arguments = New-Object System.Collections.Generic.List[string]
+        for ($commandIndex = 1; $commandIndex -lt $command.Count; $commandIndex++) {
+            if ($commandIndex -eq [int]$plan.config_arg_index) {
+                $arguments.Add($batchConfig)
+            } else {
+                $arguments.Add([string]$command[$commandIndex])
+            }
+        }
+
+        if ($batchIndex -eq 0) {
+            Write-Output "[HTCONDOR-STAGE] running batch 1/$batchCount directly from UNC; next batch is prefetching"
+        } else {
+            Write-Output "[HTCONDOR-STAGE] running batch $($batchIndex + 1)/$batchCount; local inputs are ready"
+        }
+        if ([string]$plan.working_dir) {
+            Push-Location -LiteralPath ([string]$plan.working_dir)
+        }
+        try {
+            & $executable @arguments
+            $batchExitCode = if ($null -eq $LASTEXITCODE) { 0 } else { [int]$LASTEXITCODE }
+        } finally {
+            if ([string]$plan.working_dir) {
+                Pop-Location
+            }
+        }
+
+        if ($batchIndex -gt 0 -and (Test-Path -LiteralPath $currentDir)) {
+            Remove-Item -LiteralPath $currentDir -Recurse -Force
+        }
+        Remove-Item -LiteralPath $batchConfig -Force -ErrorAction SilentlyContinue
+        if ($batchIndex -gt 0) {
+            Write-Output "[HTCONDOR-STAGE] deleted completed local batch input $($batchIndex + 1)/$batchCount"
+        }
+
+        if ($batchExitCode -ne 0) {
+            if ($null -ne $prefetch -and -not $prefetch.HasExited) {
+                Stop-Process -Id $prefetch.Id -Force -ErrorAction SilentlyContinue
+                $prefetch.WaitForExit()
+            }
+            exit $batchExitCode
+        }
+
+        if ($null -ne $prefetch) {
+            $prefetch.WaitForExit()
+            if ($prefetch.ExitCode -ne 0) {
+                throw "next batch prefetch failed, exit_code=$($prefetch.ExitCode)"
+            }
+            if (-not (Test-Path -LiteralPath $nextDir -PathType Container)) {
+                throw "next batch directory is missing: $nextDir"
+            }
+            $currentDir = $nextDir
+            if ($currentDir -eq $stageA) {
+                $nextDir = $stageB
+            } else {
+                $nextDir = $stageA
+            }
+        }
+    }
+    exit 0
+} catch {
+    Write-Error ("[HTCONDOR-STAGE] " + $_.Exception.Message)
+    exit 111
+} finally {
+    if ($null -ne $prefetch -and -not $prefetch.HasExited) {
+        Stop-Process -Id $prefetch.Id -Force -ErrorAction SilentlyContinue
+    }
+    Remove-Item -LiteralPath $stageA -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $stageB -Recurse -Force -ErrorAction SilentlyContinue
+}
+""",
+                encoding="utf-8-sig",
+            )
+
+            transfer_files.extend([
+                "stream_stage_plan.json",
+                "stream_stage_copy.ps1",
+                "stream_stage_runner.ps1",
+            ])
+            for output_dir in clean_output_dirs:
+                (job_path / output_dir).mkdir(parents=True, exist_ok=True)
+                transfer_files.append(output_dir)
+                transfer_output_items.append(output_dir)
+
         # 去重，避免 transfer_input_files 中重复出现同名文件。
         clean_transfer_files = []
         seen_transfer = set()
@@ -2745,6 +3192,15 @@ else {
             else:
                 cmd_parts.append(self._batch_arg(item))
         cmd_line = " ".join(cmd_parts)
+        if stream_stage_enabled:
+            execution_line = (
+                'powershell.exe -NoProfile -ExecutionPolicy Bypass '
+                '-File "%LOCAL_WEB_JOB_DIR%\\stream_stage_runner.ps1" '
+                '-PlanPath "%LOCAL_WEB_JOB_DIR%\\stream_stage_plan.json" '
+                '-ConfigTemplate "%LOCAL_WEB_CONFIG_JSON%"'
+            )
+        else:
+            execution_line = cmd_line
 
         lines = [
             "@echo off",
@@ -2853,6 +3309,9 @@ else {
             ])
         for key, value in (env or {}).items():
             key = str(key).strip()
+            if key == "LOCAL_WEB_HTCONDOR_STREAM_STAGE_PLAN_B64":
+                # 计划已写入随作业传输的 JSON，避免把很长的 Base64 字符串塞进 cmd 环境变量。
+                continue
             if not key or any(ch in key for ch in " =&|"):
                 continue
             val = str(value).replace("%", "%%")
@@ -2875,8 +3334,14 @@ else {
                 ")",
             ])
 
+        if stream_stage_enabled:
+            lines.extend([
+                "echo [HTCONDOR-STAGE] double-buffer input staging enabled",
+                "echo [HTCONDOR-STAGE] only current and next batches are kept on the execute node",
+            ])
+
         lines.extend([
-            cmd_line,
+            execution_line,
             "set LOCAL_WEB_EXIT=%ERRORLEVEL%",
             "(",
             "  echo return_code=%LOCAL_WEB_EXIT%",
