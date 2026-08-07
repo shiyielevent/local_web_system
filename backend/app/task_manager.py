@@ -1,5 +1,4 @@
 from __future__ import annotations
-import base64
 import copy
 import fnmatch
 import json
@@ -178,7 +177,24 @@ class TaskManager:
             add_share({"enabled": True, "local_root": local_root, "unc_root": unc_root, "share_name": share_name})
 
         enabled = bool(shares) or env_enabled in {"1", "true", "yes", "on"}
-        primary = shares[0] if shares else {"local_root": local_root, "unc_root": unc_root, "share_name": share_name}
+        primary = None
+        primary_keys = [
+            str(cfg.get("primary_unc_root") or "").strip().lower(),
+            str(cfg.get("unc_root") or "").strip().lower(),
+            str(cfg.get("local_root") or "").strip().lower(),
+        ]
+        for key in [x for x in primary_keys if x]:
+            for item in shares:
+                if (
+                    str(item.get("unc_root") or "").strip().lower() == key
+                    or str(item.get("local_root") or "").strip().lower() == key
+                    or str(item.get("share_name") or "").strip().lower() == key
+                ):
+                    primary = item
+                    break
+            if primary is not None:
+                break
+        primary = primary or (shares[0] if shares else {"local_root": local_root, "unc_root": unc_root, "share_name": share_name})
         return {
             "enabled": bool(enabled and shares),
             "local_root": str(primary.get("local_root") or ""),
@@ -232,6 +248,25 @@ class TaskManager:
         cfg = self._htcondor_shared_io_config()
         local_root = Path(str(cfg.get("local_root") or ""))
         return local_root / "_localweb_htcondor_shared" / str(parent_id)
+
+    def _shared_task_root_for_path(self, parent_id: str, path: Path | str) -> Path:
+        cfg = self._htcondor_shared_io_config()
+        shares = cfg.get("shares") if isinstance(cfg.get("shares"), list) else []
+        text = str(path or "").strip()
+        candidates = []
+        for item in shares:
+            local_root_text = str(item.get("local_root") or "").strip()
+            if local_root_text:
+                candidates.append(local_root_text)
+        candidates.sort(key=len, reverse=True)
+
+        for local_root_text in candidates:
+            try:
+                Path(text).resolve().relative_to(Path(local_root_text).resolve())
+                return Path(local_root_text) / "_localweb_htcondor_shared" / str(parent_id)
+            except Exception:
+                continue
+        return self._shared_task_root(parent_id)
 
     def _make_shared_part_output_path(self, original_path: str, part_name: str) -> tuple[Path, str]:
         """生成父节点本地输出路径及对应 UNC 路径。"""
@@ -322,6 +357,612 @@ class TaskManager:
             unc = self._path_to_shared_unc(value)
             return unc or value
         return value
+
+    def _is_probable_path_arg(self, value: Any) -> bool:
+        """判断命令参数是否像本地/UNC路径。"""
+        text = str(value or "").strip().strip('"')
+        if not text or "\n" in text or "\r" in text:
+            return False
+        if text.startswith("__LOCAL_WEB_JOB_DIR__"):
+            return True
+        return (
+            bool(re.match(r"^[A-Za-z]:[\\/]", text))
+            or text.startswith("\\\\")
+            or "\\" in text
+            or "/" in text
+        )
+
+    def _is_output_like_key(self, key: str) -> bool:
+        key = str(key or "").strip().lower()
+        if not key:
+            return False
+        output_words = [
+            "output", "out_dir", "outpath", "out_path", "result",
+            "save_dir", "target_dir", "dest", "destination",
+        ]
+        return any(word in key for word in output_words) or key in {"out", "outfile", "out_file"}
+
+    def _safe_shared_name(self, value: Any, fallback: str = "item") -> str:
+        text = str(value or "").strip() or fallback
+        text = Path(text).name or fallback
+        text = re.sub(r"[^A-Za-z0-9_.\-]+", "_", text)
+        text = text.strip("._-") or fallback
+        return text[:120]
+
+    def _shared_target_path_text(self, local_path: Path | str, use_local_paths: bool) -> str:
+        if use_local_paths:
+            return str(Path(str(local_path)).resolve())
+        unc = self._path_to_shared_unc(local_path)
+        return unc or str(local_path)
+
+    def _collect_output_path_values(self, inputs: Dict[str, Any]) -> set[str]:
+        values: set[str] = set()
+
+        def add_value(value: Any):
+            if not isinstance(value, str) or not self._is_probable_path_arg(value):
+                return
+            text = value.strip().strip('"')
+            values.add(self._normalize_path_text(text).lower())
+            try:
+                values.add(self._normalize_path_text(Path(text).resolve()).lower())
+            except Exception:
+                pass
+
+        def walk(obj: Any, key_name: str = ""):
+            if isinstance(obj, dict):
+                for key, value in obj.items():
+                    next_key = str(key or "")
+                    if self._is_output_like_key(next_key):
+                        add_value(value)
+                    walk(value, next_key)
+            elif isinstance(obj, list):
+                for item in obj:
+                    walk(item, key_name)
+
+        walk(inputs or {})
+        return values
+
+    def _is_command_output_arg(self, raw_arg: str, output_values: set[str]) -> bool:
+        if not output_values:
+            return False
+        text = str(raw_arg or "").strip().strip('"')
+        if not text:
+            return False
+        candidates = {self._normalize_path_text(text).lower()}
+        try:
+            candidates.add(self._normalize_path_text(Path(text).resolve()).lower())
+        except Exception:
+            pass
+        return bool(candidates & output_values)
+
+    def _find_paired_companion_file(self, source: Path) -> Path | None:
+        """查找 PARASOL/DPC MD/ML 或 JD/JL 配套文件。"""
+        try:
+            source = Path(source).resolve()
+            directory = source.parent
+            stem = source.stem
+            suffix = source.suffix
+        except Exception:
+            return None
+
+        candidates: list[str] = []
+        for primary, companion in [("MD", "ML"), ("JD", "JL"), ("md", "ml"), ("jd", "jl")]:
+            if stem.endswith(primary):
+                candidates.append(stem[: -len(primary)] + companion + suffix)
+
+        if not candidates:
+            return None
+
+        for name in candidates:
+            direct = directory / name
+            if direct.exists() and direct.is_file():
+                return direct
+
+        wanted = {name.lower() for name in candidates}
+        try:
+            for item in directory.iterdir():
+                if item.is_file() and item.name.lower() in wanted:
+                    return item
+        except Exception:
+            pass
+        return None
+
+    def _stage_file_in_shared_dir(
+        self,
+        source: Path,
+        target_dir: Path,
+        link_modes: list[str],
+        allow_copy: bool,
+    ) -> Path:
+        source = Path(source).resolve()
+        target = target_dir / source.name
+        mode = self._link_or_copy_file(source, target, allow_copy=allow_copy)
+        link_modes.append(mode)
+        if str(mode).startswith("failed"):
+            raise RuntimeError(
+                f"无法在共享目录中创建输入文件引用: {source} -> {target}，方式={mode}。"
+                "请把输入数据放到父节点共享根目录下，或允许系统复制到共享目录。"
+            )
+        return target
+
+    def _stage_directory_in_shared_dir(
+        self,
+        source_dir: Path,
+        target_dir: Path,
+        link_modes: list[str],
+        allow_copy: bool,
+    ) -> Path:
+        source_dir = Path(source_dir).resolve()
+        if target_dir.exists():
+            shutil.rmtree(target_dir, ignore_errors=True)
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        for source in sorted(source_dir.rglob("*")):
+            if not source.is_file():
+                continue
+            relative = source.relative_to(source_dir)
+            mode = self._link_or_copy_file(source, target_dir / relative, allow_copy=allow_copy)
+            link_modes.append(mode)
+            if str(mode).startswith("failed"):
+                raise RuntimeError(
+                    f"无法在共享目录中创建输入目录视图: {source} -> {target_dir / relative}，方式={mode}。"
+                    "请把输入数据放到父节点共享根目录下，或允许系统复制到共享目录。"
+                )
+        return target_dir
+
+    def _make_shared_output_redirect(
+        self,
+        original_arg: str,
+        entry_shared_dir: Path,
+        arg_index: int,
+        use_local_paths: bool,
+    ) -> tuple[str, Dict[str, Any]]:
+        original_path = Path(str(original_arg or "").strip().strip('"'))
+        safe_name = self._safe_shared_name(original_path.name or f"output_{arg_index}", f"output_{arg_index}")
+        shared_path = entry_shared_dir / "outputs" / f"arg{arg_index}_{safe_name}"
+
+        # 没有扩展名时按目录处理；这正好覆盖 PARASOL/DPC 的 job_directory_passthrough。
+        if original_path.suffix:
+            shared_path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            shared_path.mkdir(parents=True, exist_ok=True)
+
+        mapping = {
+            "kind": "file" if original_path.suffix else "dir",
+            "arg_index": arg_index,
+            "shared_local_path": str(shared_path),
+            "original_path": str(original_path),
+        }
+        return self._shared_target_path_text(shared_path, use_local_paths), mapping
+
+    def _prepare_htcondor_shared_path_arg(
+        self,
+        raw_arg: str,
+        entry_shared_dir: Path,
+        arg_index: int,
+        use_local_paths: bool,
+        output_values: set[str],
+        link_modes: list[str],
+        output_mappings: list[Dict[str, Any]],
+    ) -> str:
+        text = str(raw_arg or "").strip().strip('"')
+        if not self._is_probable_path_arg(text):
+            return raw_arg
+
+        # 输出路径必须保证远程节点能够写回父节点。若用户选择的输出目录不在共享根目录下，
+        # 先写到共享任务目录，子任务结束后再合并回原始输出目录。
+        if self._is_command_output_arg(text, output_values):
+            unc = self._path_to_shared_unc(text)
+            if unc:
+                return str(Path(text).resolve()) if use_local_paths else unc
+            replacement, mapping = self._make_shared_output_redirect(
+                text,
+                entry_shared_dir,
+                arg_index,
+                use_local_paths,
+            )
+            output_mappings.append(mapping)
+            return replacement
+
+        path = Path(text)
+        try:
+            resolved = path.resolve()
+        except Exception:
+            resolved = path
+
+        unc = self._path_to_shared_unc(resolved)
+        if unc:
+            return str(resolved) if use_local_paths else unc
+
+        if resolved.exists() and resolved.is_file():
+            allow_copy = str(os.environ.get("LOCAL_WEB_ALLOW_GENERIC_SHARED_INPUT_COPY", "1")).strip().lower() not in {"0", "false", "no", "off"}
+            input_dir = entry_shared_dir / "inputs" / f"arg{arg_index}_{self._safe_shared_name(resolved.stem, 'file')}"
+            staged = self._stage_file_in_shared_dir(resolved, input_dir, link_modes, allow_copy=allow_copy)
+
+            companion = self._find_paired_companion_file(resolved)
+            if companion is not None:
+                try:
+                    self._stage_file_in_shared_dir(companion, input_dir, link_modes, allow_copy=allow_copy)
+                except Exception:
+                    raise
+
+            return self._shared_target_path_text(staged, use_local_paths)
+
+        if resolved.exists() and resolved.is_dir():
+            allow_copy = str(os.environ.get("LOCAL_WEB_ALLOW_GENERIC_SHARED_INPUT_COPY", "1")).strip().lower() not in {"0", "false", "no", "off"}
+            staged_dir = entry_shared_dir / "inputs" / f"arg{arg_index}_{self._safe_shared_name(resolved.name, 'dir')}"
+            staged = self._stage_directory_in_shared_dir(resolved, staged_dir, link_modes, allow_copy=allow_copy)
+            return self._shared_target_path_text(staged, use_local_paths)
+
+        return raw_arg
+
+    def _prepare_htcondor_shared_io_entries(
+        self,
+        parent_id: str,
+        entries: List[Dict[str, Any]],
+    ) -> tuple[List[Dict[str, Any]], int]:
+        """让所有 HTCondor 子任务统一走父节点共享目录路径。"""
+        if not self._htcondor_shared_io_enabled():
+            return entries, 0
+
+        shared_root = self._shared_task_root(parent_id)
+        shared_root.mkdir(parents=True, exist_ok=True)
+
+        prepared: List[Dict[str, Any]] = []
+        changed_count = 0
+        for index, entry in enumerate(entries):
+            new_entry = dict(entry)
+            spec = dict(new_entry.get("spec") or {})
+            inputs = dict(spec.get("inputs") if isinstance(spec.get("inputs"), dict) else {})
+
+            # 自动拆分云反演路径已经在拆分阶段精确处理过，避免二次改写。
+            if inputs.get("shared_io"):
+                prepared.append(new_entry)
+                continue
+
+            target_machine = str(spec.get("target_machine") or "").strip()
+            use_local_paths = self._htcondor_target_uses_local_paths(target_machine)
+            label = str(spec.get("label") or f"job_{index + 1}")
+            entry_shared_dir = shared_root / "generic" / f"{index + 1:04d}_{self._safe_shared_name(label, 'job')}"
+            entry_shared_dir.mkdir(parents=True, exist_ok=True)
+
+            output_values = self._collect_output_path_values(inputs)
+            link_modes = list(inputs.get("link_modes") or spec.get("link_modes") or [])
+            shared_output_mappings = list(inputs.get("shared_output_mappings") or [])
+
+            command = [str(x) for x in (spec.get("command") or [])]
+            if len(command) > 1:
+                for arg_index in range(1, len(command)):
+                    command[arg_index] = self._prepare_htcondor_shared_path_arg(
+                        command[arg_index],
+                        entry_shared_dir=entry_shared_dir,
+                        arg_index=arg_index,
+                        use_local_paths=use_local_paths,
+                        output_values=output_values,
+                        link_modes=link_modes,
+                        output_mappings=shared_output_mappings,
+                    )
+
+            def rewrite_input_value(value: Any) -> Any:
+                if isinstance(value, dict):
+                    return {k: rewrite_input_value(v) for k, v in value.items()}
+                if isinstance(value, list):
+                    return [rewrite_input_value(v) for v in value]
+                if isinstance(value, str) and self._is_probable_path_arg(value):
+                    unc = self._path_to_shared_unc(value)
+                    if unc:
+                        return str(Path(value).resolve()) if use_local_paths else unc
+                return value
+
+            rewritten_inputs = rewrite_input_value(inputs)
+            if isinstance(rewritten_inputs, dict):
+                inputs = rewritten_inputs
+
+            inputs["shared_io"] = True
+            inputs["generic_shared_io"] = True
+            inputs["shared_task_dir"] = str(entry_shared_dir)
+            if shared_output_mappings:
+                inputs["shared_output_mappings"] = shared_output_mappings
+            if link_modes:
+                inputs["link_modes"] = sorted(set(str(x) for x in link_modes if str(x).strip()))
+
+            spec["command"] = command
+            spec["inputs"] = inputs
+            spec["cleanup_root"] = str(shared_root)
+            new_entry["spec"] = spec
+            prepared.append(new_entry)
+            changed_count += 1
+
+        return prepared, changed_count
+
+    def _htcondor_direct_paired_batch_enabled(self) -> bool:
+        """是否启用 H8 AOD 配套文件直提模式。
+
+        默认启用。该模式不再为全部批处理子任务创建 generic 共享目录、
+        hardlink/symlink 或复制输入文件；仅在子任务真正准备提交时，
+        把这一组已经配好的 B01/B03/B06/SOLAR 路径写入一个小 config.json。
+        """
+        raw = str(
+            os.environ.get("LOCAL_WEB_HTCONDOR_DIRECT_PAIRED_BATCH", "1")
+        ).strip().lower()
+        return raw not in {"0", "false", "no", "off"}
+
+    def _is_h8aod_direct_paired_spec(self, spec: Dict[str, Any] | None) -> bool:
+        """判断当前子任务是否可以按 H8 AOD 四文件配套关系直接提交。"""
+        if not self._htcondor_direct_paired_batch_enabled():
+            return False
+        spec = spec if isinstance(spec, dict) else {}
+        inputs = spec.get("inputs") if isinstance(spec.get("inputs"), dict) else {}
+        if bool(inputs.get("_htcondor_direct_paired_batch")):
+            return True
+
+        module_id = str(spec.get("module_id") or "").strip().lower()
+        if module_id != "h8aod":
+            return False
+
+        required = ("B01_file", "B03_file", "B06_file", "SOLAR_file", "output")
+        return all(str(inputs.get(key) or "").strip() for key in required)
+
+    def _find_json_config_arg_index(self, command: List[str]) -> int:
+        """查找命令中的 config.json 参数位置。"""
+        for index in range(len(command) - 1, 0, -1):
+            raw = str(command[index] or "").strip().strip('"')
+            if not raw:
+                continue
+            path = Path(raw)
+            if path.suffix.lower() == ".json" and path.is_file():
+                return index
+        return -1
+
+    def _direct_shared_path_for_batch(
+        self,
+        raw_value: Any,
+        *,
+        key: str,
+        target_machine: str,
+        must_be_file: bool,
+        is_output: bool = False,
+    ) -> str:
+        """把一组配套文件中的单个路径直接转换为目标节点可用路径。
+
+        输入文件不做复制、不建目录视图；远程节点直接使用现有共享目录的 UNC。
+        父节点本机任务仍可使用本地路径，避免不必要的 SMB 回环。
+        """
+        text = str(raw_value or "").strip().strip('"')
+        if not text:
+            raise RuntimeError(f"H8 AOD 配套直提失败：{key} 为空")
+
+        path = Path(text)
+        try:
+            resolved = path.resolve()
+        except Exception:
+            resolved = path
+
+        if is_output:
+            # output 必须是每个子任务唯一的 TIFF 文件路径，而不是同名目录。
+            if not resolved.suffix:
+                resolved = resolved.with_suffix(".tif")
+            resolved.parent.mkdir(parents=True, exist_ok=True)
+        elif must_be_file and not resolved.is_file():
+            raise RuntimeError(f"H8 AOD 配套直提失败：{key} 文件不存在：{resolved}")
+
+        use_local_paths = self._htcondor_target_uses_local_paths(target_machine)
+        if use_local_paths:
+            return str(resolved)
+
+        unc = self._path_to_shared_unc(resolved)
+        if not unc:
+            kind = "输出文件" if is_output else "输入文件"
+            raise RuntimeError(
+                f"H8 AOD 配套直提失败：{key} 的{kind}不在已配置共享目录内：{resolved}。"
+                "请把 B01、B03、B06、SOLAR 和 output 放在同一个已配置共享根目录下。"
+            )
+        return unc
+
+    def _stage_h8aod_direct_input_file(
+        self,
+        raw_value: Any,
+        *,
+        key: str,
+        direct_root: Path,
+        link_modes: list[str],
+    ) -> tuple[str, str]:
+        text = str(raw_value or "").strip().strip('"')
+        if not text:
+            raise RuntimeError(f"H8 AOD direct paired failed: {key} is empty")
+
+        try:
+            source = Path(text).resolve()
+        except Exception:
+            source = Path(text)
+
+        if not source.is_file():
+            raise RuntimeError(f"H8 AOD direct paired failed: {key} file does not exist: {source}")
+
+        target_dir = direct_root / key
+        target = target_dir / source.name
+        mode = self._link_or_copy_file(source, target, allow_copy=True)
+        link_modes.append(mode)
+        if str(mode).startswith("failed"):
+            raise RuntimeError(
+                f"H8 AOD direct paired failed: cannot stage {key}: {source} -> {target}, mode={mode}"
+            )
+
+        return f"__LOCAL_WEB_JOB_DIR__/{key}/{source.name}", str(source)
+
+    def _prepare_h8aod_direct_output(
+        self,
+        raw_value: Any,
+        *,
+        direct_root: Path,
+    ) -> tuple[str, str, Dict[str, Any]]:
+        text = str(raw_value or "").strip().strip('"')
+        if not text:
+            raise RuntimeError("H8 AOD direct paired failed: output is empty")
+
+        try:
+            output_path = Path(text).resolve()
+        except Exception:
+            output_path = Path(text)
+
+        if not output_path.suffix:
+            output_path = output_path.with_suffix(".tif")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        sandbox_output_dir = direct_root / "output"
+        sandbox_output_dir.mkdir(parents=True, exist_ok=True)
+        sandbox_output = sandbox_output_dir / output_path.name
+
+        mapping = {
+            "key": "output",
+            "job_subdir": "output",
+            "original_path": str(output_path.parent),
+            "file_name": output_path.name,
+        }
+        return f"__LOCAL_WEB_JOB_DIR__/output/{sandbox_output.name}", str(output_path), mapping
+
+    def _prepare_h8aod_direct_paired_entry(
+        self,
+        parent_id: str,
+        entry_index: int,
+        entry: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """在真正提交单个作业时，按现成配套关系生成一个轻量 config.json。
+
+        该函数只处理当前即将提交的一个子任务，不扫描目录，不复制大文件，
+        也不为其余尚未提交的子任务预建共享目录。
+        """
+        new_entry = dict(entry or {})
+        spec = dict(new_entry.get("spec") or {})
+        inputs = dict(spec.get("inputs") if isinstance(spec.get("inputs"), dict) else {})
+        command = [str(value) for value in (spec.get("command") or [])]
+
+        config_index = self._find_json_config_arg_index(command)
+        if config_index < 0:
+            raise RuntimeError(
+                "H8 AOD 配套直提失败：命令中未找到现有 config.json 参数"
+            )
+
+        original_config = Path(str(command[config_index]).strip().strip('"'))
+        try:
+            config_data = json.loads(original_config.read_text(encoding="utf-8-sig"))
+        except Exception as exc:
+            raise RuntimeError(
+                f"H8 AOD 配套直提失败：无法读取子任务配置 {original_config}："
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        if not isinstance(config_data, dict):
+            raise RuntimeError(f"H8 AOD 配套直提失败：配置不是 JSON 对象：{original_config}")
+
+        target_machine = str(spec.get("target_machine") or "").strip()
+        paired_keys = ("B01_file", "B03_file", "B06_file", "SOLAR_file")
+        label = str(spec.get("label") or f"job_{entry_index + 1}")
+        direct_root = (
+            self.htcondor_splits_dir
+            / f"direct_paired_{self._safe_shared_name(parent_id, 'task')}"
+            / f"{entry_index + 1:04d}_{self._safe_shared_name(label, 'job')}"
+        )
+        direct_root.mkdir(parents=True, exist_ok=True)
+
+        link_modes = list(inputs.get("link_modes") or spec.get("link_modes") or [])
+        for key in paired_keys:
+            raw = inputs.get(key, config_data.get(key))
+            sandbox_value, original_value = self._stage_h8aod_direct_input_file(
+                raw,
+                key=key,
+                direct_root=direct_root,
+                link_modes=link_modes,
+            )
+            config_data[key] = sandbox_value
+            inputs[key] = original_value
+
+        output_value = inputs.get("output", config_data.get("output"))
+        sandbox_output, original_output, output_mapping = self._prepare_h8aod_direct_output(
+            output_value,
+            direct_root=direct_root,
+        )
+        output_mapping["part_name"] = self._safe_shared_name(label, "job")
+        config_data["output"] = sandbox_output
+        inputs["output"] = original_output
+
+        direct_config = direct_root / "config.json"
+        direct_config.write_text(
+            json.dumps(config_data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        command[config_index] = str(direct_config)
+        inputs["shared_io"] = False
+        inputs["direct_paired_batch"] = True
+        inputs["generic_shared_io"] = False
+        inputs["sandbox_transfer_io"] = True
+        inputs["shared_task_dir"] = str(direct_root)
+        inputs["output_mappings"] = [output_mapping]
+        inputs["link_modes"] = sorted(set(str(x) for x in link_modes if str(x).strip()))
+
+        spec_env = dict(spec.get("env") if isinstance(spec.get("env"), dict) else {})
+        spec_env["LOCAL_WEB_HTCONDOR_FORCE_TRANSFER_IO"] = "1"
+
+        spec["command"] = command
+        spec["env"] = spec_env
+        spec["inputs"] = inputs
+        spec["cleanup_root"] = str(direct_root.parent)
+        new_entry["spec"] = spec
+        return new_entry
+
+        """
+        target_machine = str(spec.get("target_machine") or "").strip()
+        paired_keys = ("B01_file", "B03_file", "B06_file", "SOLAR_file")
+
+        # 直接使用 main.py 已经配好的四个文件，不再重新扫描或按 SOLAR 推导其他文件。
+        for key in paired_keys:
+            raw = inputs.get(key, config_data.get(key))
+            converted = self._direct_shared_path_for_batch(
+                raw,
+                key=key,
+                target_machine=target_machine,
+                must_be_file=True,
+            )
+            config_data[key] = converted
+            inputs[key] = converted
+
+        output_value = inputs.get("output", config_data.get("output"))
+        converted_output = self._direct_shared_path_for_batch(
+            output_value,
+            key="output",
+            target_machine=target_machine,
+            must_be_file=False,
+            is_output=True,
+        )
+        config_data["output"] = converted_output
+        inputs["output"] = converted_output
+
+        label = str(spec.get("label") or f"job_{entry_index + 1}")
+        direct_root = (
+            self.htcondor_splits_dir
+            / f"direct_paired_{self._safe_shared_name(parent_id, 'task')}"
+            / f"{entry_index + 1:04d}_{self._safe_shared_name(label, 'job')}"
+        )
+        direct_root.mkdir(parents=True, exist_ok=True)
+        direct_config = direct_root / "config.json"
+        direct_config.write_text(
+            json.dumps(config_data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        command[config_index] = str(direct_config)
+        inputs["shared_io"] = True
+        inputs["direct_paired_batch"] = True
+        inputs["generic_shared_io"] = False
+        inputs["shared_task_dir"] = str(direct_root)
+
+        spec["command"] = command
+        spec["inputs"] = inputs
+        spec["cleanup_root"] = str(direct_root.parent)
+        new_entry["spec"] = spec
+        return new_entry
+
+        """
 
     def _make_htcondor_safe_env(
         self,
@@ -614,6 +1255,99 @@ class TaskManager:
                 htcondor_collected_output_dir=str(target_dir),
             )
 
+    def _copy_shared_file_or_directory(self, source_path: Path, target_path: Path) -> tuple[int, int]:
+        """Copy a shared-output file or directory back to the user's selected output path."""
+        file_count = 0
+        byte_count = 0
+
+        if source_path.is_dir():
+            target_path.mkdir(parents=True, exist_ok=True)
+            return self._copy_tree_contents(source_path, target_path)
+
+        if source_path.is_file():
+            if target_path.suffix:
+                target_file = target_path
+                target_file.parent.mkdir(parents=True, exist_ok=True)
+            else:
+                target_path.mkdir(parents=True, exist_ok=True)
+                target_file = target_path / source_path.name
+            shutil.copy2(source_path, target_file)
+            file_count = 1
+            try:
+                byte_count = int(source_path.stat().st_size)
+            except Exception:
+                byte_count = 0
+
+        return file_count, byte_count
+
+    def _collect_htcondor_shared_outputs(
+        self,
+        parent_id: str,
+        child_id: str,
+        spec: Dict[str, Any],
+        label: str = "",
+    ) -> int:
+        """Merge outputs that were redirected into the parent shared directory."""
+        inputs = spec.get("inputs") if isinstance(spec.get("inputs"), dict) else {}
+        mappings = inputs.get("shared_output_mappings") or []
+        if not isinstance(mappings, list) or not mappings:
+            return 0
+
+        copied_files = 0
+        for item in mappings:
+            if not isinstance(item, dict):
+                continue
+
+            shared_text = str(item.get("shared_local_path") or "").strip()
+            original_text = str(item.get("original_path") or "").strip()
+            if not shared_text or not original_text:
+                continue
+
+            shared_path = Path(shared_text)
+            original_path = Path(original_text)
+
+            try:
+                if shared_path.resolve() == original_path.resolve():
+                    continue
+            except Exception:
+                pass
+
+            if not shared_path.exists():
+                self.append_log(
+                    parent_id,
+                    f"[HTCONDOR-WARN] {label or child_id} 共享输出不存在，无法合并：{shared_path}",
+                )
+                continue
+
+            try:
+                file_count, byte_count = self._copy_shared_file_or_directory(shared_path, original_path)
+                copied_files += file_count
+                if file_count > 0:
+                    self.append_log(
+                        parent_id,
+                        f"[HTCONDOR] 已合并 {label or child_id} 的共享输出："
+                        f"{file_count} 个文件，{byte_count} 字节 -> {original_path}",
+                    )
+                else:
+                    self.append_log(
+                        parent_id,
+                        f"[HTCONDOR-WARN] {label or child_id} 共享输出为空：{shared_path}",
+                    )
+            except Exception as exc:
+                self.append_log(
+                    parent_id,
+                    f"[HTCONDOR-WARN] {label or child_id} 合并共享输出失败："
+                    f"{shared_path} -> {original_path}，原因：{type(exc).__name__}: {exc}",
+                )
+
+        if copied_files > 0:
+            self.update_task(
+                child_id,
+                htcondor_collected_output_dir=str(Path(str(mappings[0].get("original_path") or "")).parent),
+            )
+
+        return copied_files
+
     def _htcondor_available_machines(self) -> List[str]:
         """取当前 HTCondor 池里的可用执行机器。
 
@@ -629,36 +1363,6 @@ class TaskManager:
             items = data.get("items") or []
         except Exception:
             return []
-
-        # Reuse this exact condor_status result for the CPU/memory and process
-        # slot calculations below.  Previously the split path immediately
-        # launched a second identical status command; when both commands hit
-        # their 90-second network timeout, the UI sat at queued for ~3 minutes.
-        aggregated: Dict[str, Dict[str, Any]] = {}
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            machine = str(item.get("machine") or "").strip()
-            if not machine:
-                continue
-            old = aggregated.get(machine) or {}
-            try:
-                cpus = max(float(old.get("cpus") or 0), float(item.get("cpus") or 0))
-            except Exception:
-                cpus = old.get("cpus") or item.get("cpus")
-            try:
-                memory = max(float(old.get("memory") or 0), float(item.get("memory") or 0))
-            except Exception:
-                memory = old.get("memory") or item.get("memory")
-            aggregated[machine] = {
-                **old,
-                **item,
-                "cpus": cpus or item.get("cpus"),
-                "memory": memory or item.get("memory"),
-            }
-        if aggregated:
-            self._htcondor_node_status_cache = {k: dict(v) for k, v in aggregated.items()}
-            self._htcondor_node_status_cache_at = time.time()
 
         machines: List[str] = []
         # 优先使用空闲节点；如果暂时没有 Idle，也保留节点名，方便 HTCondor 自己排队。
@@ -1236,67 +1940,6 @@ class TaskManager:
 
         return False
 
-    def _htcondor_stream_stage_enabled(self, module_item: Dict[str, Any] | None = None) -> bool:
-        """远程节点是否使用“当前批次 + 下一批次”双缓冲本地暂存。"""
-        raw_env = str(os.environ.get("LOCAL_WEB_HTCONDOR_STREAM_STAGE_INPUTS", "")).strip().lower()
-        if raw_env:
-            return raw_env in {"1", "true", "yes", "on"}
-
-        if isinstance(module_item, dict):
-            parallel = module_item.get("parallel") if isinstance(module_item.get("parallel"), dict) else {}
-            for key in ["htcondor_stream_stage_inputs", "stream_stage_inputs"]:
-                value = parallel.get(key)
-                if value not in {None, ""}:
-                    return str(value).strip().lower() in {"1", "true", "yes", "on"}
-                value = module_item.get(key)
-                if value not in {None, ""}:
-                    return str(value).strip().lower() in {"1", "true", "yes", "on"}
-
-        # 共享目录存在时，远程 EXE 默认先把小批次输入暂存到执行节点本地。
-        return True
-
-    def _htcondor_stream_stage_batch_size(self, module_item: Dict[str, Any] | None = None) -> int:
-        """双缓冲暂存每批文件数；按需求只允许 1 或 2，默认 2。"""
-        raw_values: List[Any] = [
-            os.environ.get("LOCAL_WEB_HTCONDOR_STAGE_FILES_PER_BATCH", ""),
-        ]
-        if isinstance(module_item, dict):
-            parallel = module_item.get("parallel") if isinstance(module_item.get("parallel"), dict) else {}
-            for key in ["htcondor_stage_files_per_batch", "stage_files_per_batch"]:
-                raw_values.append(parallel.get(key))
-                raw_values.append(module_item.get(key))
-        raw_values.append(2)
-
-        for raw in raw_values:
-            if raw in {None, ""}:
-                continue
-            try:
-                return max(1, min(2, int(raw)))
-            except Exception:
-                continue
-        return 2
-
-    def _htcondor_stream_stage_first_batch_size(self, module_item: Dict[str, Any] | None = None) -> int:
-        """首批直接从共享目录读取的文件数，默认 1 个。"""
-        raw_values: List[Any] = [
-            os.environ.get("LOCAL_WEB_HTCONDOR_FIRST_STAGE_FILES", ""),
-        ]
-        if isinstance(module_item, dict):
-            parallel = module_item.get("parallel") if isinstance(module_item.get("parallel"), dict) else {}
-            for key in ["htcondor_first_stage_files", "first_stage_files"]:
-                raw_values.append(parallel.get(key))
-                raw_values.append(module_item.get(key))
-        raw_values.append(1)
-
-        for raw in raw_values:
-            if raw in {None, ""}:
-                continue
-            try:
-                return max(1, min(2, int(raw)))
-            except Exception:
-                continue
-        return 1
-
     def _htcondor_max_files_per_job(self, module_item: Dict[str, Any] | None = None) -> int:
         """每个 HTCondor 子任务最多处理多少个输入文件。
 
@@ -1842,13 +2485,7 @@ class TaskManager:
         output_defs = self._module_output_defs(module_item, split_key=split_key)
         aux_input_defs = self._module_aux_input_defs(module_item, split_key=split_key)
         shared_io = self._htcondor_shared_io_enabled()
-        stream_stage_enabled = bool(shared_io and self._htcondor_stream_stage_enabled(module_item))
-        stream_stage_batch_size = self._htcondor_stream_stage_batch_size(module_item)
-        stream_stage_first_batch_size = min(
-            stream_stage_batch_size,
-            self._htcondor_stream_stage_first_batch_size(module_item),
-        )
-        shared_root = self._shared_task_root(parent_id) if shared_io else split_root
+        shared_root = self._shared_task_root_for_path(parent_id, input_dir) if shared_io else split_root
         if shared_io:
             shared_root.mkdir(parents=True, exist_ok=True)
 
@@ -1900,40 +2537,9 @@ class TaskManager:
 
             shared_input_unc = self._path_to_shared_unc(part_input_dir) if shared_io else ""
             use_local_paths = bool(shared_io and self._htcondor_target_uses_local_paths(machine))
-            stream_stage = bool(
-                stream_stage_enabled
-                and not use_local_paths
-                and shared_input_unc
-                and len(chunk_items) > stream_stage_first_batch_size
-            )
-            direct_input_unc = ""
-            if stream_stage:
-                # The first one or two inputs are exposed through a tiny UNC
-                # directory view and executed immediately.  While that first
-                # algorithm process is running, the wrapper prefetches the next
-                # batch into the execute node's local disk.
-                direct_input_dir = part_dir / f"{split_key}_direct"
-                direct_input_dir.mkdir(parents=True, exist_ok=True)
-                direct_modes: List[str] = []
-                for source in chunk_items[:stream_stage_first_batch_size]:
-                    direct_modes.append(self._link_or_copy_file(
-                        source,
-                        direct_input_dir / source.name,
-                        allow_copy=False,
-                    ))
-                if any(str(mode).startswith("failed") for mode in direct_modes):
-                    raise RuntimeError("无法为远程首批直读文件创建目录视图。")
-                used_modes.extend(direct_modes)
-                direct_input_unc = self._path_to_shared_unc(direct_input_dir)
-                if not direct_input_unc:
-                    raise RuntimeError("无法把远程首批直读目录转换为 UNC 路径。")
             if shared_io and use_local_paths:
                 # 父节点本机任务直接读写本地路径，避免 netCDF4/HDF5 通过 UNC 访问自己的共享目录。
                 part_config[split_key] = str(part_input_dir)
-            elif stream_stage:
-                # 远程节点由作业包装器按“当前批次 + 下一批次”复制到本地沙箱。
-                # EXE 启动前，包装器会把这里改成已经完整复制好的当前批次目录。
-                part_config[split_key] = "__LOCAL_WEB_JOB_DIR__/stage_current"
             elif shared_io and shared_input_unc:
                 # 远程子节点通过 UNC 读取父节点共享目录。
                 part_config[split_key] = shared_input_unc
@@ -1951,9 +2557,6 @@ class TaskManager:
                     out_local, out_unc = self._make_shared_part_output_path(original_out_path, part_name)
                     out_value = str(out_local) if use_local_paths else out_unc
                     if out_value:
-                        # 双缓冲只把“大输入”暂存到远程节点本地；算法生成的输出仍直接
-                        # 写回父节点共享目录。这样每个 TIF 在计算完成后立即传回父节点，
-                        # 不再依赖 Windows HTCondor 对整个输出目录的回收与合并。
                         part_config[out_key] = out_value
                         continue
 
@@ -2015,25 +2618,6 @@ class TaskManager:
 
             part_command = [str(x) for x in command]
             part_command[config_index] = str(part_config_path)
-            part_env = dict(env or {})
-            if stream_stage:
-                stream_stage_plan = {
-                    "version": 1,
-                    "input_key": split_key,
-                    "source_dir": shared_input_unc,
-                    "direct_input_dir": direct_input_unc,
-                    "files": [source.name for source in chunk_items],
-                    "batch_size": stream_stage_batch_size,
-                    "first_batch_size": stream_stage_first_batch_size,
-                    "output_dirs": [
-                        str(item.get("job_subdir") or item.get("key") or "").strip()
-                        for item in output_mappings
-                        if str(item.get("job_subdir") or item.get("key") or "").strip()
-                    ],
-                }
-                part_env["LOCAL_WEB_HTCONDOR_STREAM_STAGE_PLAN_B64"] = base64.b64encode(
-                    json.dumps(stream_stage_plan, ensure_ascii=False).encode("utf-8")
-                ).decode("ascii")
 
             entries.append({
                 "spec": {
@@ -2042,7 +2626,7 @@ class TaskManager:
                     "module_name": str(module_item.get("name") or parent_task.get("module_name") or ""),
                     "command": part_command,
                     "working_dir": working_dir,
-                    "env": part_env,
+                    "env": env or {},
                     "target_machine": machine,
                     "inputs": {
                         "split_mode": "module_config",
@@ -2063,13 +2647,7 @@ class TaskManager:
                         "htcondor_max_files_per_job": max_files_per_job,
                         "file_patterns": self._module_file_patterns(module_item, split_input),
                         "output_mappings": output_mappings,
-                        # 输入双缓冲不改变输出策略：父节点任务写本地目录，远程任务写父节点 UNC。
-                        # 两者的输出都已直接进入用户选择的目录，无需 HTCondor 再回收临时输出目录。
                         "shared_io": bool(shared_io and (shared_input_unc or use_local_paths)),
-                        "stream_stage_inputs": stream_stage,
-                        "stream_stage_batch_size": stream_stage_batch_size if stream_stage else 0,
-                        "stream_stage_first_batch_size": stream_stage_first_batch_size if stream_stage else 0,
-                        "stream_direct_input_unc": direct_input_unc,
                         "shared_input_dir_unc": shared_input_unc,
                         "link_modes": sorted(set(used_modes)),
                     },
@@ -2359,7 +2937,7 @@ class TaskManager:
                     continue
                 part_name = f"part_{index + 1}_{machine}"
                 shared_io = self._htcondor_shared_io_enabled()
-                part_dir = (self._shared_task_root(parent_id) if shared_io else split_root) / part_name
+                part_dir = (self._shared_task_root_for_path(parent_id, input_dir) if shared_io else split_root) / part_name
                 part_input_dir = part_dir / "input"
                 part_input_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2430,7 +3008,7 @@ class TaskManager:
                             "shared_input_dir_unc": shared_input_unc,
                             "link_modes": sorted(set(used_modes)),
                         },
-                        "cleanup_root": str(self._shared_task_root(parent_id) if shared_io else split_root),
+                        "cleanup_root": str(self._shared_task_root_for_path(parent_id, input_dir) if shared_io else split_root),
                         "link_modes": sorted(set(link_modes)),
                     }
                 })
@@ -2451,6 +3029,91 @@ class TaskManager:
                 spec["target_machine"] = machines[index % len(machines)]
             new_entry["spec"] = spec
             result.append(new_entry)
+        return result
+
+    def _assign_batch_entries_by_machine_weight_and_process_slots(
+        self,
+        entries: List[Dict[str, Any]],
+        machines: List[str],
+        module_item: Dict[str, Any] | None = None,
+    ) -> List[Dict[str, Any]]:
+        """按云反演同一套“节点比例 + 进程槽”规则分配批处理子任务。
+
+        气溶胶批处理的每个 entry 已经是一个可独立运行的算法子任务，
+        这里不再把多个 entry 合并成一个命令，只负责写入 target_machine
+        和调度元数据，供 HTCondor 并发提交与日志统计使用。
+        """
+        machines = [str(x).strip() for x in machines if str(x).strip()]
+        if not entries or not machines:
+            return entries
+
+        wrappers = [
+            {
+                "index": index,
+                "entry": entry,
+                # 批处理 entry 本身代表一个输入组；默认按数量均衡，
+                # 如果后续开启 size-aware，也能稳定给出非零权重。
+                "estimated_bytes": 1,
+            }
+            for index, entry in enumerate(entries)
+        ]
+
+        job_chunks = self._split_items_by_machine_weight_and_process_slots(
+            wrappers,
+            machines,
+            module_item=module_item,
+        )
+        if not job_chunks:
+            return self._assign_htcondor_targets(entries, machines)
+
+        weights = self._htcondor_machine_weights(machines)
+        assigned: List[Dict[str, Any] | None] = [None for _ in entries]
+        total_parts = len(entries)
+
+        for job_chunk in job_chunks:
+            machine = str(job_chunk.get("machine") or "").strip()
+            if not machine:
+                continue
+            chunk_items = list(job_chunk.get("items") or [])
+            machine_process_slots = int(job_chunk.get("machine_process_slots") or 1)
+            machine_job_index = int(job_chunk.get("machine_job_index") or 1)
+
+            for item in chunk_items:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    original_index = int(item.get("index"))
+                except Exception:
+                    continue
+                if original_index < 0 or original_index >= len(entries):
+                    continue
+
+                original_entry = item.get("entry")
+                if not isinstance(original_entry, dict):
+                    original_entry = entries[original_index]
+
+                new_entry = dict(original_entry)
+                spec = dict(new_entry.get("spec") or {})
+                inputs = dict(spec.get("inputs") or {})
+
+                spec["target_machine"] = machine
+                inputs["machine"] = machine
+                inputs["node_weight"] = weights.get(machine, 0)
+                inputs["node_weight_percent"] = weights.get(machine, 0)
+                inputs["part_count"] = int(inputs.get("part_count") or 1)
+                inputs["part_index"] = original_index + 1
+                inputs["part_total"] = total_parts
+                inputs["machine_part_index"] = machine_job_index
+                inputs["machine_process_slots"] = machine_process_slots
+                inputs["estimated_input_bytes"] = int(item.get("estimated_bytes") or 1)
+
+                spec["inputs"] = inputs
+                new_entry["spec"] = spec
+                assigned[original_index] = new_entry
+
+        result: List[Dict[str, Any]] = []
+        for index, entry in enumerate(entries):
+            result.append(assigned[index] or entry)
         return result
 
     def _run_htcondor_single_task(
@@ -2535,6 +3198,33 @@ class TaskManager:
                 "[HTCONDOR] 当前任务没有找到可安全拆分的输入列表或输入目录，退回单任务提交。"
             )
 
+        single_target_machine = ""
+        if machines:
+            task_item = self.get_task(task_id) or {}
+            single_entries = [{
+                "spec": {
+                    "module_id": str(task_item.get("module_id") or ""),
+                    "module_name": str(task_item.get("module_name") or task_item.get("module_id") or ""),
+                    "label": str(task_item.get("module_name") or task_item.get("module_id") or task_id),
+                    "command": command,
+                    "working_dir": working_dir or "",
+                    "env": env or {},
+                    "inputs": task_item.get("inputs") if isinstance(task_item.get("inputs"), dict) else {},
+                }
+            }]
+            single_entries = self._assign_htcondor_targets(single_entries, machines)
+            single_entries, single_shared_count = self._prepare_htcondor_shared_io_entries(task_id, single_entries)
+            single_spec = (single_entries[0].get("spec") if single_entries else {}) or {}
+            command = [str(x) for x in (single_spec.get("command") or command)]
+            working_dir = str(single_spec.get("working_dir") or working_dir or "")
+            env = single_spec.get("env") if isinstance(single_spec.get("env"), dict) else (env or {})
+            single_target_machine = str(single_spec.get("target_machine") or "").strip()
+            if single_shared_count:
+                self.append_log(
+                    task_id,
+                    "[HTCONDOR] 单任务已统一使用父节点共享目录路径；远程节点不再读取父节点本机盘符路径。",
+                )
+
         self.update_task(
             task_id,
             status="running",
@@ -2547,8 +3237,11 @@ class TaskManager:
             self.append_log(task_id, f"[HTCONDOR] 已启用远程 EXE 线程限制：每个任务最多 {thread_limit} 个内部线程。")
         else:
             self.append_log(task_id, "[HTCONDOR] 未启用远程 EXE 线程限制，优先保证节点计算性能。")
-        self.append_log(task_id,
-                        "[HTCONDOR] 当前版本要求执行节点具备相同的软件安装路径；大型输入输出仍按 config.json 中的路径读取和写入。")
+        self.append_log(
+            task_id,
+            "[HTCONDOR] 输入、输出和固定资源路径会优先改写为父节点共享目录 UNC 路径；"
+            "父节点本机任务保留本地路径，远程子节点使用 UNC 访问。",
+        )
         def should_cancel():
             task = self.get_task(task_id) or {}
             return task_id in self.cancel_flags or task.get("status") == "cancelled"
@@ -2611,6 +3304,7 @@ class TaskManager:
                 timeout_seconds=self.htcondor_job_timeout_seconds,
                 on_update=on_update,
                 should_cancel=should_cancel,
+                target_machine=single_target_machine,
             )
             self._apply_htcondor_result(task_id, result)
         except Exception as exc:
@@ -2635,6 +3329,19 @@ class TaskManager:
     ):
         machines = self._htcondor_available_machines()
         entries = self._assign_htcondor_targets(entries, machines)
+
+        # H8 AOD 已在 main.py 中按 B01/B03/B06/SOLAR 配成独立子任务。
+        # 这里不再一次性预处理全部 42 个任务；每个任务在真正提交时只写一个小 config.json。
+        direct_paired_mode = bool(entries) and all(
+            self._is_h8aod_direct_paired_spec(
+                entry.get("spec") if isinstance(entry, dict) else {}
+            )
+            for entry in entries
+        )
+        if direct_paired_mode:
+            generic_shared_count = 0
+        else:
+            entries, generic_shared_count = self._prepare_htcondor_shared_io_entries(parent_id, entries)
 
         total = len(entries)
         module_id_for_plan = ""
@@ -2671,6 +3378,22 @@ class TaskManager:
         }
         requested_max_workers = max(1, min(int(max_workers or 1), max(1, total)))
         per_target_limits: Dict[str, int] = {}
+        shared_io_remote_machines = {
+            str(((entry.get("spec") or {}).get("target_machine") or "")).strip()
+            for entry in entries
+            if isinstance(entry, dict)
+            and isinstance((entry.get("spec") or {}).get("inputs"), dict)
+            and ((entry.get("spec") or {}).get("inputs") or {}).get("shared_io")
+            and str(((entry.get("spec") or {}).get("target_machine") or "")).strip()
+            and not self._htcondor_target_uses_local_paths(
+                str(((entry.get("spec") or {}).get("target_machine") or "")).strip()
+            )
+        }
+        try:
+            shared_io_remote_cap = int(os.environ.get("LOCAL_WEB_HTCONDOR_SHARED_IO_MAX_REMOTE_EXE_PER_NODE", "0") or "0")
+        except Exception:
+            shared_io_remote_cap = 0
+        shared_io_remote_cap = max(0, shared_io_remote_cap)
         if machines:
             try:
                 explicit_per_node_cap = int(os.environ.get("LOCAL_WEB_HTCONDOR_MAX_EXE_PER_NODE", "0") or 0)
@@ -2687,6 +3410,8 @@ class TaskManager:
                 limit = configured_slots
                 if explicit_per_node_cap > 0:
                     limit = min(limit, explicit_per_node_cap)
+                if machine in shared_io_remote_machines and shared_io_remote_cap > 0:
+                    limit = min(limit, shared_io_remote_cap)
                 per_target_limits[machine] = max(1, limit)
         if machines:
             # 最多同时提交用户选择的并发数；单个节点可按进程槽/本次并发上限承接多个 EXE。
@@ -2695,17 +3420,6 @@ class TaskManager:
         else:
             max_workers = requested_max_workers
         max_workers = max(1, min(int(max_workers or 1), max(1, total)))
-
-        try:
-            node_submit_stagger_seconds = max(
-                0.0,
-                min(
-                    30.0,
-                    float(os.environ.get("LOCAL_WEB_HTCONDOR_NODE_START_STAGGER_SECONDS", "8") or "8"),
-                ),
-            )
-        except Exception:
-            node_submit_stagger_seconds = 8.0
 
         manager = self.htcondor_manager
         if manager is None:
@@ -2722,6 +3436,23 @@ class TaskManager:
             execution_backend="htcondor",
         )
         self.append_log(parent_id, f"[HTCONDOR] {group_name}启动：总任务数={total}，最多同时提交={max_workers}")
+        if direct_paired_mode:
+            self.append_log(
+                parent_id,
+                "[HTCONDOR-DIRECT] H8 AOD paired transfer enabled: each child job carries its matched B01/B03/B06/SOLAR files in the HTCondor sandbox.",
+            )
+            self.append_log(
+                parent_id,
+                "[HTCONDOR-DIRECT] H8 AOD 已启用配套直提：直接使用已配好的 "
+                "B01/B03/B06/SOLAR 文件组；不再统一预处理全部子任务，"
+                "仅在任务实际提交时生成当前组 config.json。",
+            )
+        if generic_shared_count:
+            self.append_log(
+                parent_id,
+                f"[HTCONDOR] 已统一 {generic_shared_count} 个子任务使用父节点共享目录路径；"
+                "远程节点不再读取父节点本机盘符路径。",
+            )
         if machines:
             self.append_log(parent_id, f"[HTCONDOR] 当前可用执行节点：{', '.join(machines)}")
         thread_limit = str(os.environ.get("LOCAL_WEB_HTCONDOR_THREAD_LIMIT", "")).strip()
@@ -2736,43 +3467,25 @@ class TaskManager:
                 for machine in machines
             )
             self.append_log(parent_id, f"[HTCONDOR] 已启用节点并发上限：{node_limit_text}；同一执行节点按上限同时运行 EXE。")
-            if node_submit_stagger_seconds > 0:
+
+        if shared_io_remote_machines:
+            limited_text = ", ".join(
+                f"{machine}:{per_target_limits.get(machine, 1)}"
+                for machine in machines
+                if machine in shared_io_remote_machines
+            )
+            if limited_text:
                 self.append_log(
                     parent_id,
-                    f"[HTCONDOR-START] 同一节点的多个 EXE 将错峰 {node_submit_stagger_seconds:g} 秒启动，"
-                    "避免模型和运行库同时冷加载拖慢首个结果。",
+                    f"[HTCONDOR] 共享目录远程任务已启用稳定并发上限：{limited_text}。",
                 )
 
         shared_count = 0
-        stream_stage_count = 0
         for entry in entries:
             spec = entry.get("spec") if isinstance(entry, dict) else {}
             inputs = spec.get("inputs") if isinstance(spec.get("inputs"), dict) else {}
             if inputs.get("shared_io"):
                 shared_count += 1
-            if inputs.get("stream_stage_inputs"):
-                stream_stage_count += 1
-        if stream_stage_count:
-            batch_sizes = sorted({
-                int(
-                    (
-                        (entry.get("spec") or {}).get("inputs")
-                        if isinstance((entry.get("spec") or {}).get("inputs"), dict)
-                        else {}
-                    ).get("stream_stage_batch_size") or 2
-                )
-                for entry in entries
-                if isinstance(entry, dict)
-                and isinstance((entry.get("spec") or {}).get("inputs"), dict)
-                and ((entry.get("spec") or {}).get("inputs") or {}).get("stream_stage_inputs")
-            })
-            batch_text = "/".join(str(value) for value in batch_sizes) or "2"
-            self.append_log(
-                parent_id,
-                f"[HTCONDOR-STAGE] 已启用远程输入双缓冲：首批 1 个文件直接读取共享目录，后续每批 {batch_text} 个文件暂存到执行节点本地。"
-                "首批计算开始后立即后台预取下一批；计算当前批次时只保留下一批；"
-                "批次完成立即删除其本地输入，任务结束仅回传输出。",
-            )
         if shared_count:
             cfg = self._htcondor_shared_io_config()
             self.append_log(
@@ -2799,9 +3512,59 @@ class TaskManager:
         failures = 0
         future_map: Dict[Any, Dict[str, Any]] = {}
         active_target_counts: Dict[str, int] = {}
-        target_last_submit_monotonic: Dict[str, float] = {}
+        shared_io_target_resume_at: Dict[str, float] = {}
         submitted_count = 0
         pending_entries: List[tuple[int, Dict[str, Any]]] = list(enumerate(entries))
+        try:
+            shared_io_requeue_retries = int(os.environ.get("LOCAL_WEB_HTCONDOR_SHARED_IO_REQUEUE_RETRIES", "3") or "3")
+        except Exception:
+            shared_io_requeue_retries = 3
+        shared_io_requeue_retries = max(0, min(10, shared_io_requeue_retries))
+        try:
+            shared_io_retry_backoff_seconds = float(os.environ.get("LOCAL_WEB_HTCONDOR_SHARED_IO_RETRY_BACKOFF_SECONDS", "8") or "8")
+        except Exception:
+            shared_io_retry_backoff_seconds = 8.0
+        shared_io_retry_backoff_seconds = max(1.0, min(60.0, shared_io_retry_backoff_seconds))
+
+        def is_shared_io_retryable_failure(
+            inputs: Dict[str, Any],
+            result_code: int | None = None,
+            error_text: str = "",
+        ) -> bool:
+            if not isinstance(inputs, dict) or not inputs.get("shared_io"):
+                return False
+            if result_code == 1326:
+                return True
+            low = str(error_text or "").lower()
+            return any(
+                token in low
+                for token in (
+                    "system error 71",
+                    "no more connections can be made",
+                    "shared directory is not accessible",
+                    "net use shared directory failed",
+                    "return_code=1326",
+                    "return code=1326",
+                    "error 71",
+                )
+            )
+
+        def reduce_shared_io_target_limit(target_machine: str) -> str:
+            if not target_machine or target_machine not in shared_io_remote_machines:
+                return ""
+            shared_io_target_resume_at[target_machine] = max(
+                shared_io_target_resume_at.get(target_machine, 0.0),
+                time.time() + shared_io_retry_backoff_seconds,
+            )
+            try:
+                old_limit = max(1, int(per_target_limits.get(target_machine, 1) or 1))
+            except Exception:
+                old_limit = 1
+            if old_limit <= 1:
+                return ""
+            new_limit = max(1, old_limit // 2)
+            per_target_limits[target_machine] = new_limit
+            return f"；{target_machine} 共享目录并发已从 {old_limit} 降为 {new_limit}"
 
         htcondor_cleanup_roots: list[str] = []
         for entry in entries:
@@ -2810,23 +3573,7 @@ class TaskManager:
             if cleanup_root and cleanup_root not in htcondor_cleanup_roots:
                 htcondor_cleanup_roots.append(cleanup_root)
 
-        def make_on_update(
-            current_child_id: str,
-            current_label: str,
-            current_target: str,
-            current_spec: Dict[str, Any],
-        ):
-            current_inputs = (
-                current_spec.get("inputs")
-                if isinstance(current_spec.get("inputs"), dict)
-                else {}
-            )
-            current_stream_stage = bool(current_inputs.get("stream_stage_inputs"))
-            current_first_stage_files = max(
-                1,
-                int(current_inputs.get("stream_stage_first_batch_size") or 1),
-            )
-
+        def make_on_update(current_child_id: str, current_label: str, current_target: str):
             def on_update(info):
                 info = info or {}
                 kind = str(info.get("type") or "")
@@ -2869,16 +3616,6 @@ class TaskManager:
                             useful.append(raw)
                     if useful:
                         self._append_htcondor_output(current_child_id, "CONDOR", "\n".join(useful), max_lines=80)
-                    if any("executing" in str(line or "").lower() for line in useful):
-                        if current_stream_stage:
-                            phase_text = (
-                                f"已获得执行槽，首批 {current_first_stage_files} 个输入文件将直接从共享目录计算，并后台预取后续输入。"
-                            )
-                            self.update_task(current_child_id, runtime_phase="running_direct_first_batch")
-                        else:
-                            phase_text = "已获得执行槽，正在启动算法并加载运行库与模型。"
-                            self.update_task(current_child_id, runtime_phase="starting_algorithm")
-                        self.append_log(parent_id, f"[HTCONDOR-START] {current_label} {phase_text}")
             return on_update
 
         def make_should_cancel(current_child_id: str):
@@ -2893,6 +3630,19 @@ class TaskManager:
 
         def submit_entry(pool: ThreadPoolExecutor, entry_index: int, entry: Dict[str, Any]):
             nonlocal submitted_count
+
+            # 只在这个子任务即将进入 HTCondor 队列时准备它。
+            # pending 中的其余任务保持原样，避免一次性处理 42 组。
+            if direct_paired_mode:
+                entry = self._prepare_h8aod_direct_paired_entry(
+                    parent_id,
+                    entry_index,
+                    entry,
+                )
+                cleanup_root = str(((entry.get("spec") or {}).get("cleanup_root") or "")).strip()
+                if cleanup_root and cleanup_root not in htcondor_cleanup_roots:
+                    htcondor_cleanup_roots.append(cleanup_root)
+
             spec = entry["spec"]
             child_id = entry.get("child_id")
             label = str(spec.get("label") or f"子任务 {entry_index + 1}")
@@ -2926,6 +3676,8 @@ class TaskManager:
                     started_at=now_iso(),
                     execution_backend="htcondor",
                     target_machine=target_machine,
+                    command=spec.get("command") or [],
+                    inputs=spec.get("inputs") or {},
                 )
 
             future = pool.submit(
@@ -2946,7 +3698,7 @@ class TaskManager:
                     thread_limit=(resource_plans.get(target_machine) or {}).get("threads_per_exe"),
                 ),
                 timeout_seconds=self.htcondor_job_timeout_seconds,
-                on_update=make_on_update(child_id, label, target_machine, spec),
+                on_update=make_on_update(child_id, label, target_machine),
                 should_cancel=make_should_cancel(child_id),
                 target_machine=target_machine,
             )
@@ -2955,10 +3707,10 @@ class TaskManager:
                 "label": label,
                 "target_machine": target_machine,
                 "spec": spec,
+                "entry_index": entry_index,
             }
             if target_machine:
                 active_target_counts[target_machine] = active_target_counts.get(target_machine, 0) + 1
-                target_last_submit_monotonic[target_machine] = time.monotonic()
                 self.append_log(parent_id, f"[HTCONDOR] 已提交 {submitted_count + 1}/{total}: {label} -> {target_machine}")
             else:
                 self.append_log(parent_id, f"[HTCONDOR] 已提交 {submitted_count + 1}/{total}: {label}")
@@ -2972,16 +3724,13 @@ class TaskManager:
                 for pos, (entry_index, entry) in enumerate(pending_entries):
                     spec = entry.get("spec") if isinstance(entry, dict) else {}
                     target_machine = str((spec or {}).get("target_machine") or "").strip()
+                    resume_at = shared_io_target_resume_at.get(target_machine, 0.0) if target_machine else 0.0
+                    if resume_at and time.time() < resume_at:
+                        continue
+                    if resume_at:
+                        shared_io_target_resume_at.pop(target_machine, None)
                     target_limit = per_target_limits.get(target_machine, max_workers)
-                    active_count = active_target_counts.get(target_machine, 0)
-                    stagger_ready = True
-                    if target_machine and active_count > 0 and node_submit_stagger_seconds > 0:
-                        last_submit = target_last_submit_monotonic.get(target_machine, 0.0)
-                        stagger_ready = (time.monotonic() - last_submit) >= node_submit_stagger_seconds
-                    if (
-                        (not target_machine or active_count < target_limit)
-                        and stagger_ready
-                    ):
+                    if not target_machine or active_target_counts.get(target_machine, 0) < target_limit:
                         selected_pos = pos
                         break
                 if selected_pos is None:
@@ -3004,11 +3753,13 @@ class TaskManager:
                     if not future_map:
                         launch_available(pool)
                         if not future_map:
+                            if pending_entries:
+                                time.sleep(0.5)
+                                continue
                             break
 
                     done, _ = wait(list(future_map.keys()), timeout=0.5, return_when=FIRST_COMPLETED)
                     if not done:
-                        launch_available(pool)
                         continue
 
                     for future in done:
@@ -3024,15 +3775,65 @@ class TaskManager:
                                 active_target_counts.pop(target_machine, None)
                         try:
                             result = future.result()
+                            spec_for_collect = meta.get("spec") or {}
+                            inputs_for_collect = spec_for_collect.get("inputs") if isinstance(spec_for_collect.get("inputs"), dict) else {}
+                            try:
+                                result_code = int((result or {}).get("return_code"))
+                            except Exception:
+                                result_code = None
+                            try:
+                                shared_retry_count = int(inputs_for_collect.get("_shared_io_requeue_count") or 0)
+                            except Exception:
+                                shared_retry_count = 0
+                            if (
+                                is_shared_io_retryable_failure(
+                                    inputs_for_collect,
+                                    result_code=result_code,
+                                )
+                                and shared_retry_count < shared_io_requeue_retries
+                            ):
+                                limit_note = reduce_shared_io_target_limit(target_machine)
+                                retry_spec = copy.deepcopy(spec_for_collect)
+                                retry_inputs = dict(retry_spec.get("inputs") if isinstance(retry_spec.get("inputs"), dict) else {})
+                                retry_inputs["_shared_io_requeue_count"] = shared_retry_count + 1
+                                retry_spec["inputs"] = retry_inputs
+                                pending_entries.append((
+                                    int(meta.get("entry_index") or 0),
+                                    {"child_id": child_id, "spec": retry_spec},
+                                ))
+                                self.update_task(
+                                    child_id,
+                                    status="queued",
+                                    return_code=None,
+                                    ended_at="",
+                                    execution_backend="htcondor",
+                                )
+                                self.append_log(
+                                    parent_id,
+                                    f"[HTCONDOR] {label} 共享目录连接暂时不可用，已重新排队重试 {shared_retry_count + 1}/{shared_io_requeue_retries}{limit_note}。",
+                                )
+                                self._cleanup_htcondor_job_dir(
+                                    parent_id,
+                                    str((result or {}).get("job_dir") or ""),
+                                    label=label,
+                                    reason="HTCondor 共享目录连接重试，清理本次失败 job 目录",
+                                )
+                                continue
+
                             status = self._apply_htcondor_result(child_id, result)
                             if status == "success":
-                                spec_for_collect = meta.get("spec") or {}
-                                inputs_for_collect = spec_for_collect.get("inputs") if isinstance(spec_for_collect.get("inputs"), dict) else {}
                                 if inputs_for_collect.get("shared_io"):
-                                    self.append_log(
-                                        parent_id,
-                                        f"[HTCONDOR] {label} 使用共享目录模式，输出已直接写入父节点共享目录，跳过 HTCondor 输出回收。"
+                                    collected_files = self._collect_htcondor_shared_outputs(
+                                        parent_id=parent_id,
+                                        child_id=child_id,
+                                        spec=spec_for_collect,
+                                        label=label,
                                     )
+                                    if not collected_files:
+                                        self.append_log(
+                                            parent_id,
+                                            f"[HTCONDOR] {label} 使用共享目录模式，输出已直接写入父节点共享目录，跳过 HTCondor 输出回收。"
+                                        )
                                 else:
                                     self._collect_htcondor_transferred_outputs(
                                         parent_id=parent_id,
@@ -3049,6 +3850,49 @@ class TaskManager:
                                 reason=f"HTCondor 子任务结束，状态={status}",
                             )
                         except Exception as exc:
+                            spec_for_collect = meta.get("spec") or {}
+                            inputs_for_collect = spec_for_collect.get("inputs") if isinstance(spec_for_collect.get("inputs"), dict) else {}
+                            try:
+                                shared_retry_count = int(inputs_for_collect.get("_shared_io_requeue_count") or 0)
+                            except Exception:
+                                shared_retry_count = 0
+                            error_text = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
+                            if (
+                                is_shared_io_retryable_failure(
+                                    inputs_for_collect,
+                                    error_text=error_text,
+                                )
+                                and shared_retry_count < shared_io_requeue_retries
+                            ):
+                                limit_note = reduce_shared_io_target_limit(target_machine)
+                                retry_spec = copy.deepcopy(spec_for_collect)
+                                retry_inputs = dict(retry_spec.get("inputs") if isinstance(retry_spec.get("inputs"), dict) else {})
+                                retry_inputs["_shared_io_requeue_count"] = shared_retry_count + 1
+                                retry_spec["inputs"] = retry_inputs
+                                pending_entries.append((
+                                    int(meta.get("entry_index") or 0),
+                                    {"child_id": child_id, "spec": retry_spec},
+                                ))
+                                self.append_log(child_id, f"[HTCONDOR-WARN] 共享目录连接异常，子任务将重新排队：{type(exc).__name__}: {exc}")
+                                self.update_task(
+                                    child_id,
+                                    status="queued",
+                                    return_code=None,
+                                    ended_at="",
+                                    execution_backend="htcondor",
+                                )
+                                self.append_log(
+                                    parent_id,
+                                    f"[HTCONDOR] {label} 共享目录连接异常，已重新排队重试 {shared_retry_count + 1}/{shared_io_requeue_retries}{limit_note}。",
+                                )
+                                self._cleanup_htcondor_job_dir(
+                                    parent_id,
+                                    str((self.get_task(child_id) or {}).get("htcondor_job_dir") or ""),
+                                    label=label,
+                                    reason="HTCondor 共享目录异常重试，清理本次失败 job 目录",
+                                )
+                                continue
+
                             status = "failed"
                             self.append_log(child_id, f"[HTCONDOR-ERROR] {type(exc).__name__}: {exc}")
                             self.append_log(child_id, traceback.format_exc())
@@ -3120,6 +3964,55 @@ class TaskManager:
             {"child_id": child_id, "spec": job}
             for child_id, job in child_job_map.items()
         ]
+        machines = self._htcondor_available_machines()
+        module_id = ""
+        for job in child_job_map.values():
+            module_id = str((job or {}).get("module_id") or "").strip()
+            if module_id:
+                break
+        module_item = self._find_module_item(module_id) if module_id else {}
+
+        # H8 AOD 的 jobs 已由 main.py 按 B01/B03/B06/SOLAR 配套生成。
+        # 给这些 entry 加直提标志，后续跳过 generic 共享目录批量预处理。
+        if module_id.strip().lower() == "h8aod" and self._htcondor_direct_paired_batch_enabled():
+            tagged_entries: List[Dict[str, Any]] = []
+            for entry in entries:
+                tagged = dict(entry)
+                spec = dict(tagged.get("spec") or {})
+                spec_inputs = dict(spec.get("inputs") if isinstance(spec.get("inputs"), dict) else {})
+                spec_inputs["_htcondor_direct_paired_batch"] = True
+                spec["inputs"] = spec_inputs
+                tagged["spec"] = spec
+                tagged_entries.append(tagged)
+            entries = tagged_entries
+
+        if machines:
+            entries = self._assign_batch_entries_by_machine_weight_and_process_slots(
+                entries,
+                machines,
+                module_item=module_item,
+            )
+            process_slots_map = self._htcondor_machine_process_slots(machines, module_item=module_item)
+            group_max_workers = min(
+                len(entries) or 1,
+                max(1, sum(process_slots_map.get(machine, 1) for machine in machines)),
+            )
+            weight_text = ", ".join(
+                f"{machine}={self._htcondor_machine_weights(machines).get(machine, 1)}"
+                for machine in machines
+            )
+            process_slots_text = ", ".join(
+                f"{machine}={process_slots_map.get(machine, 1)}"
+                for machine in machines
+            )
+            self.append_log(parent_id, f"[HTCONDOR] 检测到 {len(machines)} 个可用执行节点：{', '.join(machines)}")
+            self.append_log(parent_id, f"[HTCONDOR] 节点任务权重：{weight_text}。批处理模块统一按云反演逻辑分配任务：先按节点比例分配输入组，再按各节点进程槽并发提交。")
+            self.append_log(parent_id, f"[HTCONDOR] 节点进程槽：{process_slots_text}；本次最多同时提交={group_max_workers}。")
+            distribution_text = self._htcondor_entries_distribution_text(entries)
+            if distribution_text:
+                self.append_log(parent_id, f"[HTCONDOR] 实际输入组分配：{distribution_text}")
+            return self._run_htcondor_job_group(parent_id, entries, group_max_workers, "批处理")
+
         return self._run_htcondor_job_group(parent_id, entries, max_parallel, "批处理")
 
     def kick_scheduler(self):

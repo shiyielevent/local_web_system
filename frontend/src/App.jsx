@@ -901,7 +901,6 @@ function findLastNumberInLogs(logs, patterns) {
 function getTaskProgressInfo(task, taskLogs, elapsedTextOverride = '') {
   const status = normalizeTaskStatus(task?.status);
   const logs = Array.isArray(taskLogs) ? taskLogs : [];
-  const elapsedText = elapsedTextOverride || '';
 
   if (!task) {
     return {
@@ -928,7 +927,7 @@ function getTaskProgressInfo(task, taskLogs, elapsedTextOverride = '') {
     return {
       percent: 100,
       label: '任务已完成',
-      detail: elapsedText ? `总耗时：${elapsedText}` : '输出结果已进入登记流程',
+      detail: '输出结果已进入登记流程',
       mode: 'done',
       color: '#1f9d55',
     };
@@ -939,9 +938,7 @@ function getTaskProgressInfo(task, taskLogs, elapsedTextOverride = '') {
       return {
         percent: 100,
         label: '任务因内存不足失败',
-        detail: elapsedText
-          ? `总耗时：${elapsedText}；系统检测到 MemoryError / Unable to allocate，请清理内存后重新运行`
-          : '系统检测到 MemoryError / Unable to allocate，请清理内存后重新运行',
+        detail: '系统检测到 MemoryError / Unable to allocate，请清理内存后重新运行',
         mode: 'failed_memory',
         color: '#d64545',
       };
@@ -950,9 +947,7 @@ function getTaskProgressInfo(task, taskLogs, elapsedTextOverride = '') {
     return {
       percent: 100,
       label: '任务运行失败',
-      detail: elapsedText
-        ? `总耗时：${elapsedText}；请查看下方运行日志中的 STDERR、ERROR 或 Traceback 信息`
-        : '请查看下方运行日志中的 STDERR、ERROR 或 Traceback 信息',
+      detail: '请查看下方运行日志中的 STDERR、ERROR 或 Traceback 信息',
       mode: 'failed',
       color: '#d64545',
     };
@@ -962,51 +957,93 @@ function getTaskProgressInfo(task, taskLogs, elapsedTextOverride = '') {
     return {
       percent: 100,
       label: '任务已取消',
-      detail: elapsedText ? `已运行：${elapsedText}` : '',
+      detail: '',
       mode: 'cancelled',
       color: '#6b7280',
     };
   }
 
+  const executionBackend = String(task?.execution_backend || 'local').trim().toLowerCase();
+  const isDistributed = executionBackend === 'htcondor';
+  const parallelTotal = Number.parseInt(String(task?.parallel_total || 0), 10) || 0;
+  const parallelDone = Number.parseInt(String(task?.parallel_done || 0), 10) || 0;
+  const parallelFailed = Number.parseInt(String(task?.parallel_failed || 0), 10) || 0;
   const fileProgress = task?.file_progress && typeof task.file_progress === 'object'
     ? task.file_progress
     : null;
   const fileTotal = Number.parseInt(String(fileProgress?.total || task?.file_total || 0), 10) || 0;
-  if (fileTotal > 0) {
+
+  // 单机：只按已经完成的输入子任务数量计算进度。
+  // 不读取输出目录文件数，避免一个输入生成多个中间文件时提前显示 6/6。
+  if (!isDistributed && parallelTotal > 0) {
+    const finished = Math.max(0, Math.min(parallelTotal, parallelDone));
+    const failed = Math.max(0, Math.min(finished, parallelFailed));
+    const succeeded = Math.max(0, finished - failed);
+    const rawPercent = Math.round((finished / parallelTotal) * 100);
+    const percent = status === 'running'
+      ? Math.max(0, Math.min(99, rawPercent))
+      : Math.max(0, Math.min(100, rawPercent));
+
+    return {
+      percent,
+      label: `文件进度：${finished}/${parallelTotal}`,
+      detail: failed > 0 ? `已成功 ${succeeded} 个，失败 ${failed} 个` : '',
+      mode: 'local_input_completion',
+      color: '#2d7cf6',
+    };
+  }
+
+  // 分布式：由父节点扫描共享输出目录，以新增输出文件数计算进度。
+  if (isDistributed && fileTotal > 0) {
     const rawDone = Number.parseInt(String(fileProgress?.done || task?.file_done || 0), 10) || 0;
     const fileDone = Math.max(0, Math.min(fileTotal, rawDone));
-    const matchedOutputs = Number.parseInt(String(fileProgress?.matched_outputs || fileDone), 10) || fileDone;
-    const percent = Math.max(0, Math.min(99, Math.round((fileDone / fileTotal) * 100)));
-    const scanInterval = Number.parseInt(String(fileProgress?.scan_interval_seconds || 0), 10) || 0;
-    const outputDirs = Array.isArray(fileProgress?.output_dirs) ? fileProgress.output_dirs : [];
-    const scanText = scanInterval > 0
-      ? `父节点输出目录约每 ${scanInterval} 秒扫描一次`
-      : '父节点输出目录扫描';
-    const dirText = outputDirs.length > 0
-      ? `；扫描目录：${outputDirs.slice(0, 2).join('；')}${outputDirs.length > 2 ? ' 等' : ''}`
-      : '';
+    const rawPercent = Math.round((fileDone / fileTotal) * 100);
+    const percent = status === 'running'
+      ? Math.max(0, Math.min(99, rawPercent))
+      : Math.max(0, Math.min(100, rawPercent));
 
     return {
       percent,
       label: `文件进度：${fileDone}/${fileTotal}`,
-      detail: `已生成 ${matchedOutputs} 个输出文件；${scanText}${elapsedText ? `，已运行 ${elapsedText}` : ''}${dirText}`,
+      detail: '',
+      mode: 'distributed_output_progress',
+      color: '#2d7cf6',
+    };
+  }
+
+  // 兼容普通任务或旧任务中的文件进度字段。
+  if (fileTotal > 0) {
+    const rawDone = Number.parseInt(String(fileProgress?.done || task?.file_done || 0), 10) || 0;
+    const fileDone = Math.max(0, Math.min(fileTotal, rawDone));
+    const rawPercent = Math.round((fileDone / fileTotal) * 100);
+    const percent = status === 'running'
+      ? Math.max(0, Math.min(99, rawPercent))
+      : Math.max(0, Math.min(100, rawPercent));
+
+    return {
+      percent,
+      label: `文件进度：${fileDone}/${fileTotal}`,
+      detail: '',
       mode: 'file_progress',
       color: '#2d7cf6',
     };
   }
 
-  const parallelTotal = Number.parseInt(String(task?.parallel_total || 0), 10) || 0;
+  // 分布式没有可扫描输出路径时，退回 HTCondor 子任务完成数。
   if (parallelTotal > 0) {
-    const completed = Number.parseInt(String(task?.parallel_done || 0), 10) || 0;
-    const failed = Number.parseInt(String(task?.parallel_failed || 0), 10) || 0;
-    const finished = Math.min(parallelTotal, completed);
+    const finished = Math.max(0, Math.min(parallelTotal, parallelDone));
+    const failed = Math.max(0, Math.min(finished, parallelFailed));
     const succeeded = Math.max(0, finished - failed);
-    const percent = Math.max(0, Math.min(99, Math.round((finished / parallelTotal) * 100)));
+    const rawPercent = Math.round((finished / parallelTotal) * 100);
+    const percent = status === 'running'
+      ? Math.max(0, Math.min(99, rawPercent))
+      : Math.max(0, Math.min(100, rawPercent));
+
     return {
       percent,
-      label: `子任务进度：${finished}/${parallelTotal}`,
-      detail: `成功 ${succeeded} 个，失败 ${failed} 个${elapsedText ? `，已运行 ${elapsedText}` : ''}`,
-      mode: 'parallel',
+      label: `文件进度：${finished}/${parallelTotal}`,
+      detail: failed > 0 ? `已成功 ${succeeded} 个，失败 ${failed} 个` : '',
+      mode: 'parallel_fallback',
       color: '#2d7cf6',
     };
   }
@@ -1018,13 +1055,13 @@ function getTaskProgressInfo(task, taskLogs, elapsedTextOverride = '') {
       : tqdmProgress.percent;
 
     const label = tqdmProgress.total
-      ? `算法进度：${tqdmProgress.current || 0}/${tqdmProgress.total}`
-      : `算法进度：${percent}%`;
+      ? `任务进度：${tqdmProgress.current || 0}/${tqdmProgress.total}`
+      : `任务进度：${percent}%`;
 
     return {
       percent,
       label,
-      detail: `${elapsedText ? `已运行 ${elapsedText}；` : ''}进度来自程序输出的 tqdm 进度条`,
+      detail: '',
       mode: 'tqdm',
       color: '#2d7cf6',
     };
@@ -1056,7 +1093,7 @@ function getTaskProgressInfo(task, taskLogs, elapsedTextOverride = '') {
     return {
       percent,
       label,
-      detail: `${elapsedText ? `已运行 ${elapsedText}；` : ''}进度根据运行日志自动识别`,
+      detail: '进度根据运行日志自动识别',
       mode: 'log_files',
       color: '#2d7cf6',
     };
@@ -1067,7 +1104,7 @@ function getTaskProgressInfo(task, taskLogs, elapsedTextOverride = '') {
     return {
       percent: null,
       label: '任务正在运行',
-      detail: `${elapsedText ? `已运行 ${elapsedText}；` : ''}当前模块未输出可识别的百分比，系统正在持续记录日志`,
+      detail: '当前模块未输出可识别的文件级进度，系统正在持续记录日志',
       mode: 'indeterminate',
       color: '#2d7cf6',
     };
@@ -1076,7 +1113,7 @@ function getTaskProgressInfo(task, taskLogs, elapsedTextOverride = '') {
   return {
     percent: 5,
     label: '任务准备中',
-    detail: elapsedText ? `已等待 ${elapsedText}` : '',
+    detail: '',
     mode: 'preparing',
     color: '#2d7cf6',
   };
@@ -1228,6 +1265,16 @@ function TaskProgressPanel({ task, taskLogs }) {
         {progress.label}
         {progress.mode === 'indeterminate' && <RunningDots active={true} />}
       </div>
+      {elapsedText && status === 'running' && (
+        <div style={{ marginTop: 4, color: '#63758c', fontSize: 12, lineHeight: 1.5 }}>
+          运行时间：{elapsedText}
+        </div>
+      )}
+      {elapsedText && isTerminalTaskStatus(status) && (
+        <div style={{ marginTop: 4, color: '#63758c', fontSize: 12, lineHeight: 1.5 }}>
+          总耗时：{elapsedText}
+        </div>
+      )}
       {progress.detail && (
         <div style={{ marginTop: 4, color: '#63758c', fontSize: 12, lineHeight: 1.5 }}>
           {progress.detail}
@@ -2362,6 +2409,7 @@ function HTCondorPage({
   const nodeItems = Array.isArray(nodes.items) ? nodes.items : [];
   const uniqueMachines = Array.from(new Set(nodeItems.map((item) => item.machine).filter(Boolean)));
   const poolRole = info.pool_role || 'standalone';
+  const standaloneLocal = poolRole === 'standalone';
   const parentConnection = info.parent_connection || {};
   const childConnectionStatus = poolRole === 'child'
     ? (parentConnection.status || 'checking')
@@ -2381,6 +2429,22 @@ function HTCondorPage({
   const roleText = !isAdmin && poolRole === 'parent'
     ? '父节点（管理员配置）'
     : nodeRoleText;
+  const runModeText = standaloneLocal
+    ? '本机单机执行'
+    : (poolRole === 'child'
+      ? (childConnected
+        ? 'HTCondor 子节点执行（已连接）'
+        : (childChecking
+          ? 'HTCondor 子节点执行（连接确认中）'
+          : (childDegraded
+            ? 'HTCondor 子节点执行（注册异常）'
+            : 'HTCondor 子节点执行（已断开）')))
+      : (mode === 'htcondor'
+        ? 'HTCondor 分布式执行'
+        : '父节点已启动／当前本机执行'));
+  const runModeTone = poolRole === 'child' && !childConnected
+    ? (childChecking || childDegraded ? 'warning' : 'danger')
+    : 'normal';
   const clusterStarted = poolRole === 'parent' || poolRole === 'child';
   const clusterHealthy = poolRole === 'child'
     ? childConnected
@@ -2736,9 +2800,9 @@ function HTCondorPage({
       <div style={{ ...styles.card, padding: '12px 16px' }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap', alignItems: 'center' }}>
           <div>
-            <div style={{ fontSize: 26, fontWeight: 900, color: '#12385f', lineHeight: 1.15 }}>HTCondor 分布式</div>
+            <div style={{ fontSize: 26, fontWeight: 900, color: '#12385f', lineHeight: 1.15 }}>HTCondor 集群管理</div>
             <div style={{ marginTop: 4, color: '#5c7189', lineHeight: 1.45, fontSize: 14 }}>
-              当前接入 HTCondor 提交与执行模式，用于父节点调度、子节点执行和多节点任务分配。
+              未启动或未加入集群时，平台默认采用本机单机执行；启动父节点或加入子节点后再进入相应集群角色。
             </div>
           </div>
           <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
@@ -2758,12 +2822,25 @@ function HTCondorPage({
                 : (poolRole === 'child' && !childConnected ? '父节点断开，WRITE 不可用' : 'WRITE 权限失败'),
               writePermissionPending,
             )}
-            {okBadge(
-              info.enabled,
-              'HTCondor 执行已启用',
-              childChecking || ping.pending ? 'HTCondor 状态确认中' : '当前未启用 HTCondor',
-              childChecking || !!ping.pending,
-            )}
+            {poolRole === 'standalone'
+              ? okBadge(true, '当前为本机执行', '当前为本机执行')
+              : (poolRole === 'child'
+                ? okBadge(
+                  childConnected,
+                  '子节点执行已就绪',
+                  childChecking
+                    ? '子节点连接确认中'
+                    : (childDegraded ? '子节点注册异常' : '子节点连接已断开'),
+                  childChecking,
+                )
+                : (mode === 'htcondor'
+                  ? okBadge(
+                    info.enabled,
+                    'HTCondor 执行已启用',
+                    ping.pending ? 'HTCondor 状态确认中' : 'HTCondor 执行检查未通过',
+                    !!ping.pending,
+                  )
+                  : okBadge(true, '父节点当前为本机执行', '父节点当前为本机执行')))}
             {okBadge(sharedEnabled, '共享目录已启用', '共享目录未启用')}
           </div>
         </div>
@@ -2818,12 +2895,22 @@ function HTCondorPage({
           {cardTitle('运行状态', '集中展示集群角色、节点数量和安装结果。')}
 
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 8 }}>
-            {statCard('运行模式', mode === 'htcondor' ? 'HTCondor 分布式执行' : '本机 local')}
-            {statCard('集群状态', clusterStatusText, clusterStatusTone)}
-            {statCard('节点数量', String(nodeCount))}
-            {statCard('当前节点角色', roleText, roleTone)}
-            {infoCard('父节点信息', parentInfo)}
-            {infoCard('子节点信息', childInfo)}
+            {standaloneLocal ? (
+              <>
+                {statCard('运行模式', '本机单机执行')}
+                {statCard('任务启动方式', '直接启动本机程序')}
+                {statCard('分布式调度', '不使用 HTCondor')}
+              </>
+            ) : (
+              <>
+                {statCard('运行模式', runModeText, runModeTone)}
+                {statCard('集群状态', clusterStatusText, clusterStatusTone)}
+                {statCard('节点数量', String(nodeCount))}
+                {statCard('当前节点角色', roleText, roleTone)}
+                {infoCard('父节点信息', parentInfo)}
+                {infoCard('子节点信息', childInfo)}
+              </>
+            )}
           </div>
 
           <div style={{
@@ -2836,13 +2923,39 @@ function HTCondorPage({
             fontSize: 13,
             lineHeight: 1.5,
           }}>
-            <div><strong style={{ color: '#17406b' }}>HTCondor 版本：</strong>{shortVersion || '-'}</div>
-            <div><strong style={{ color: '#17406b' }}>当前机器：</strong>{info.machine || '-'}</div>
-            <div><strong style={{ color: '#17406b' }}>服务状态：</strong>{service.state || (info.service_running ? 'running' : 'stopped')}</div>
-            <div><strong style={{ color: '#17406b' }}>安装结果：</strong>{install.message || install.status || '暂无安装结果'}</div>
+            {standaloneLocal ? (
+              <>
+                <div><strong style={{ color: '#17406b' }}>执行方式：</strong>本机进程池直接运行</div>
+                <div><strong style={{ color: '#17406b' }}>任务路由：</strong>不会读取父节点、节点权重或目标机器名</div>
+                <div><strong style={{ color: '#17406b' }}>说明：</strong>HTCondor 服务即使仍在后台运行，也不参与当前平台任务。</div>
+              </>
+            ) : (
+              <>
+                <div><strong style={{ color: '#17406b' }}>HTCondor 版本：</strong>{shortVersion || '-'}</div>
+                <div><strong style={{ color: '#17406b' }}>当前机器：</strong>{info.machine || '-'}</div>
+                <div><strong style={{ color: '#17406b' }}>服务状态：</strong>{service.state || (info.service_running ? 'running' : 'stopped')}</div>
+                <div><strong style={{ color: '#17406b' }}>安装结果：</strong>{install.message || install.status || '暂无安装结果'}</div>
+              </>
+            )}
           </div>
 
-          <div className="htcondor-node-scroll htcondor-column-scroll">
+          {standaloneLocal && (
+            <div className="htcondor-node-scroll">
+              <div style={{
+                padding: '18px',
+                borderRadius: 14,
+                background: '#f0f7ff',
+                border: '1px solid #cfe0f2',
+                color: '#17406b',
+                lineHeight: 1.7,
+              }}>
+                <div style={{ fontSize: 18, fontWeight: 900 }}>当前为本机单机模式</div>
+                <div style={{ marginTop: 6, fontSize: 14 }}>运行模块时直接启动本机 EXE 或 Python 进程，不进行节点发现、父节点分配、target_machine 指定或 condor_submit。</div>
+              </div>
+            </div>
+          )}
+
+          <div className="htcondor-node-scroll htcondor-column-scroll" style={{ display: standaloneLocal ? 'none' : 'flex' }}>
             <div style={{
               padding: '12px 12px',
               borderRadius: 14,
@@ -3073,7 +3186,9 @@ function HTCondorPage({
             )}
             {!showParentExecutionControls && (
               <div className="htcondor-action-note">
-                子节点只执行父节点下发任务，执行模式切换和自检任务由父节点管理员操作。
+                {poolRole === 'standalone'
+                  ? '当前未启动或加入集群，所有平台任务均按本机单机模式运行。'
+                  : '子节点只接收父节点下发任务，执行模式切换和自检任务由父节点管理员操作。'}
               </div>
             )}
           </div>
@@ -4273,7 +4388,7 @@ async function installModuleFolder() {
   }
 
   async function handleHTCondorLeavePool() {
-    if (!window.confirm('确定退出 HTCondor 集群吗？系统会重启 Condor 服务。')) return null;
+    if (!window.confirm('确定退出 HTCondor 集群吗？系统会重启 Condor 服务，并自动切换为本机单机执行。')) return null;
     return runHTCondorAction('退出 HTCondor 集群', () => leaveHTCondorPool());
   }
 

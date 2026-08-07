@@ -695,12 +695,30 @@ def is_path_like_value(value: str) -> bool:
 
 def collect_chinese_path_items(value: Any, prefix: str = "路径") -> list[dict]:
     items: list[dict] = []
+    display_text_keys = {
+        "label",
+        "name",
+        "module_name",
+        "description",
+        "help_text",
+        "placeholder",
+        "title",
+        "tags",
+    }
+
+    def is_display_text_key(key_path: str) -> bool:
+        parts = re.split(r"[.\[\]]+", str(key_path or ""))
+        parts = [part for part in parts if part and not part.isdigit()]
+        last = parts[-1].lower() if parts else ""
+        return last in display_text_keys
 
     def walk(v: Any, key_path: str):
         if v is None:
             return
 
         if isinstance(v, str):
+            if is_display_text_key(key_path):
+                return
             text = v.strip()
             if text and contains_chinese_text(text) and (is_path_like_value(text) or is_path_like_key(key_path)):
                 items.append({"field": key_path or "路径", "path": text})
@@ -1079,6 +1097,12 @@ def normalize_parallel_config(module: dict) -> dict:
         "pair_suffixes",
         "primary_suffixes",
         "batch_primary_suffixes",
+        "input_pass_mode",
+        "batch_pass_mode",
+        "pass_mode",
+        "match_mode",
+        "batch_allow_all_files",
+        "batch_allow_no_extension",
         "output_mode",
         "jd_jl_pair",
         "jd_only",
@@ -1146,11 +1170,31 @@ def recover_modules_from_installed_modules() -> List[dict]:
         if not isinstance(raw, dict):
             continue
 
-        module_id = str(raw.get("id") or raw.get("module_id") or module_dir.name).strip()
+        if manifest_path.name.lower() == "executable_module.json":
+            try:
+                recovery_report = {
+                    "errors": [],
+                    "warnings": [],
+                    "missing_files": [],
+                    "suggestions": [],
+                }
+                module = _normalize_new_executable_manifest(
+                    module_dir,
+                    manifest_path,
+                    raw,
+                    recovery_report,
+                )
+                if recovery_report.get("errors"):
+                    module = dict(raw)
+            except Exception:
+                module = dict(raw)
+        else:
+            module = dict(raw)
+
+        module_id = str(module.get("id") or module.get("module_id") or module_dir.name).strip()
         if not module_id or module_id in seen:
             continue
 
-        module = dict(raw)
         module["id"] = module_id
         module["name"] = module.get("name") or module.get("module_name") or module_id
         module["description"] = module.get("description") or ""
@@ -3892,6 +3936,304 @@ def _infer_executable_inputs_from_config(param_json: dict, module_root: Path, mo
     return inputs
 
 
+def _aerosol_manifest_detect_text(*values: Any) -> str:
+    parts: list[str] = []
+    for value in values:
+        if isinstance(value, list):
+            parts.extend(str(item or "") for item in value)
+        elif isinstance(value, dict):
+            parts.extend(str(k or "") for k in value.keys())
+            parts.extend(str(v or "") for v in value.values() if isinstance(v, (str, int, float, bool)))
+        else:
+            parts.append(str(value or ""))
+    return " ".join(parts).lower()
+
+
+def _is_h8aod_aerosol_manifest(module_id: str, entry_file: str, param_json: dict, raw_data: dict) -> bool:
+    keys = {str(key or "") for key in (param_json or {}).keys()}
+    if {"B01_file", "B03_file", "B06_file", "SOLAR_file"}.issubset(keys):
+        return True
+    text = _aerosol_manifest_detect_text(
+        module_id,
+        entry_file,
+        raw_data.get("module_name"),
+        raw_data.get("name"),
+        raw_data.get("description"),
+        raw_data.get("tags"),
+    )
+    return (
+        module_id.strip().lower() in {"h8aod", "h8_aod", "h8-aod"}
+        or "aod_ahi" in text
+        or ("h8" in text and "aod" in text)
+    )
+
+
+def _is_dpc_aod_manifest(module_id: str, entry_file: str, param_json: dict, raw_data: dict) -> bool:
+    text = _aerosol_manifest_detect_text(
+        module_id,
+        entry_file,
+        raw_data.get("module_name"),
+        raw_data.get("name"),
+        raw_data.get("description"),
+        raw_data.get("tags"),
+    )
+    return module_id.strip().lower() in {"dpc_aod", "dpcaod", "dpc-aod"} or "dpcaod" in text or "dpc aod" in text
+
+
+def _is_parasol_aod_manifest(module_id: str, entry_file: str, param_json: dict, raw_data: dict) -> bool:
+    text = _aerosol_manifest_detect_text(
+        module_id,
+        entry_file,
+        raw_data.get("module_name"),
+        raw_data.get("name"),
+        raw_data.get("description"),
+        raw_data.get("tags"),
+    )
+    return (
+        module_id.strip().lower() in {"parasol_aod", "parasolaod", "parasol-aod"}
+        or "parasolaod" in text
+        or "parasol" in text
+    )
+
+
+def _param_default(param_json: dict, key: str, fallback: Any = "") -> Any:
+    if isinstance(param_json, dict) and key in param_json and param_json.get(key) not in (None, ""):
+        return param_json.get(key)
+    return fallback
+
+
+def _h8aod_explicit_inputs(param_json: dict, file_patterns: str) -> list[dict]:
+    input_defs = [
+        ("B01_file", "B01\u8f93\u5165\u76ee\u5f55", "B01"),
+        ("B03_file", "B03\u8f93\u5165\u76ee\u5f55", "B03"),
+        ("B06_file", "B06\u8f93\u5165\u76ee\u5f55", "B06"),
+        ("SOLAR_file", "SOLAR\u8f93\u5165\u76ee\u5f55", "SOLAR"),
+    ]
+    inputs: list[dict] = []
+    for key, label, role in input_defs:
+        inputs.append({
+            "key": key,
+            "label": label,
+            "type": "dir_path",
+            "path_mode": "absolute",
+            "io_role": "input",
+            "batch_role": role,
+            "file_patterns": file_patterns,
+            "match_mode": "same_index",
+            "batch_allow_all_files": False,
+            "batch_allow_no_extension": False,
+            "required": True,
+            "visible_to_user": True,
+            "admin_fixed": False,
+            "default": _param_default(param_json, key, ""),
+        })
+
+    resource_defs = [
+        ("GEO1_file", "\u7ecf\u7eac\u5ea6\u53ca\u89c2\u6d4b\u51e0\u4f55\u6587\u4ef6", "resources/lon_lat_az_zen_1000_73_19_140_54.tif"),
+        ("al_igbp", "IGBP\u5730\u8868\u7c7b\u578b\u6587\u4ef6", "resources/h8_aod_igbp.tif"),
+        ("al_lut", "AOD\u67e5\u627e\u8868\u6587\u4ef6", "resources/h8_aod_lut.dat"),
+        ("al_dem", "DEM\u6587\u4ef6", "resources/dem_1000_73_19_140_54.tif"),
+    ]
+    for key, label, fallback in resource_defs:
+        inputs.append({
+            "key": key,
+            "label": label,
+            "type": "file_path",
+            "path_mode": "relative_to_module",
+            "default": _param_default(param_json, key, fallback),
+            "visible_to_user": False,
+            "admin_fixed": True,
+            "io_role": "input",
+            "batch_role": "",
+            "required": True,
+        })
+
+    inputs.append({
+        "key": "output",
+        "label": "\u8f93\u51fa\u76ee\u5f55",
+        "type": "dir_path",
+        "path_mode": "absolute",
+        "io_role": "output",
+        "batch_role": "OUTPUT_DIR",
+        "required": True,
+        "visible_to_user": True,
+        "admin_fixed": False,
+        "default": _param_default(param_json, "output", ""),
+    })
+    return inputs
+
+
+def _paired_aod_explicit_inputs(param_json: dict, module_label: str) -> list[dict]:
+    return [
+        {
+            "key": "input_dir",
+            "label": f"{module_label} Level-1\u8f93\u5165\u76ee\u5f55",
+            "type": "dir_path",
+            "required": True,
+            "visible_to_user": True,
+            "admin_fixed": False,
+            "path_mode": "absolute",
+            "io_role": "input",
+            "default": _param_default(param_json, "input_dir", ""),
+            "batch_role": "input",
+            "match_mode": "each_file",
+            "file_patterns": "*",
+            "batch_allow_all_files": True,
+            "batch_allow_no_extension": True,
+            "batch_pass_mode": "primary_file",
+        },
+        {
+            "key": "output_dir",
+            "label": "\u8f93\u51fa\u76ee\u5f55",
+            "type": "dir_path",
+            "required": True,
+            "visible_to_user": True,
+            "admin_fixed": False,
+            "path_mode": "absolute",
+            "io_role": "output",
+            "default": _param_default(param_json, "output_dir", ""),
+            "batch_role": "OUTPUT_DIR",
+            "output_mode": "job_directory_passthrough",
+        },
+        {
+            "key": "config_xml",
+            "label": "\u56fa\u5b9aXML\u914d\u7f6e\u6587\u4ef6",
+            "type": "file_path",
+            "required": True,
+            "visible_to_user": False,
+            "admin_fixed": True,
+            "path_mode": "relative_to_module",
+            "io_role": "input",
+            "default": _param_default(param_json, "config_xml", "resources/ConfigXMLFile.xml"),
+            "batch_role": "",
+        },
+    ]
+
+
+def _positive_int_config(value: Any, default: int = 1) -> int:
+    try:
+        return max(1, int(value))
+    except Exception:
+        return max(1, int(default))
+
+
+def _apply_aerosol_executable_template_defaults(
+    raw_data: dict,
+    module_id: str,
+    entry_file: str,
+    tool_type: str,
+    param_json: dict,
+    inferred_inputs: list[dict],
+    parallel_cfg: dict,
+    command_template: list[str],
+) -> tuple[list[dict], dict, list[str]]:
+    """Turn the public executable template into the explicit aerosol config used internally."""
+    if normalize_tool_key(tool_type) != "aerosol":
+        return inferred_inputs, parallel_cfg, command_template
+
+    cfg = dict(parallel_cfg or {})
+    command = list(command_template or [])
+
+    if _is_h8aod_aerosol_manifest(module_id, entry_file, param_json, raw_data):
+        file_patterns = str(cfg.get("file_patterns") or "*.tif;*.tiff").strip() or "*.tif;*.tiff"
+        cfg.update({
+            "mode": "batch_group",
+            "input_key": "B01_file",
+            "output_key": "output",
+            "input_pass_mode": "file",
+            "file_patterns": file_patterns,
+            "output_suffix": str(cfg.get("output_suffix") or ".tif"),
+            "output_naming": str(cfg.get("output_naming") or "source_stem"),
+            "output_mode": str(cfg.get("output_mode") or "file"),
+            "files_per_job": _positive_int_config(cfg.get("files_per_job"), 1),
+            "chunk_multiplier": _positive_int_config(cfg.get("chunk_multiplier"), 1),
+            "batch_allow_all_files": False,
+            "batch_allow_no_extension": False,
+        })
+        if not command:
+            command = ["{executable}", "{config_json}"]
+        return _h8aod_explicit_inputs(param_json, file_patterns), cfg, command
+
+    paired_label = ""
+    if _is_dpc_aod_manifest(module_id, entry_file, param_json, raw_data):
+        paired_label = "DPC"
+    elif _is_parasol_aod_manifest(module_id, entry_file, param_json, raw_data):
+        paired_label = "PARASOL"
+
+    if paired_label:
+        cfg.update({
+            "mode": "batch_group",
+            "input_key": "input_dir",
+            "output_key": "output_dir",
+            "file_patterns": "*",
+            "pair_mode": str(cfg.get("pair_mode") or "strict"),
+            "pair_suffixes": str(cfg.get("pair_suffixes") or "MD:ML;JD:JL"),
+            "primary_suffixes": str(cfg.get("primary_suffixes") or "MD;JD"),
+            "input_pass_mode": "primary_file",
+            "batch_pass_mode": "primary_file",
+            "batch_allow_all_files": True,
+            "batch_allow_no_extension": True,
+            "output_suffix": str(cfg.get("output_suffix") or ".tif"),
+            "output_naming": str(cfg.get("output_naming") or "source_stem"),
+            "output_mode": str(cfg.get("output_mode") or "job_directory_passthrough"),
+            "files_per_job": _positive_int_config(cfg.get("files_per_job"), 1),
+            "chunk_multiplier": _positive_int_config(cfg.get("chunk_multiplier"), 1),
+        })
+        command = ["{executable}", "{input_dir}", "{output_dir}", "{config_xml}"]
+        return _paired_aod_explicit_inputs(param_json, paired_label), cfg, command
+
+    return inferred_inputs, cfg, command
+
+
+def _aerosol_module_data_to_executable_manifest(module_data: dict) -> dict:
+    entry_file = str(
+        module_data.get("entry_file")
+        or module_data.get("entry")
+        or Path(str(module_data.get("executable") or "")).name
+        or ""
+    ).strip()
+    source_dir = str(module_data.get("source_dir") or ".").strip() or "."
+    param_json_path = str(module_data.get("param_json_path") or "config.json").strip() or "config.json"
+    runtime = str(module_data.get("runtime") or "executable").strip() or "executable"
+    if runtime in {"cpp_native", "native", "cpp"}:
+        runtime = "executable"
+
+    return {
+        "module_id": str(module_data.get("id") or module_data.get("module_id") or "").strip(),
+        "module_name": str(module_data.get("name") or module_data.get("module_name") or "").strip(),
+        "tool_type": "aerosol",
+        "runtime": runtime,
+        "entry_file": entry_file,
+        "source_dir": source_dir,
+        "param_json_path": param_json_path,
+        "description": str(module_data.get("description") or ""),
+        "runtime_env_path": str(module_data.get("runtime_env_path") or ""),
+        "dependency_dirs": module_data.get("dependency_dirs") if isinstance(module_data.get("dependency_dirs"), list) else [],
+        "dependency_search_dirs": module_data.get("dependency_search_dirs") if isinstance(module_data.get("dependency_search_dirs"), list) else [],
+        "resource_dirs": module_data.get("resource_dirs") if isinstance(module_data.get("resource_dirs"), list) else [],
+        "auto_collect_deps": bool(module_data.get("auto_collect_deps", True)),
+        "config_mode": str(module_data.get("config_mode") or "json_file"),
+        "command_template": module_data.get("command_template") if isinstance(module_data.get("command_template"), list) else ["{executable}", "{config_json}"],
+        "inputs": module_data.get("inputs") if isinstance(module_data.get("inputs"), list) else [],
+        "parallel": module_data.get("parallel") if isinstance(module_data.get("parallel"), dict) else {},
+        "tags": module_data.get("tags") if isinstance(module_data.get("tags"), list) else ["executable", "native", "aerosol"],
+        "enabled": bool(module_data.get("enabled", True)),
+    }
+
+
+def _write_installed_aerosol_executable_manifest(target_dir: Path, module_data: dict):
+    if normalize_tool_key(str(module_data.get("tool_type") or "")) != "aerosol":
+        return
+    manifest_path = target_dir / "executable_module.json"
+    if not manifest_path.exists():
+        return
+    manifest = _aerosol_module_data_to_executable_manifest(module_data)
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
 def _normalize_new_executable_manifest(module_root: Path, manifest_path: Path, raw_data: dict, report: dict) -> dict:
     """把新版 executable_module.json 转成系统内部沿用的 module.json 记录。"""
     if not _is_new_executable_manifest(manifest_path, raw_data):
@@ -3980,6 +4322,16 @@ def _normalize_new_executable_manifest(module_root: Path, manifest_path: Path, r
             "parallel": parallel_cfg,
         },
     )
+    inputs, parallel_cfg, command_template = _apply_aerosol_executable_template_defaults(
+        raw_data=raw_data,
+        module_id=module_id,
+        entry_file=entry_file,
+        tool_type=tool_type,
+        param_json=param_json or {},
+        inferred_inputs=inputs,
+        parallel_cfg=parallel_cfg,
+        command_template=command_template,
+    )
 
     # 如果声明了 JD/JL 配对，确保输入字段只按 JD 生成任务。
     if isinstance(parallel_cfg, dict) and (parallel_cfg.get("jd_jl_pair") is True or parallel_cfg.get("jd_only") is True):
@@ -4002,13 +4354,18 @@ def _normalize_new_executable_manifest(module_root: Path, manifest_path: Path, r
         "description": description,
         "runtime": "cpp_native",
         "entry": executable_rel,
+        "entry_file": entry_file,
         "executable": executable_rel,
         "working_dir": source_dir,
+        "source_dir": source_dir,
         "config_mode": "json_file",
+        "param_json_path": param_json_name,
         "command_template": command_template,
         "dependency_dirs": dependency_dirs,
         "dependency_search_dirs": dependency_search_dirs,
         "resource_dirs": resource_dirs,
+        "runtime_env_path": runtime_env_path,
+        "auto_collect_deps": bool(raw_data.get("auto_collect_deps", True)),
         "parallel": parallel_cfg,
         "tags": raw_data.get("tags") if isinstance(raw_data.get("tags"), list) else ["executable", "native"],
         "tool_type": tool_type,
@@ -4458,6 +4815,7 @@ def install_validated_cpp_module(module_root: Path, module_data: dict, collect_d
     module_data["working_dir"] = to_project_relative_path(wd_path)
     module_data["runtime"] = module_data.get("runtime") or "cpp_native"
 
+    _write_installed_aerosol_executable_manifest(target_dir, module_data)
     upsert_module(module_data)
     return module_data
 
@@ -7251,6 +7609,14 @@ def build_batch_jobs_for_module(module: dict, inputs: dict, parallel_workers: in
             # 当前目录只有一个文件时，也允许作为所有 job 共用，方便临时测试 SOLAR。
             elif len(files) == 1:
                 selected = files[0]
+            elif str(field.get("match_mode") or "").strip().lower() in {
+                "same_index",
+                "index",
+                "same_order",
+                "by_index",
+            }:
+                if idx - 1 < len(files):
+                    selected = files[idx - 1]
             else:
                 # 正常按时次匹配。
                 index = role_indexes[role]
@@ -7823,7 +8189,7 @@ def start_data_file_scan_after_task(
             try:
                 task_manager.append_log(
                     task_id,
-                    f"[PROGRESS] 文件级进度按父节点输出目录扫描，每 {scan_interval:g} 秒刷新一次；总文件数={progress_total}",
+                    f"[PROGRESS] 文件级进度已启动，每 {scan_interval:g} 秒刷新一次；总文件数={progress_total}",
                 )
                 update_task_output_file_progress(
                     task_id,
@@ -7852,7 +8218,7 @@ def start_data_file_scan_after_task(
                     )
                 except Exception as exc:
                     try:
-                        task_manager.append_log(task_id, f"[PROGRESS-WARN] 输出目录进度扫描失败: {repr(exc)}")
+                        task_manager.append_log(task_id, f"[PROGRESS-WARN] 进度刷新失败: {repr(exc)}")
                     except Exception:
                         pass
 

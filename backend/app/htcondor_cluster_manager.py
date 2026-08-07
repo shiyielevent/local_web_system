@@ -1277,6 +1277,8 @@ $result | ConvertTo-Json -Depth 8 | Set-Content -Path $resultPath -Encoding UTF8
         mode = str(self.state.get("execution_mode") or "local")
         local_machine = socket.gethostname()
         pool_role = str(self.state.get("pool_role") or "standalone")
+        if pool_role.strip().lower() == "standalone" and mode.strip().lower() == "htcondor":
+            mode = "local"
         parent_ip = str(self.state.get("parent_ip") or "")
         collector_port = int(self.state.get("collector_port") or 9618)
         visible_machines = {
@@ -1467,7 +1469,9 @@ $result | ConvertTo-Json -Depth 8 | Set-Content -Path $resultPath -Encoding UTF8
         }
 
     def distributed_execution_requested(self) -> bool:
-        return str(self.state.get("execution_mode") or "local") == "htcondor"
+        mode = str(self.state.get("execution_mode") or "local").strip().lower()
+        pool_role = str(self.state.get("pool_role") or "standalone").strip().lower()
+        return mode == "htcondor" and pool_role == "parent"
 
     def distributed_execution_enabled(self, force_refresh: bool = False) -> bool:
         now = time.monotonic()
@@ -1490,6 +1494,9 @@ $result | ConvertTo-Json -Depth 8 | Set-Content -Path $resultPath -Encoding UTF8
             raise HTCondorClusterError("HTCondor 执行模式只能是 local 或 htcondor")
 
         if mode == "htcondor":
+            pool_role = str(self.state.get("pool_role") or "standalone").strip().lower()
+            if pool_role != "parent":
+                raise HTCondorClusterError("只有父节点模式可以启用 HTCondor 执行；当前为本机单机模式，请先启动父节点集群。")
             data = self.status()
             if not (data.get("install_validated") and data.get("service_running") and data.get("ping", {}).get("ok")):
                 raise HTCondorClusterError("HTCondor 尚未通过安装、自检或 WRITE 权限检查，不能启用。")
@@ -2215,6 +2222,7 @@ finally {{
         result = self._run_elevated_ps("standalone", script, timeout=180)
         if result.get("success") or result.get("config_applied"):
             self.state["pool_role"] = "standalone"
+            self.state["execution_mode"] = "local"
             self.state["parent_ip"] = ""
             self.state["bind_ip"] = ""
             self._save_state()
@@ -2241,6 +2249,14 @@ finally {{
         if re.fullmatch(r"[-/][A-Za-z0-9_:.,=+\-]+", text):
             return text.replace("%", "%%")
         return self._batch_quote(text)
+
+    def _batch_set_value(self, value: Any) -> str:
+        text = str(value)
+        text = text.replace("\r", " ").replace("\n", " ")
+        text = text.replace("%", "%%")
+        text = text.replace("^", "^^")
+        text = text.replace('"', '^"')
+        return text
 
 
     def _read_submit_account_password(self) -> str:
@@ -2812,6 +2828,11 @@ else {
 
         run_cmd = job_path / "run_job.cmd"
         sub_file = job_path / "job.sub"
+        result_file = job_path / "result.txt"
+        try:
+            result_file.write_text("", encoding="ascii")
+        except Exception:
+            pass
 
         # 为了让子节点也能读到平台生成的 config.json，
         # 这里把较小的 json 配置文件随作业一起传输。
@@ -2821,7 +2842,7 @@ else {
         # input/output 子目录一起传给 HTCondor，并在执行节点上把占位符替换成
         # 当前 HTCondor 作业目录。
         safe_command = [str(x) for x in command]
-        transfer_files = ["run_job.cmd"]
+        transfer_files = ["result.txt"]
         transfer_output_items = ["result.txt"]
         stream_stage_plan: Dict[str, Any] = {}
         stream_stage_plan_raw = str(
@@ -2854,6 +2875,32 @@ else {
         except Exception:
             shared_cfg = {}
         shared_io_enabled = bool(shared_cfg.get("enabled") and str(shared_cfg.get("unc_root") or "").strip())
+        try:
+            share_connect_retries = max(
+                1,
+                min(30, int(os.environ.get("LOCAL_WEB_HTCONDOR_SHARE_CONNECT_RETRIES", "12") or "12")),
+            )
+        except Exception:
+            share_connect_retries = 12
+        try:
+            share_retry_seconds = max(
+                1,
+                min(30, int(os.environ.get("LOCAL_WEB_HTCONDOR_SHARE_RETRY_SECONDS", "3") or "3")),
+            )
+        except Exception:
+            share_retry_seconds = 3
+        force_transfer_io = str(
+            (env or {}).get("LOCAL_WEB_HTCONDOR_FORCE_TRANSFER_IO") or ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if force_transfer_io:
+            shared_io_enabled = False
+
+        # 共享目录模式的实际产品直接写入 UNC，共享作业沙箱只需要返回日志/退出码。
+        # 不再显式声明 transfer_output_files=result.txt；显式列出的文件一旦缺失，
+        # HTCondor 会把已结束作业置为 Hold。省略该行后，HTCondor 按默认规则回收
+        # 沙箱中的普通小文件，同时不会因 result.txt 偶发缺失而 Hold。
+        if shared_io_enabled:
+            transfer_output_items = []
 
         for idx in range(len(safe_command) - 1, -1, -1):
             try:
@@ -3206,8 +3253,13 @@ try {
             "@echo off",
             "chcp 65001 >nul",
             "setlocal EnableExtensions",
-            "set LOCAL_WEB_JOB_DIR=%CD%",
-            "set LOCAL_WEB_CONFIG_JSON=%LOCAL_WEB_JOB_DIR%\\localweb_config.json",
+            "set \"LOCAL_WEB_JOB_DIR=%CD%\"",
+            "set \"LOCAL_WEB_CONFIG_JSON=%LOCAL_WEB_JOB_DIR%\\localweb_config.json\"",
+            "(",
+            "  echo return_code=999",
+            "  echo computer=%COMPUTERNAME%",
+            "  echo started_at=%DATE% %TIME%",
+            ") > \"%LOCAL_WEB_JOB_DIR%\\result.txt\"",
             "if exist \"%LOCAL_WEB_JOB_DIR%\\rewrite_config.ps1\" (",
             "  powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%LOCAL_WEB_JOB_DIR%\\rewrite_config.ps1\"",
             "  if errorlevel 1 (",
@@ -3216,7 +3268,7 @@ try {
             "    echo ended_at=%DATE% %TIME% >> \"%LOCAL_WEB_JOB_DIR%\\result.txt\"",
             "    exit /b 101",
             "  )",
-            "  set LOCAL_WEB_CONFIG_JSON=%LOCAL_WEB_JOB_DIR%\\localweb_runtime_config.json",
+            "  set \"LOCAL_WEB_CONFIG_JSON=%LOCAL_WEB_JOB_DIR%\\localweb_runtime_config.json\"",
             ")",
             "echo [HTCONDOR] job started",
             "echo [HTCONDOR] computer=%COMPUTERNAME%",
@@ -3232,14 +3284,22 @@ try {
         share_user = ""
         share_password = ""
         share_credential_source = "none"
+        share_cleanup_lines: List[str] = []
 
         local_target_machine = self._is_local_target_machine(target_machine)
-        if shared_cfg.get("enabled") and share_unc and local_target_machine:
+        if shared_io_enabled and shared_cfg.get("enabled") and share_unc and local_target_machine:
             lines.extend([
-                "echo [HTCONDOR] shared directory mode enabled, but target is parent/local machine; skip net use and use local paths from config.",
+                "echo [HTCONDOR] target is parent/local machine; skip SMB net use and access local paths directly.",
             ])
 
-        if shared_cfg.get("enabled") and share_unc and not local_target_machine:
+        if shared_io_enabled and shared_cfg.get("enabled") and share_unc and not local_target_machine:
+            # 父节点和远程节点一律在 HTCondor 作业会话中连接 UNC。
+            # HTCondor slot/service 账号不等同于当前桌面用户，直接写 F:\ 等本地盘符
+            # 可能没有权限；统一走共享凭据可避免本机节点 Permission denied。
+            if local_target_machine:
+                lines.extend([
+                    "echo [HTCONDOR] target is parent/local machine; use UNC and authenticate shared directory for slot account.",
+                ])
             (
                 share_user,
                 share_password,
@@ -3255,6 +3315,10 @@ try {
             except Exception:
                 share_host = ""
             safe_host = share_host.replace("%", "%%")
+            share_cleanup_lines = [
+                f'net use "{safe_unc}" /delete /y >nul 2>nul',
+                f'cmdkey /delete:{safe_host} >nul 2>nul',
+            ]
 
             lines.extend([
                 "echo [HTCONDOR] connect shared directory",
@@ -3268,29 +3332,60 @@ try {
 
             if share_user and share_password:
                 lines.extend([
-                    f'net use "{safe_unc}" /delete /y >nul 2>nul',
+                    "set \"LOCAL_WEB_SHARE_OK=0\"",
                     f'cmdkey /delete:{safe_host} >nul 2>nul',
                     f'cmdkey /add:{safe_host} /user:"{safe_user}" /pass:"{safe_password}"',
                     "if errorlevel 1 (",
                     "  echo [HTCONDOR-WARN] failed to store shared credential, will test direct UNC access",
                     ")",
-                    f'net use "{safe_unc}" /persistent:no',
-                    "if errorlevel 1 (",
-                    "  echo [HTCONDOR-WARN] net use shared directory failed, will test direct UNC access",
-                    "  echo [HTCONDOR] net use after failed connect:",
-                    "  net use",
-                    "  echo [HTCONDOR] cmdkey list:",
-                    "  cmdkey /list",
-                    ")",
                 ])
+                for attempt in range(1, share_connect_retries + 1):
+                    retry_wait_line = (
+                        f"  timeout /t {share_retry_seconds} /nobreak >nul 2>nul"
+                        if attempt > 1
+                        else "  rem first shared directory connection attempt"
+                    )
+                    lines.extend([
+                        "if not \"%LOCAL_WEB_SHARE_OK%\"==\"1\" (",
+                        f"  echo [HTCONDOR] shared directory connect attempt {attempt}/{share_connect_retries}",
+                        "  net use",
+                        retry_wait_line,
+                        f'  net use "{safe_unc}" /delete /y >nul 2>nul',
+                        f'  net use "{safe_unc}" /persistent:no',
+                        f'  dir "{safe_unc}" >nul 2>nul',
+                        "  if not errorlevel 1 (",
+                        "    set \"LOCAL_WEB_SHARE_OK=1\"",
+                        "  ) else (",
+                        "    echo [HTCONDOR-WARN] shared directory connect attempt failed",
+                        "  )",
+                        ")",
+                    ])
             else:
                 lines.extend([
                     "echo [HTCONDOR-WARN] shared directory enabled but no share credential configured",
+                    "set \"LOCAL_WEB_SHARE_OK=0\"",
                 ])
+                for attempt in range(1, share_connect_retries + 1):
+                    retry_wait_line = (
+                        f"  timeout /t {share_retry_seconds} /nobreak >nul 2>nul"
+                        if attempt > 1
+                        else "  rem first shared directory direct access attempt"
+                    )
+                    lines.extend([
+                        "if not \"%LOCAL_WEB_SHARE_OK%\"==\"1\" (",
+                        f"  echo [HTCONDOR] shared directory direct access attempt {attempt}/{share_connect_retries}",
+                        retry_wait_line,
+                        f'  dir "{safe_unc}" >nul 2>nul',
+                        "  if not errorlevel 1 (",
+                        "    set \"LOCAL_WEB_SHARE_OK=1\"",
+                        "  ) else (",
+                        "    echo [HTCONDOR-WARN] shared directory direct access attempt failed",
+                        "  )",
+                        ")",
+                    ])
 
             lines.extend([
-                f'dir "{safe_unc}" >nul 2>nul',
-                "if errorlevel 1 (",
+                "if not \"%LOCAL_WEB_SHARE_OK%\"==\"1\" (",
                 "  echo [HTCONDOR-ERROR] shared directory is not accessible in this HTCondor job session",
                 "  echo [HTCONDOR] job user:",
                 "  whoami",
@@ -3303,6 +3398,7 @@ try {
                 "    echo computer=%COMPUTERNAME%",
                 "    echo ended_at=%DATE% %TIME%",
                 "  ) > \"%LOCAL_WEB_JOB_DIR%\\result.txt\"",
+                *share_cleanup_lines,
                 "  exit /b 1326",
                 ")",
                 "echo [HTCONDOR] shared directory accessible",
@@ -3314,14 +3410,32 @@ try {
                 continue
             if not key or any(ch in key for ch in " =&|"):
                 continue
-            val = str(value).replace("%", "%%")
-            lines.append(f"set {key}={val}")
+            if key.upper() in {"COMPUTERNAME", "USERDOMAIN", "LOGONSERVER", "SESSIONNAME", "CLIENTNAME"}:
+                continue
+            val = self._batch_set_value(value)
+            lines.append(f"set \"{key}={val}\"")
 
         lines.extend([
             "echo [HTCONDOR] request_cpus=%LOCAL_WEB_HTCONDOR_REQUEST_CPUS%",
             "echo [HTCONDOR] request_memory_mb=%LOCAL_WEB_HTCONDOR_REQUEST_MEMORY_MB%",
             "echo [HTCONDOR] threads_per_exe=%LOCAL_WEB_HTCONDOR_THREADS_PER_EXE%",
         ])
+
+        # 对绝对路径入口程序做显式检查，避免远程节点未安装同名模块时只留下
+        # result.txt 缺失/9009 等模糊错误。
+        executable_arg = str(safe_command[0] if safe_command else "").strip().strip('"')
+        if re.match(r"^[A-Za-z]:[\\/]", executable_arg):
+            quoted_executable = self._batch_quote(executable_arg)
+            lines.extend([
+                f"if not exist {quoted_executable} (",
+                "  echo [HTCONDOR-ERROR] executable not found: " + executable_arg.replace("%", "%%"),
+                "  echo return_code=102 > \"%LOCAL_WEB_JOB_DIR%\\result.txt\"",
+                "  echo computer=%COMPUTERNAME% >> \"%LOCAL_WEB_JOB_DIR%\\result.txt\"",
+                "  echo ended_at=%DATE% %TIME% >> \"%LOCAL_WEB_JOB_DIR%\\result.txt\"",
+                *share_cleanup_lines,
+                "  exit /b 102",
+                ")",
+            ])
 
         if working_dir:
             lines.append(f"cd /d {self._batch_quote(str(working_dir))}")
@@ -3330,6 +3444,7 @@ try {
                 "  echo return_code=100 > \"%LOCAL_WEB_JOB_DIR%\\result.txt\"",
                 "  echo computer=%COMPUTERNAME% >> \"%LOCAL_WEB_JOB_DIR%\\result.txt\"",
                 "  echo ended_at=%DATE% %TIME% >> \"%LOCAL_WEB_JOB_DIR%\\result.txt\"",
+                *share_cleanup_lines,
                 "  exit /b 100",
                 ")",
             ])
@@ -3342,13 +3457,14 @@ try {
 
         lines.extend([
             execution_line,
-            "set LOCAL_WEB_EXIT=%ERRORLEVEL%",
+            "set \"LOCAL_WEB_EXIT=%ERRORLEVEL%\"",
             "(",
             "  echo return_code=%LOCAL_WEB_EXIT%",
             "  echo computer=%COMPUTERNAME%",
             "  echo ended_at=%DATE% %TIME%",
             ") > \"%LOCAL_WEB_JOB_DIR%\\result.txt\"",
             "if not exist \"%LOCAL_WEB_JOB_DIR%\\result.txt\" echo return_code=%LOCAL_WEB_EXIT% > \"%LOCAL_WEB_JOB_DIR%\\result.txt\"",
+            *share_cleanup_lines,
             "echo [HTCONDOR] job finished, return_code=%LOCAL_WEB_EXIT%",
             "exit /b %LOCAL_WEB_EXIT%",
         ])
@@ -3370,7 +3486,11 @@ try {
                 seen_output_items.add(item)
                 clean_transfer_output_items.append(item)
         transfer_output_files = ", ".join(clean_transfer_output_items)
-        transfer_output_line = f"transfer_output_files = {transfer_output_files}\n" if transfer_output_files else ""
+        transfer_output_line = (
+            f"transfer_output_files = {transfer_output_files}\n"
+            if transfer_output_files and not shared_io_enabled
+            else ""
+        )
 
         try:
             request_cpus_raw = (
@@ -3411,8 +3531,7 @@ try {
             run_as_owner_value = "false"
 
         sub_text = f"""universe = vanilla
-executable = C:/Windows/System32/cmd.exe
-arguments = /D /C run_job.cmd
+executable = run_job.cmd
 initialdir = {job_dir_posix}
 {requirements_line}should_transfer_files = YES
 when_to_transfer_output = ON_EXIT
@@ -3842,6 +3961,8 @@ queue 1
                 m = re.search(r"job finished,\s*return_code\s*=\s*(-?\d+)", source, re.IGNORECASE)
             if not m:
                 m = re.search(r"return value\s+(-?\d+)", source, re.IGNORECASE)
+            if not m:
+                m = re.search(r"signal\s+(-?\d+)", source, re.IGNORECASE)
             if m:
                 try:
                     return_code = int(m.group(1))
